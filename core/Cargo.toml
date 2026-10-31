@@ -1,0 +1,71 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+description = "The part of g-ssh without UI: SSH, SFTP, terminal emulator, vault and sync"
+license = "MIT"
+publish = false
+
+# Rust already ships a crate named `core`, so this library is imported as `gssh`.
+[lib]
+name = "gssh"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+russh = "0.65"
+russh-sftp = "3"
+alacritty_terminal = "0.26"
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+tokio-socks = "0.5"
+base64 = "0.23"
+async-channel = "2"
+async-trait = "0.1"
+futures = "0.3"
+
+# vault
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+secrecy = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.10"
+ciborium = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }
+bip39 = { version = "3", features = ["zeroize"] }
+
+# sync
+ureq = { version = "3", features = ["json"] }
+sha2 = "0.11"
+subtle = "2"
+hkdf = "0.13"
+ed25519-dalek = "3"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
