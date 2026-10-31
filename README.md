@@ -61,6 +61,31 @@ Signing in with GitHub attaches the vault to an account. The vault password
 becomes the account password, and changes sync. A host can be shared with a
 team or kept personal.
 
+## First launch on a Mac
+
+A download from the release page or the update check is ad-hoc signed and
+not notarized, so Gatekeeper says Apple could not verify "g-ssh" is free of
+malware. Allow the app once.
+
+Drag `g-ssh.app` from the disk image into Applications and open it.
+
+- macOS 15 or newer: click Done on the warning. Open System Settings, go to
+  Privacy & Security, and click Open Anyway next to g-ssh. Confirm and enter
+  your password.
+- macOS 13 and 14: Control-click `g-ssh.app`, choose Open, then click Open.
+  The same Open Anyway button is under Privacy & Security.
+- macOS 12: Control-click `g-ssh.app` and choose Open. Or open System
+  Preferences, Security & Privacy, General, and click Open Anyway.
+
+Or clear the download mark in Terminal, then open the app:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/g-ssh.app
+```
+
+A binary from `cargo build` has no download mark, so Gatekeeper leaves it
+alone.
+
 ## Updates
 
 macOS (Apple silicon) and Windows x86_64 can ask GitHub for a newer
@@ -86,7 +111,8 @@ starts it and publishes the builds on the GitHub release for that tag,
 which is what the update check downloads. macOS is a `.dmg` containing
 `g-ssh.app`. Windows is a `.zip` and Linux is a `.tar.gz`. It can still
 be started by hand, and that run only keeps the builds as artifacts.
-The macOS app is ad-hoc signed so it can launch, and not notarized.
+The macOS app is ad-hoc signed so it can launch, and not notarized. See
+[First launch on a Mac](#first-launch-on-a-mac).
 
 ```sh
 cargo test
