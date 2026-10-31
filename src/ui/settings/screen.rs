@@ -23,8 +23,9 @@ use crate::preferences::{
 use crate::ui::hosts::form::read_key_file;
 use crate::ui::terminal::colors::TerminalColors;
 use crate::ui::terminal::element::{terminal_family_name, terminal_font_family};
+use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
 use crate::ui::updates::service::UpdateService;
-use crate::ui::{dialog_chrome, VaultState};
+use crate::ui::{dialog_chrome, VaultState, DIALOG_WIDE};
 use gssh::vault::{
     ProxyAuth, ProxyChoice, ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting, Snippet,
     SnippetBody, SshKey, SshKeySummary, VaultError,
@@ -1507,6 +1508,26 @@ impl SettingsView {
             })
     }
 
+    /// The notes and the download. The title bar's chip opens the same
+    /// dialog, and Settings sits on top of that chip.
+    fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(UpdateView::new);
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &UpdateViewEvent, window, cx| match event {
+                UpdateViewEvent::Closed => {
+                    window.close_dialog(cx);
+                    this.focus_handle.focus(window, cx);
+                }
+            },
+        )
+        .detach();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog_chrome(dialog).w(DIALOG_WIDE).child(view.clone())
+        });
+    }
+
     fn render_about(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let fg = theme.foreground;
@@ -1555,15 +1576,19 @@ impl SettingsView {
             .children(updates)
     }
 
-    /// The "Check for updates on start" preference, with a button to check
-    /// right now and how the last check ended.
+    /// The "Check for updates on start" preference, a button to check right
+    /// now, how the last check ended, and Update when a newer build is out.
     fn render_update_check(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted_fg = cx.theme().muted_foreground;
         let is_automatic = Preferences::update_checks(cx) == Some(UpdateChecks::OnStart);
         let service = UpdateService::global(cx);
-        let (is_checking, result) = {
+        let (is_checking, result, update_label) = {
             let service = service.read(cx);
-            (service.is_checking, service.result_line(is_automatic))
+            (
+                service.is_checking,
+                service.result_line(is_automatic),
+                service.update_action_label(),
+            )
         };
 
         v_flex()
@@ -1609,6 +1634,17 @@ impl SettingsView {
                                     .update(cx, |service, cx| service.check(cx));
                             }),
                     )
+                    .when_some(update_label, |row, label| {
+                        row.child(
+                            Button::new("about-update")
+                                .small()
+                                .primary()
+                                .child(label)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_update_dialog(window, cx);
+                                })),
+                        )
+                    })
                     // Lets a long error wrap instead of running past the card.
                     .child(
                         div()

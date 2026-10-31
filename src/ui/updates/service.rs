@@ -323,6 +323,18 @@ impl UpdateService {
         true
     }
 
+    /// Label for the About page's update button. `None` when there is no
+    /// newer build. While a download is running, the percent.
+    pub fn update_action_label(&self) -> Option<String> {
+        if self.release.is_none() {
+            return None;
+        }
+        Some(match self.download {
+            Download::Running { percent } => format!("Downloading {percent}%"),
+            _ => "Update".into(),
+        })
+    }
+
     /// The line beside Check now on the About page.
     pub fn result_line(&self, is_automatic: bool) -> String {
         if self.is_checking {
@@ -420,6 +432,24 @@ mod tests {
             service.result_line(true),
             "Could not check: could not reach GitHub: timed out"
         );
+    }
+
+    #[test]
+    fn the_update_button_appears_only_when_a_build_is_waiting() {
+        let mut service = service();
+        assert_eq!(service.update_action_label(), None);
+
+        service.release = Some(release("0.2.0"));
+        assert_eq!(service.update_action_label().as_deref(), Some("Update"));
+
+        service.download = Download::Running { percent: 42 };
+        assert_eq!(
+            service.update_action_label().as_deref(),
+            Some("Downloading 42%")
+        );
+
+        service.download = Download::Done("/tmp/g-ssh-0.2.0.dmg".into());
+        assert_eq!(service.update_action_label().as_deref(), Some("Update"));
     }
 
     #[test]
