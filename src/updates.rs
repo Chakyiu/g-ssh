@@ -45,7 +45,8 @@ fn github_download_base() -> String {
 
 /// The archive name GitHub is asked for. `None` where there are no builds to
 /// offer, and then nothing is ever asked. The name is the `<os-arch>` piece
-/// of `g-ssh-<version>-<os-arch>.tar.gz` on the release page.
+/// of `g-ssh-<version>-<os-arch>.<ext>` on the release page: `.dmg` on macOS,
+/// `.zip` on Windows.
 pub fn platform() -> Option<&'static str> {
     // macOS sets this variable for an app that runs in the sandbox.
     let is_sandboxed = std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some();

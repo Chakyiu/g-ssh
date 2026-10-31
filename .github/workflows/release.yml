@@ -5,9 +5,10 @@
 # Runs when a version tag is pushed (`v0.1.5`), and can still be started by hand:
 #   git tag v0.1.5 && git push origin v0.1.5
 #   gh workflow run release.yml
-# A tag publishes the archives on that GitHub release. The app downloads them
-# from the release page. A hand start only keeps the archives as artifacts.
-# The macOS binaries are not signed or notarized.
+# A tag publishes the builds on that GitHub release. The app downloads them
+# from the release page. A hand start only keeps the builds as artifacts.
+# macOS is a .dmg of g-ssh.app. Windows is a .zip, Linux a .tar.gz.
+# The macOS app is ad-hoc signed so it can launch, and not notarized.
 name: release
 
 on:
@@ -79,24 +80,29 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           name="g-ssh-${version}-${{ matrix.artifact }}"
-          mkdir "$name"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/release/g-ssh.exe "$name/"
+          # The updater accepts one archive per platform. macOS publishes the
+          # .dmg only, so a .tar.gz of the same name would be a second match.
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            archive="${name}.dmg"
+            bash scripts/macos-dmg.sh "$archive"
           else
-            cp target/release/g-ssh "$name/"
-          fi
-          cp assets/fonts/CascadiaCode-LICENSE.txt \
-            assets/fonts/SourceSans3-OFL.txt \
-            assets/icons/LUCIDE-LICENSE.txt \
-            "$name/"
-          # The updater looks for this name on the release page:
-          # g-ssh-<version>-<os-arch>.tar.gz, or .zip on Windows.
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            archive="${name}.zip"
-            tar -a -cf "$archive" "$name"
-          else
-            archive="${name}.tar.gz"
-            tar -czf "$archive" "$name"
+            mkdir "$name"
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              cp target/release/g-ssh.exe "$name/"
+            else
+              cp target/release/g-ssh "$name/"
+            fi
+            cp assets/fonts/CascadiaCode-LICENSE.txt \
+              assets/fonts/SourceSans3-OFL.txt \
+              assets/icons/LUCIDE-LICENSE.txt \
+              "$name/"
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              archive="${name}.zip"
+              tar -a -cf "$archive" "$name"
+            else
+              archive="${name}.tar.gz"
+              tar -czf "$archive" "$name"
+            fi
           fi
           echo "archive=$archive" >> "$GITHUB_ENV"
 
@@ -124,7 +130,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          files=(dist/*.tar.gz dist/*.zip)
+          files=(dist/*.tar.gz dist/*.zip dist/*.dmg)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no release archives were built" >&2
             exit 1
@@ -135,6 +141,15 @@ jobs:
           # lookup; --verify-tag still checks the tag on GitHub.
           repo="$GITHUB_REPOSITORY"
           if gh release view "$GITHUB_REF_NAME" --repo "$repo" >/dev/null 2>&1; then
+            # The updater rejects a release that has two archives for one
+            # platform. Drop the macOS tarball this dmg replaces.
+            names=$(gh release view "$GITHUB_REF_NAME" --repo "$repo" --json assets --jq '.assets[].name')
+            for dmg in dist/*.dmg; do
+              old=$(basename "${dmg%.dmg}.tar.gz")
+              if printf '%s\n' "$names" | grep -Fxq "$old"; then
+                gh release delete-asset "$GITHUB_REF_NAME" "$old" --repo "$repo" --yes
+              fi
+            done
             gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$repo" --clobber
           else
             gh release create "$GITHUB_REF_NAME" "${files[@]}" \

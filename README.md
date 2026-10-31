@@ -82,10 +82,11 @@ The binary is `target/release/g-ssh`, or `g-ssh.exe` on Windows.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 Linux, macOS arm64, and Windows x86_64. Pushing a `v*` tag
-starts it and publishes the archives on the GitHub release for that tag,
-which is what the update check downloads. It can still be started by hand,
-and that run only keeps the archives as artifacts.
-The macOS binaries from that run are not signed.
+starts it and publishes the builds on the GitHub release for that tag,
+which is what the update check downloads. macOS is a `.dmg` containing
+`g-ssh.app`. Windows is a `.zip` and Linux is a `.tar.gz`. It can still
+be started by hand, and that run only keeps the builds as artifacts.
+The macOS app is ad-hoc signed so it can launch, and not notarized.
 
 ```sh
 cargo test
