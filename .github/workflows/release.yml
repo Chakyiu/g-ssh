@@ -37,7 +37,9 @@ jobs:
             artifact: linux-x86_64
           - runner: ubuntu-24.04-arm
             artifact: linux-aarch64
-          - runner: macos-14
+          # macos-14 retires 2026-11-02. macos-15 is still arm64, and the
+          # deployment target above keeps the binary launchable on macOS 12.
+          - runner: macos-15
             artifact: macos-aarch64
           - runner: windows-latest
             artifact: windows-x86_64
