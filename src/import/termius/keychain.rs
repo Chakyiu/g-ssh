@@ -46,7 +46,7 @@ fn read_raw_key() -> Result<Zeroizing<Vec<u8>>> {
         CredReadW(
             PCWSTR(target.as_ptr()),
             CRED_TYPE_GENERIC,
-            0,
+            None,
             &mut credential,
         )
         .context("no Termius key in Credential Manager")?;
