@@ -6,6 +6,7 @@ pub mod keyboard;
 pub mod menu;
 pub mod palette;
 pub mod root;
+pub mod scale;
 pub mod session;
 pub mod settings;
 pub mod sftp;
@@ -28,7 +29,7 @@ pub fn dialog_chrome(dialog: gpui_component::dialog::Dialog) -> gpui_component::
     dialog
         .bg(crate::theme::pop_surface())
         .border_color(crate::theme::float_border())
-        .rounded(gpui::px(12.))
+        .rounded(scale::px(12.))
         .shadow(modal_shadow())
 }
 
@@ -36,11 +37,19 @@ pub fn dialog_chrome(dialog: gpui_component::dialog::Dialog) -> gpui_component::
 /// a session.
 pub const PANEL_RADIUS: f32 = 14.;
 
-pub const DIALOG_NARROW: gpui::Pixels = gpui::px(400.);
-pub const DIALOG_WIDE: gpui::Pixels = gpui::px(480.);
+pub fn dialog_narrow() -> gpui::Pixels {
+    scale::px(400.)
+}
+
+pub fn dialog_wide() -> gpui::Pixels {
+    scale::px(480.)
+}
+
 /// The host form: user, host and port share a row, and so do the folder and
 /// the tags.
-pub const DIALOG_FORM: gpui::Pixels = gpui::px(620.);
+pub fn dialog_form() -> gpui::Pixels {
+    scale::px(620.)
+}
 
 /// The four-layer shadow Zed gives its modals, shared by dialogs, the palette
 /// and the settings card so they all sit at the same height.
@@ -50,9 +59,9 @@ pub fn modal_shadow() -> Vec<gpui::BoxShadow> {
         // Warm shadow, same temperature as the ink, so panels sit on the
         // desk instead of on a neutral grey.
         color: gpui::hsla(0.08, 0.28, 0.07, alpha),
-        offset: gpui::point(gpui::px(0.), gpui::px(y)),
-        blur_radius: gpui::px(blur),
-        spread_radius: gpui::px(0.),
+        offset: gpui::point(scale::px(0.), scale::px(y)),
+        blur_radius: scale::px(blur),
+        spread_radius: scale::px(0.),
         inset: false,
     };
     vec![
@@ -72,7 +81,7 @@ pub fn modal_shadow() -> Vec<gpui::BoxShadow> {
 /// own 16px padding on each side and a matching gap at the bottom.
 pub fn dialog_max_height(window: &gpui::Window) -> gpui::Pixels {
     let viewport = window.viewport_size().height;
-    (viewport * 0.9 - gpui::px(48.)).max(gpui::px(200.))
+    (viewport * 0.9 - scale::px(48.)).max(scale::px(200.))
 }
 
 pub enum VaultState {

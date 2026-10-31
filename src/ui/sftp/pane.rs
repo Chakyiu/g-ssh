@@ -1,11 +1,13 @@
 use crate::ui::menu::{ContextMenu, ContextMenuItem};
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, px, uniform_list, App, Bounds, ClickEvent, ClipboardItem, Context, Entity,
-    EntityId, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, MouseButton, Pixels, Point, SharedString,
-    UniformListScrollHandle, WeakEntity, Window,
+    canvas, div, uniform_list, App, Bounds, ClickEvent, ClipboardItem, Context, Entity, EntityId,
+    EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Focusable, Hsla,
+    KeyDownEvent, MouseButton, Pixels, Point, SharedString, UniformListScrollHandle, WeakEntity,
+    Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -395,7 +397,9 @@ impl Render for DragPreview {
 
 const SPIN_CYCLE: Duration = Duration::from_millis(800);
 
-const ROW_HEIGHT: Pixels = px(26.);
+fn row_height() -> Pixels {
+    px(26.)
+}
 /// Space between the pane edge and the rounded rows.
 const LIST_INSET: f32 = 6.;
 /// Space inside a row before its icon and after its last column.
@@ -677,7 +681,7 @@ impl FilePane {
             .bounds()
             .size
             .height;
-        ((height / ROW_HEIGHT) as i32 - 1).max(1)
+        ((height / row_height()) as i32 - 1).max(1)
     }
 
     /// Scroll the visible row at `position` into view.
@@ -2503,7 +2507,7 @@ fn render_parent_row(
     h_flex()
         .id("entry-parent")
         .w_full()
-        .h(ROW_HEIGHT)
+        .h(row_height())
         .px(px(ROW_PADDING))
         .gap(px(8.))
         .items_center()
@@ -2704,7 +2708,7 @@ fn render_entry(
     let mut el = h_flex()
         .id(("entry", ix))
         .w_full()
-        .h(ROW_HEIGHT)
+        .h(row_height())
         .px(px(ROW_PADDING))
         .gap(px(8.))
         .items_center()

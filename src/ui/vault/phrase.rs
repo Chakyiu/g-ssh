@@ -1,8 +1,10 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Task, Window};
+use gpui::{div, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, Task, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex, v_flex, ActiveTheme as _,

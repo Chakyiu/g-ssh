@@ -1,8 +1,9 @@
 //! The tile in front of a host: the mark of the system it runs, tinted in
 //! that system's colour, with a dot on its corner while a session is open.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, svg, AnyElement, Hsla};
+use gpui::{div, svg, AnyElement, Hsla};
 
 use crate::theme;
 

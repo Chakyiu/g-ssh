@@ -79,7 +79,9 @@ fn main() {
         crate::ui::settings::init(cx);
 
         // Loaded before the vault so the unlock screen is already themed.
+        // The zoom has to be installed first: the theme's rem is read from it.
         let prefs = Preferences::load_or_default();
+        crate::ui::scale::set_factor(prefs.ui_scale);
         let theme_preference = prefs.theme;
         cx.set_global(prefs);
         theme::apply_preference(theme_preference, None, cx);

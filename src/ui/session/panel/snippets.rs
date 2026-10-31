@@ -3,8 +3,10 @@
 
 use std::cmp::Reverse;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, Context, Div, Entity, SharedString, Window};
+use gpui::{div, AnyElement, Context, Div, Entity, SharedString, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,

@@ -175,6 +175,28 @@ pub struct VaultPayload {
     /// Invites used and not accepted yet.
     #[serde(default)]
     pub joins: Vec<crate::vault::sync::PendingJoin>,
+    /// The assistant endpoint. The API key is encrypted with the rest of the
+    /// vault. This is not a synced record, so it stays on this computer.
+    #[serde(default)]
+    pub agent: AgentSettings,
+}
+
+/// Where the assistant sends a question, and what it may run without asking.
+/// Empty strings mean the defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentSettings {
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub api_key: String,
+    /// Empty means the built-in system prompt.
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Command names that run without a prompt. `ls` allows `ls -la`.
+    #[serde(default)]
+    pub always_allow: Vec<String>,
 }
 
 /// A host folder, for visual grouping only.

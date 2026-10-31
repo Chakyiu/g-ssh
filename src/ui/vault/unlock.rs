@@ -1,5 +1,7 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{px, AnyElement, App, Context, Entity, FocusHandle, Focusable, Window};
+use gpui::{AnyElement, App, Context, Entity, FocusHandle, Focusable, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState, Textarea, TextareaState},

@@ -1,7 +1,9 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    px, AnyElement, App, Context, Div, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Window,
+    AnyElement, App, Context, Div, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     switch::Switch,

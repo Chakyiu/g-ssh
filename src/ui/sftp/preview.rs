@@ -3,11 +3,13 @@
 
 use std::sync::Arc;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, img, px, Context, Entity, Image, ImageFormat, ObjectFit, RenderImage, SharedString,
+    div, img, Context, Entity, Image, ImageFormat, ObjectFit, RenderImage, SharedString,
     Subscription, Task, Window,
 };
+
 use gpui_component::{
     h_flex,
     input::{Editor, EditorState},

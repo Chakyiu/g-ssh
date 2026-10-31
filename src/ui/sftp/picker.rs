@@ -1,5 +1,7 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App, Context, Entity, EventEmitter, Window};
+use gpui::{div, App, Context, Entity, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogFooter, DialogHeader, DialogTitle},

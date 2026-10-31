@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, AnyElement, AnyWindowHandle, App, Context, Entity, EntityId, FocusHandle,
+    actions, div, AnyElement, AnyWindowHandle, App, Context, Entity, EntityId, FocusHandle,
     Focusable, ModifiersChangedEvent, StyleRefinement, SystemNotification, Task, WeakEntity,
     Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogFooter, DialogHeader, DialogTitle},
@@ -28,7 +30,7 @@ use crate::ui::hosts::sidebar::{HostStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH
 use crate::ui::keyboard::bind_chord;
 use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
 use crate::ui::session::{connect_time_message, ForwardRuntime, ServerSession, ServerSessionEvent};
-use crate::ui::settings::{SettingsView, SettingsViewEvent};
+use crate::ui::settings::{SettingsSection, SettingsView, SettingsViewEvent};
 use crate::ui::sftp::browser::{RestorePaths, TransferKind};
 use crate::ui::sftp::conflict::transfer_conflict_dialog;
 use crate::ui::sftp::picker::{AppPicker, AppPickerEvent};
@@ -38,7 +40,7 @@ use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
 use crate::ui::updates::service::{Download, UpdateService};
 use crate::ui::vault::passphrase::{PassphrasePromptEvent, PassphrasePromptView};
 use crate::ui::workspace::{WorkKind, Workspace, WorkspaceEvent};
-use crate::ui::{dialog_chrome, VaultState, DIALOG_FORM, DIALOG_NARROW, DIALOG_WIDE};
+use crate::ui::{dialog_chrome, dialog_form, dialog_narrow, dialog_wide, VaultState};
 use gssh::ssh::connection::Connection;
 use gssh::ssh::route::{self, CredentialIssue};
 use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
@@ -69,9 +71,31 @@ actions!(
         ActivateTab7,
         ActivateTab8,
         ActivateTab9,
+        ZoomIn,
+        ZoomOut,
+        ResetZoom,
         Quit,
     ]
 );
+
+/// Move the interface zoom by `steps` and repaint. One step is 10%.
+pub(crate) fn step_interface_scale(steps: i32, cx: &mut App) {
+    let next = crate::ui::scale::step(Preferences::ui_scale(cx), steps);
+    set_interface_scale(next, cx);
+}
+
+/// Put the interface back to the designed size and repaint.
+pub(crate) fn reset_interface_scale(cx: &mut App) {
+    set_interface_scale(crate::ui::scale::DEFAULT_UI_SCALE, cx);
+}
+
+fn set_interface_scale(scale: f32, cx: &mut App) {
+    if !Preferences::set_ui_scale(scale, cx) {
+        return;
+    }
+    crate::theme::sync_ui_scale(cx);
+    cx.refresh_windows();
+}
 
 pub fn init(cx: &mut App) {
     crate::ui::palette::init(cx);
@@ -81,12 +105,21 @@ pub fn init(cx: &mut App) {
         tracing::info!("quit from the keyboard");
         cx.quit();
     });
+    // Zoom the whole interface, not only the terminal font. `+` is Shift+=
+    // on a US layout, and the unshifted equals key zooms in too.
+    cx.on_action(|_: &ZoomIn, cx| step_interface_scale(1, cx));
+    cx.on_action(|_: &ZoomOut, cx| step_interface_scale(-1, cx));
+    cx.on_action(|_: &ResetZoom, cx| reset_interface_scale(cx));
 
     // `bind_chord` also registers each chord as it arrives on the Russian
     // layout; chords with no letter in them come out as a single binding.
     #[cfg(target_os = "macos")]
     {
         bind_chord(cx, "cmd-q", Quit, None);
+        bind_chord(cx, "cmd-=", ZoomIn, None);
+        bind_chord(cx, "cmd-shift-=", ZoomIn, None);
+        bind_chord(cx, "cmd--", ZoomOut, None);
+        bind_chord(cx, "cmd-0", ResetZoom, None);
         bind_chord(cx, "cmd-,", ToggleSettings, None);
         bind_chord(cx, "cmd-p", ToggleCommandPalette, None);
         bind_chord(cx, "cmd-l", LockVault, None);
@@ -117,6 +150,10 @@ pub fn init(cx: &mut App) {
     // as "ctrl-}" and never match.
     #[cfg(not(target_os = "macos"))]
     {
+        bind_chord(cx, "ctrl-=", ZoomIn, None);
+        bind_chord(cx, "ctrl-shift-=", ZoomIn, None);
+        bind_chord(cx, "ctrl--", ZoomOut, None);
+        bind_chord(cx, "ctrl-0", ResetZoom, None);
         bind_chord(cx, "ctrl-,", ToggleSettings, None);
         bind_chord(cx, "ctrl-shift-p", ToggleCommandPalette, None);
         bind_chord(cx, "ctrl-shift-l", LockVault, None);
@@ -505,7 +542,7 @@ impl AppView {
         )
         .detach();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
-            dialog_chrome(dialog).w(DIALOG_NARROW).child(view.clone())
+            dialog_chrome(dialog).w(dialog_narrow()).child(view.clone())
         });
     }
 
@@ -528,31 +565,49 @@ impl AppView {
         if self.settings_view.is_some() {
             self.settings_view = None;
             self.focus_handle.focus(window, cx);
+            cx.notify();
         } else {
-            self.command_palette = None;
-            let sv = cx.new(|cx| SettingsView::new(self.vault_state.clone(), window, cx));
-            cx.subscribe_in(
-                &sv,
-                window,
-                |this, _, event: &SettingsViewEvent, window, cx| match event {
-                    SettingsViewEvent::Close => {
-                        this.settings_view = None;
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    }
-                    SettingsViewEvent::LockRequested => this.lock_vault(window, cx),
-                    SettingsViewEvent::RunSnippet(snippet_id) => {
-                        let id = *snippet_id;
-                        this.settings_view = None;
-                        this.run_snippet_on_active_session(id, cx);
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                    }
-                },
-            )
-            .detach();
-            self.settings_view = Some(sv);
+            self.open_settings_at(SettingsSection::Vault, window, cx);
         }
+    }
+
+    /// Open Settings on `section`. If it is already open, switch to that page
+    /// instead of closing it.
+    fn open_settings_at(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.settings_view.clone() {
+            view.update(cx, |settings, cx| settings.show_section(section, cx));
+            cx.notify();
+            return;
+        }
+        self.command_palette = None;
+        let sv = cx.new(|cx| SettingsView::new(self.vault_state.clone(), window, cx));
+        sv.update(cx, |settings, cx| settings.show_section(section, cx));
+        cx.subscribe_in(
+            &sv,
+            window,
+            |this, _, event: &SettingsViewEvent, window, cx| match event {
+                SettingsViewEvent::Close => {
+                    this.settings_view = None;
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }
+                SettingsViewEvent::LockRequested => this.lock_vault(window, cx),
+                SettingsViewEvent::RunSnippet(snippet_id) => {
+                    let id = *snippet_id;
+                    this.settings_view = None;
+                    this.run_snippet_on_active_session(id, cx);
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        self.settings_view = Some(sv);
         cx.notify();
     }
 
@@ -1458,7 +1513,7 @@ impl AppView {
         let view_for_dialog = view.clone();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
             dialog_chrome(dialog)
-                .w(DIALOG_NARROW)
+                .w(dialog_narrow())
                 .child(view_for_dialog.clone())
         });
     }
@@ -1663,6 +1718,9 @@ impl AppView {
                 }
                 ServerSessionEvent::RunSnippet(snippet_id) => {
                     this.run_snippet_on_session(*snippet_id, session_entity, cx);
+                }
+                ServerSessionEvent::OpenAgentSettings => {
+                    this.open_settings_at(SettingsSection::Agent, window, cx);
                 }
                 ServerSessionEvent::EditRequested { entry_id } => {
                     if let Ok(id) = Uuid::parse_str(entry_id) {
@@ -1872,7 +1930,7 @@ impl AppView {
                     let (lc, wb_c, ws_c) = (local.clone(), wb.clone(), weak_session.clone());
                     let (lr, wb_r, ws_r) = (local.clone(), wb.clone(), weak_session.clone());
                     let (lo, wb_o, ws_o) = (local.clone(), wb.clone(), weak_session.clone());
-                    dialog_chrome(dialog).w(DIALOG_WIDE).child(
+                    dialog_chrome(dialog).w(dialog_wide()).child(
                         v_flex()
                             .p(px(12.))
                             .gap(px(8.))
@@ -1975,7 +2033,7 @@ impl AppView {
         cx.spawn(async move |_, cx| {
             cx.update_window(wh, |_, window, cx| {
                 window.open_dialog(cx, move |dialog, _, _| {
-                    dialog_chrome(dialog).w(DIALOG_WIDE).child(picker.clone())
+                    dialog_chrome(dialog).w(dialog_wide()).child(picker.clone())
                 });
             })
             .ok();
@@ -2017,7 +2075,7 @@ impl AppView {
             let (weak2, label2) = (weak.clone(), label.clone());
             let jump_warning = jump_warning.clone();
             let warning_color = cx.theme().warning;
-            dialog_chrome(dialog).w(DIALOG_NARROW).child(
+            dialog_chrome(dialog).w(dialog_narrow()).child(
                 v_flex()
                     .p(px(12.))
                     .gap(px(8.))
@@ -2147,7 +2205,7 @@ impl AppView {
         let view_for_dialog = view.clone();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
             dialog_chrome(dialog)
-                .w(DIALOG_WIDE)
+                .w(dialog_wide())
                 .child(view_for_dialog.clone())
         });
     }
@@ -2262,7 +2320,7 @@ impl AppView {
         )
         .detach();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
-            dialog_chrome(dialog).w(DIALOG_WIDE).child(view.clone())
+            dialog_chrome(dialog).w(dialog_wide()).child(view.clone())
         });
     }
 
@@ -2439,7 +2497,7 @@ impl AppView {
         let form_for_dialog = form.clone();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
             dialog_chrome(dialog)
-                .w(DIALOG_FORM)
+                .w(dialog_form())
                 .child(form_for_dialog.clone())
         });
         // A new host starts from its address; pasting `user@host:port` there
@@ -2583,7 +2641,9 @@ impl AppView {
         let left_pad = if window.is_fullscreen() {
             px(8.)
         } else {
-            px(80.)
+            // Native traffic lights do not zoom, so the clearance stays put
+            // or a smaller interface would slide the title under them.
+            gpui::px(80.)
         };
         #[cfg(not(target_os = "macos"))]
         let left_pad = px(6.);
@@ -2661,7 +2721,7 @@ impl AppView {
         let bar = h_flex()
             .relative()
             .w_full()
-            .h(chrome::TITLE_BAR_HEIGHT)
+            .h(chrome::title_bar_height())
             .pl(left_pad)
             .pr(px(6.))
             .gap(px(8.))

@@ -8,8 +8,10 @@
 //! This is part of `impl ServerSession`, kept out of the session module so
 //! that module stays about the connection lifecycle.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, AnyElement, Context, Hsla, SharedString};
+use gpui::{div, AnyElement, Context, Hsla, SharedString};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,

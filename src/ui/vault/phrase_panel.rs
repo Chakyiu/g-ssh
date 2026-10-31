@@ -1,5 +1,7 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App};
+use gpui::{div, App};
+
 use gpui_component::{h_flex, theme::Theme, v_flex, ActiveTheme as _};
 
 use crate::ui::vault::lock;

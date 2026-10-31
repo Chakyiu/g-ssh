@@ -1,8 +1,10 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    actions, div, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, KeyBinding, MouseButton, ScrollHandle, SharedString, Window,
 };
+
 use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},

@@ -8,12 +8,13 @@
 //! The methods belong to `ServerSession`. They live here so that the session
 //! module stays about the connection lifecycle.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, px, relative, Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, Entity,
-    Focusable as _, Hsla, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, SharedString,
-    Window,
+    div, relative, Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, Focusable as _,
+    Hsla, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, SharedString, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogFooter, DialogHeader, DialogTitle},
@@ -475,6 +476,13 @@ impl ServerSession {
             &terminal,
             |this, terminal, event: &TerminalEvent, cx| match event {
                 TerminalEvent::Exited => this.close_exited_terminal(&terminal, cx),
+                TerminalEvent::AskAgent {
+                    text,
+                    start_line,
+                    end_line,
+                } => {
+                    this.open_agent_from_terminal(text.clone(), *start_line, *end_line, cx);
+                }
             },
         )
         .detach();
@@ -1098,10 +1106,76 @@ impl ServerSession {
             .into_any_element()
     }
 
-    /// Show or hide this connection's inspector. Other open hosts are left
-    /// as they are.
+    /// The name on the terminal tab that has the keyboard.
+    pub(crate) fn active_tab_label(&self, cx: &App) -> String {
+        let Some(ix) = self.focused_index() else {
+            return "Terminal".to_string();
+        };
+        let (title, _, file) = self.tab_meta(ix, cx);
+        tab_label(
+            ix,
+            self.terminals.len() == 1,
+            title.as_deref(),
+            file.as_deref(),
+        )
+    }
+
+    /// Show the agent. A non-empty `text` is attached as the terminal
+    /// selection, marked with this session, the tab, and the lines.
+    fn open_agent_from_terminal(
+        &mut self,
+        text: String,
+        start_line: usize,
+        end_line: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_server_panel_shown = true;
+        let cite = if text.trim().is_empty() {
+            None
+        } else {
+            Some(crate::ui::session::panel::SelectionCite::new(
+                &crate::ui::session::panel::session_login(
+                    &self.conn_info.username,
+                    &self.conn_info.host,
+                ),
+                &self.active_tab_label(cx),
+                start_line,
+                end_line,
+                &text,
+            ))
+        };
+        self.server_panel
+            .update(cx, |panel, cx| panel.request_agent(cite, cx));
+        cx.notify();
+    }
+
+    /// Show the agent chat, or hide the panel when that chat is already in front.
+    fn toggle_agent_panel(&mut self, cx: &mut Context<Self>) {
+        let showing = self.is_server_panel_shown && self.server_panel.read(cx).shows_agent();
+        if showing {
+            self.is_server_panel_shown = false;
+            cx.notify();
+            return;
+        }
+        self.is_server_panel_shown = true;
+        self.server_panel
+            .update(cx, |panel, cx| panel.request_agent(None, cx));
+        cx.notify();
+    }
+
+    /// Show or hide this connection's inspector. The agent chat is a different
+    /// face of the same side, so this switches to Overview and Snippets when
+    /// the chat is what is open. Other hosts are left as they are.
     pub fn toggle_server_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.is_server_panel_shown = !self.is_server_panel_shown;
+        let inspector_open =
+            self.is_server_panel_shown && !self.server_panel.read(cx).shows_agent();
+        if inspector_open {
+            self.is_server_panel_shown = false;
+        } else {
+            self.is_server_panel_shown = true;
+            self.server_panel
+                .update(cx, |panel, cx| panel.show_inspector(cx));
+        }
         // The click took the keys from whatever was on screen.
         if self.is_sftp_hidden {
             self.is_terminal_focus_pending = true;
@@ -1729,10 +1803,26 @@ impl ServerSession {
             .into_any_element()
     }
 
+    pub(crate) fn render_agent_button(&self, cx: &Context<Self>) -> AnyElement {
+        let is_on = self.is_server_panel_shown && self.server_panel.read(cx).shows_agent();
+        toggle_button(
+            SharedString::from(format!("agent-{}", self.server_id)),
+            is_on,
+            cx,
+        )
+        .px(px(5.))
+        .child(Icon::empty().path("icons/message-square.svg").size(px(15.)))
+        .tooltip(|window, cx| Tooltip::new("Agent").build(window, cx))
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_agent_panel(cx)))
+        .into_any_element()
+    }
+
     pub(crate) fn render_server_panel_toggle(&self, cx: &Context<Self>) -> AnyElement {
+        let inspector_open =
+            self.is_server_panel_shown && !self.server_panel.read(cx).shows_agent();
         toggle_button(
             SharedString::from(format!("server-panel-{}", self.server_id)),
-            self.is_server_panel_shown,
+            inspector_open,
             cx,
         )
         .relative()

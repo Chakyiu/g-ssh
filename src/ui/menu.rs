@@ -12,12 +12,14 @@ use std::cell::Cell;
 use std::panic::Location;
 use std::rc::Rc;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    canvas, deferred, div, point, px, Anchor, AnyElement, App, Axis, Bounds, ClickEvent, ElementId,
+    canvas, deferred, div, point, Anchor, AnyElement, App, Axis, Bounds, ClickEvent, ElementId,
     GlobalElementId, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, Pixels, Point,
     Position, SharedString, Style, Window,
 };
+
 use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
 
 /// One selectable row in a menu.

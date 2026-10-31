@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use crate::files::associations::SharedFileAssociations;
 use crate::preferences::Preferences;
 use crate::theme;
-use crate::ui::session::panel::{ServerPanel, ServerPanelEvent, PANEL_WIDTH};
+use crate::ui::scale::px;
+use crate::ui::session::panel::{panel_resize_handle, PanelResize, ServerPanel, ServerPanelEvent};
 use crate::ui::sftp::browser::{
     BrowserEvent, PreservedFiles, RestorePaths, SftpBrowser, TransferKind,
 };
@@ -19,9 +20,10 @@ use crate::ui::terminal::view::TerminalView;
 use crate::ui::VaultState;
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable as _, MouseButton, Pixels, StyleRefinement, Task, WeakEntity, Window,
+    div, AnyElement, App, AsyncApp, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable as _, MouseButton, Pixels, StyleRefinement, Task, WeakEntity, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
@@ -150,6 +152,8 @@ pub enum ServerSessionEvent {
     OsDetected(String),
     /// Run this vault snippet in the session's terminal.
     RunSnippet(uuid::Uuid),
+    /// Open Settings on the agent endpoint page.
+    OpenAgentSettings,
     /// The user (or `~/.ssh/known_hosts`) trusted this host key fingerprint.
     /// Persist it on `entry_id`'s entry so future connects verify silently.
     /// On a jumped host that is often a bastion, never the target.
@@ -842,6 +846,10 @@ pub struct ServerSession {
     /// The inspector on the right of this connection. Each open host has its
     /// own, so a split does not open the panel on both sides.
     pub(crate) is_server_panel_shown: bool,
+    /// Polls only while on screen. Made with the session and not on first
+    /// show: gpui does not redraw a cached view for an entity created during
+    /// a render. The terminal opens the agent tab through this.
+    pub(crate) server_panel: Entity<ServerPanel>,
     /// The server's shell history, kept so a terminal tab opened later gets
     /// the same suggestions as the first.
     pub(crate) shell_history: Vec<String>,
@@ -901,9 +909,6 @@ pub struct ServerSession {
     /// Holds a clone of the connection, which stays open as long as any
     /// clone lives. Kept here so that it ends with the session.
     probe_task: Option<Task<()>>,
-    /// Polls only while on screen. Made here and not on first show: gpui
-    /// does not redraw a cached view for an entity created during a render.
-    server_panel: Entity<ServerPanel>,
 }
 
 impl EventEmitter<ServerSessionEvent> for ServerSession {}
@@ -2208,24 +2213,55 @@ impl ServerSession {
         event: &ServerPanelEvent,
         cx: &mut Context<Self>,
     ) {
-        let ServerPanelEvent::RunSnippet(id) = event;
-        // The snippet runs in the shell, so that tab comes forward.
-        self.is_sftp_hidden = true;
-        self.is_terminal_focus_pending = true;
-        cx.emit(ServerSessionEvent::RunSnippet(*id));
-        cx.notify();
+        match event {
+            ServerPanelEvent::RunSnippet(id) => {
+                // The snippet runs in the shell, so that tab comes forward.
+                self.is_sftp_hidden = true;
+                self.is_terminal_focus_pending = true;
+                cx.emit(ServerSessionEvent::RunSnippet(*id));
+                cx.notify();
+            }
+            ServerPanelEvent::OpenAgentSettings => {
+                cx.emit(ServerSessionEvent::OpenAgentSettings);
+            }
+            ServerPanelEvent::WidthChanged => cx.notify(),
+        }
     }
 
-    fn render_server_panel(&self) -> Option<AnyElement> {
+    fn render_server_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.is_server_panel_shown || self.browser.is_none() {
             return None;
         }
-        // Redrawn on its own ticks, not on every terminal frame.
-        let style = StyleRefinement::default()
-            .w(px(PANEL_WIDTH))
-            .flex_none()
-            .h_full();
-        Some(self.server_panel.clone().cached(style).into_any_element())
+        // The panel is cached so a terminal frame does not redraw it. The
+        // handle stays outside that cache: its hover is a window refresh,
+        // which would not reach a cached child. The width follows the face
+        // and the last drag; either one emits `WidthChanged` and this runs
+        // again.
+        let width = self.server_panel.read(cx).laid_out_width(window, cx);
+        let panel_id = self.server_panel.entity_id();
+        let style = StyleRefinement::default().w(px(width)).flex_none().h_full();
+        Some(
+            div()
+                .id(("server-panel-frame", panel_id.as_u64()))
+                .relative()
+                .flex_none()
+                .w(px(width))
+                .h_full()
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<PanelResize>, window, cx| {
+                        let drag = event.drag(cx);
+                        if !drag.is_for(panel_id) {
+                            return;
+                        }
+                        let width = drag.width_at(event.event.position.x.as_f32());
+                        this.server_panel
+                            .update(cx, |panel, cx| panel.resize_to(width, window, cx));
+                    },
+                ))
+                .child(self.server_panel.clone().cached(style))
+                .child(panel_resize_handle(panel_id, width))
+                .into_any_element(),
+        )
     }
 }
 
@@ -2253,7 +2289,7 @@ impl ServerSession {
             self.tab_slot = None;
         }
         let failure_card = self.render_connect_failure(cx);
-        let server_panel = self.render_server_panel();
+        let server_panel = self.render_server_panel(window, cx);
         let theme = cx.theme();
 
         let content: AnyElement = if let (Some(browser), Some(_)) =

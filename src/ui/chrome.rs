@@ -1,11 +1,14 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, Div, ElementId, Stateful, Window, WindowControlArea};
+use gpui::{div, Div, ElementId, Stateful, Window, WindowControlArea};
 
 #[cfg(not(target_os = "macos"))]
 use gpui_component::{h_flex, Icon, IconName};
 
 /// Height of the title bar strip, on the main screen and the lock screens.
-pub const TITLE_BAR_HEIGHT: gpui::Pixels = px(32.);
+pub fn title_bar_height() -> gpui::Pixels {
+    px(32.)
+}
 
 /// An empty strip that moves the window when dragged. It grows to fill the
 /// row it sits in.
@@ -117,7 +120,7 @@ pub fn bare_title_bar(window: &Window) -> Div {
     let bar = gpui_component::h_flex()
         .flex_none()
         .w_full()
-        .h(TITLE_BAR_HEIGHT)
+        .h(title_bar_height())
         .pr(px(6.))
         .items_center()
         .child(drag_region("lock-titlebar-drag"));

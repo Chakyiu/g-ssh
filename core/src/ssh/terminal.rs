@@ -11,8 +11,8 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{ClearMode, Color, CursorShape, Handler, Processor};
 
 use crate::ssh::shell::{
-    GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionSide, SelectionType,
-    SnapshotCell, SnapshotColor, TermSnapshot,
+    GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionExcerpt, SelectionSide,
+    SelectionType, SnapshotCell, SnapshotColor, TermSnapshot,
 };
 
 /// Rows of scrollback kept per session.
@@ -287,6 +287,51 @@ impl TermEmulator {
         self.term.selection_to_string()
     }
 
+    /// Selected text plus its line numbers. Lines count from the top of the
+    /// scrollback, so the oldest row still kept is line 1.
+    pub fn selection_excerpt(&self) -> Option<SelectionExcerpt> {
+        let text = self.term.selection_to_string()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let range = self
+            .term
+            .selection
+            .as_ref()?
+            .to_range(&self.term)
+            .map(to_grid_range)?;
+        let top = self.term.grid().topmost_line().0;
+        let start = scrollback_line(range.start.line, top);
+        let end = scrollback_line(range.end.line, top);
+        let (start_line, end_line) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        Some(SelectionExcerpt {
+            text,
+            start_line,
+            end_line,
+        })
+    }
+
+    /// The scrollback and the screen, as the user sees them. The selection is
+    /// left alone.
+    pub fn buffer_text(&self) -> String {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        if cols == 0 {
+            return String::new();
+        }
+        let start = AlacPoint::new(grid.topmost_line(), Column(0));
+        let end = AlacPoint::new(grid.bottommost_line(), Column(cols - 1));
+        self.term.bounds_to_string(start, end)
+    }
+
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn select_all(&mut self) -> Option<GridSelectionRange> {
         let (start, end) = {
             let grid = self.term.grid();
@@ -522,6 +567,11 @@ fn to_alac_side(s: SelectionSide) -> Side {
     }
 }
 
+/// 1-based row, counting down from the oldest scrollback line.
+fn scrollback_line(line: i32, top: i32) -> usize {
+    line.saturating_sub(top).max(0) as usize + 1
+}
+
 fn to_grid_range(r: AlacSelectionRange) -> GridSelectionRange {
     GridSelectionRange {
         start: GridPoint {
@@ -628,6 +678,13 @@ mod tests {
         let text = emulator.selection_to_string().expect("selection has text");
         assert!(text.starts_with("first\n"), "got {text:?}");
         assert!(text.contains("last"));
+
+        // The newline after "last" leaves the cursor on the next row, and
+        // select-all includes it, so the range is one row longer than the
+        // eight strings that were written.
+        let excerpt = emulator.selection_excerpt().expect("selection has lines");
+        assert_eq!(excerpt.start_line, 1);
+        assert_eq!(excerpt.end_line, 9);
     }
 
     #[test]

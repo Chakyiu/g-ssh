@@ -1,8 +1,10 @@
 //! The dialog behind the title bar's update mark: what is new, and the
 //! download of it. It only shows what `UpdateService` knows.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, Context, EventEmitter, Window};
+use gpui::{div, Context, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogHeader, DialogTitle},

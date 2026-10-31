@@ -11,7 +11,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::LazyLock;
 
-use gpui::{px, App, Hsla, Window, WindowAppearance};
+use gpui::{App, Hsla, Window, WindowAppearance};
+
+use crate::ui::scale::px;
 use gpui_component::theme::{Theme, ThemeMode, ThemeTokens};
 
 use crate::preferences::ThemePreference;
@@ -548,8 +550,11 @@ fn apply_theme(cx: &mut App) {
     // is the window's rem, so `h_6`, `px_2`, `text_sm` and friends all scale
     // with it. 16px puts a plain Input at 32px and `text_sm` at 14px, both a
     // size up from the rest of the chrome; 14px lands them on the 22/28px
-    // ladder the hand-built rows use.
+    // ladder the hand-built rows use. `px` includes the interface zoom, so
+    // stock controls grow with the rest of the window. Kept in step with
+    // `sync_ui_scale`.
     t.font_size = px(14.);
+    t.mono_font_size = px(13.);
 
     t.background       = p.background;
     t.foreground       = p.text;
@@ -709,6 +714,16 @@ fn apply_theme(cx: &mut App) {
     // `tokens`, never `colors`. Without this they keep gpui-component's stock
     // values and stay dark in light mode.
     t.tokens = ThemeTokens::from(&t.colors);
+}
+
+/// Point the rem size and the monospace size at the current interface zoom.
+///
+/// [`apply_theme`] sets the same two sizes. This is the path Command +/-
+/// uses, so a zoom does not repaint the rest of the palette.
+pub fn sync_ui_scale(cx: &mut App) {
+    let t = Theme::global_mut(cx);
+    t.font_size = px(14.);
+    t.mono_font_size = px(13.);
 }
 
 #[cfg(test)]

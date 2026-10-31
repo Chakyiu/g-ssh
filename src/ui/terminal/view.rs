@@ -1,15 +1,15 @@
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-    Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, Subscription, Task,
-    Window,
+    actions, div, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, Hsla,
+    KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, Subscription, Task, Window,
 };
 
-use crate::preferences::{Preferences, DEFAULT_TERMINAL_FONT_SIZE};
+use crate::preferences::Preferences;
 use crate::theme;
 use crate::ui::keyboard::bind_chord;
 use crate::ui::menu::{ContextMenu, ContextMenuItem};
@@ -35,9 +35,6 @@ actions!(
         Paste,
         CopySelection,
         SelectAll,
-        IncreaseFontSize,
-        DecreaseFontSize,
-        ResetFontSize,
         ClearScreen,
         ScrollPageUp,
         ScrollPageDown,
@@ -49,9 +46,23 @@ actions!(
 /// How long the "Copied" note stays up after a copy.
 const COPIED_HINT_DURATION: Duration = Duration::from_millis(1500);
 
-/// Space between the side edges of the terminal and its text. The scrollbar
-/// sits inside it, so overlays and the scrollbar's grab band account for it.
+/// Space between the terminal's left edge and its text.
 pub(crate) const SIDE_PADDING: f32 = 12.;
+
+/// Lane reserved at the terminal's right edge. The grid stops before it, and
+/// the scrollbar is painted inside it, so the bar sits on the panel instead of
+/// covering the last glyphs.
+pub(crate) const SCROLLBAR_GUTTER: f32 = 14.;
+
+/// Painted thickness of the scrollbar thumb.
+pub(crate) const SCROLLBAR_WIDTH: f32 = 6.;
+
+/// Gap between the thumb and the panel's outer edge.
+pub(crate) const SCROLLBAR_EDGE_INSET: f32 = 4.;
+
+/// How long the scrollbar stays up after a scroll, a drag, or the pointer
+/// leaving its lane.
+const SCROLLBAR_HOLD: Duration = Duration::from_millis(1000);
 
 pub fn init(cx: &mut App) {
     search::init(cx);
@@ -71,10 +82,8 @@ pub fn init(cx: &mut App) {
         bind_chord(cx, "cmd-v", Paste, Some("Terminal"));
         bind_chord(cx, "cmd-c", CopySelection, Some("Terminal"));
         bind_chord(cx, "cmd-a", SelectAll, Some("Terminal"));
-        bind_chord(cx, "cmd-=", IncreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "cmd-shift-=", IncreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "cmd--", DecreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "cmd-0", ResetFontSize, Some("Terminal"));
+        // Command +/- zooms the whole interface from `ui::app`, including
+        // this font. Binding it here would steal the shortcut back.
         bind_chord(cx, "cmd-k", ClearScreen, Some("Terminal"));
         cx.bind_keys([
             KeyBinding::new("cmd-home", ScrollToTop, Some("Terminal")),
@@ -88,10 +97,7 @@ pub fn init(cx: &mut App) {
         bind_chord(cx, "ctrl-shift-v", Paste, Some("Terminal"));
         bind_chord(cx, "ctrl-shift-c", CopySelection, Some("Terminal"));
         bind_chord(cx, "ctrl-shift-a", SelectAll, Some("Terminal"));
-        bind_chord(cx, "ctrl-=", IncreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "ctrl-shift-=", IncreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "ctrl--", DecreaseFontSize, Some("Terminal"));
-        bind_chord(cx, "ctrl-0", ResetFontSize, Some("Terminal"));
+        // Ctrl +/- zooms the whole interface from `ui::app`.
         bind_chord(cx, "ctrl-shift-k", ClearScreen, Some("Terminal"));
     }
 }
@@ -219,6 +225,13 @@ pub struct TerminalView {
     pub(crate) scrollbar_geom: Option<ScrollbarGeom>,
     /// While dragging the scrollbar thumb: the grab offset (pointer.y - thumb top).
     scrollbar_drag: Option<Pixels>,
+    /// Pointer is in the scrollbar lane. Keeps the bar up without a timer.
+    scrollbar_hovered: bool,
+    /// Hide the bar once this instant has passed, unless the pointer is in the
+    /// lane or a drag is in progress. `None` once the bar has been hidden.
+    scrollbar_visible_until: Option<Instant>,
+    /// Fires when `scrollbar_visible_until` elapses. Replaced by the next scroll.
+    scrollbar_hide_task: Option<Task<()>>,
     /// Command suggestions popup, see [`crate::ui::terminal::suggestions`].
     pub(crate) suggestions: SuggestionState,
     /// Search bar state, see [`crate::ui::terminal::search`].
@@ -245,6 +258,13 @@ pub struct TerminalView {
 pub enum TerminalEvent {
     /// The remote shell ended while the connection stayed up.
     Exited,
+    /// Open the agent. `text` is empty when nothing is selected. The line
+    /// numbers count from the top of the scrollback.
+    AskAgent {
+        text: String,
+        start_line: usize,
+        end_line: usize,
+    },
 }
 
 impl EventEmitter<TerminalEvent> for TerminalView {}
@@ -323,6 +343,9 @@ impl TerminalView {
             autoscroll_task: None,
             scrollbar_geom: None,
             scrollbar_drag: None,
+            scrollbar_hovered: false,
+            scrollbar_visible_until: None,
+            scrollbar_hide_task: None,
             suggestions: SuggestionState::default(),
             search: SearchState::default(),
             _preferences_subscription: preferences_subscription,
@@ -332,33 +355,6 @@ impl TerminalView {
             is_link_click: false,
             reported_press: None,
         }
-    }
-
-    fn on_increase_font_size(
-        &mut self,
-        _: &IncreaseFontSize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        Preferences::set_terminal_font_size(Preferences::terminal_font_size(cx) + 1.0, cx);
-    }
-
-    fn on_decrease_font_size(
-        &mut self,
-        _: &DecreaseFontSize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        Preferences::set_terminal_font_size(Preferences::terminal_font_size(cx) - 1.0, cx);
-    }
-
-    fn on_reset_font_size(
-        &mut self,
-        _: &ResetFontSize,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        Preferences::set_terminal_font_size(DEFAULT_TERMINAL_FONT_SIZE, cx);
     }
 
     /// Wipe the scrollback and the screen, then send Ctrl-L (form feed) so the
@@ -425,6 +421,7 @@ impl TerminalView {
             cx.propagate();
             return;
         }
+        self.note_scrollbar_activity(cx);
         let shell = self.shell.clone();
         cx.background_executor()
             .spawn(async move { shell.scroll_to(target).await })
@@ -451,8 +448,8 @@ impl TerminalView {
             div()
                 .absolute()
                 .bottom(px(8.))
-                // Clear of the scrollbar, like the search bar.
-                .right(px(20. + SIDE_PADDING))
+                // Clear of the scrollbar lane, like the search bar.
+                .right(px(SCROLLBAR_GUTTER + 8.))
                 .px(px(8.))
                 .py(px(3.))
                 .bg(theme::pop_surface())
@@ -482,6 +479,14 @@ impl TerminalView {
                 }),
             ));
         }
+        items.push(ContextMenuItem::new(
+            "term-ask-agent",
+            "Ask agent",
+            cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                this.ask_agent(cx);
+            }),
+        ));
         if has_clipboard {
             items.push(ContextMenuItem::new(
                 "term-paste",
@@ -509,6 +514,35 @@ impl TerminalView {
             }),
         ));
         items
+    }
+
+    /// Open the agent with the current selection, read off the emulator.
+    fn ask_agent(&mut self, cx: &mut Context<Self>) {
+        if self.selection.is_none() {
+            cx.emit(TerminalEvent::AskAgent {
+                text: String::new(),
+                start_line: 0,
+                end_line: 0,
+            });
+            return;
+        }
+        let shell = self.shell.clone();
+        cx.spawn(async move |this, cx| {
+            let excerpt = shell.extract_selection_excerpt().await;
+            this.update(cx, |_, cx| {
+                let (text, start_line, end_line) = match excerpt {
+                    Some(excerpt) => (excerpt.text, excerpt.start_line, excerpt.end_line),
+                    None => (String::new(), 0, 0),
+                };
+                cx.emit(TerminalEvent::AskAgent {
+                    text,
+                    start_line,
+                    end_line,
+                });
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The grid size last sent to the remote PTY, as (rows, columns).
@@ -585,7 +619,7 @@ impl TerminalView {
     }
 
     /// True when `pos` is on the scrollbar's clickable band.
-    fn is_over_scrollbar(&self, pos: Point<Pixels>) -> bool {
+    pub(crate) fn is_over_scrollbar(&self, pos: Point<Pixels>) -> bool {
         let Some(g) = self.scrollbar_geom else {
             return false;
         };
@@ -600,11 +634,105 @@ impl TerminalView {
         self.scrollbar_drag.is_some()
     }
 
+    pub(crate) fn is_scrollbar_hovered(&self) -> bool {
+        self.scrollbar_hovered
+    }
+
+    /// The thumb uses its stronger colour while the pointer is on it or dragging it.
+    pub(crate) fn scrollbar_thumb_hot(&self) -> bool {
+        self.scrollbar_hovered || self.scrollbar_drag.is_some()
+    }
+
+    /// True while the bar should be painted. Scrollback alone does not show it:
+    /// it comes up for a scroll, a hover of its lane, or a drag, then goes away.
+    pub(crate) fn scrollbar_shown(&self) -> bool {
+        self.scrollbar_thumb_hot()
+            || self
+                .scrollbar_visible_until
+                .is_some_and(|until| until > Instant::now())
+    }
+
+    /// Remember where the bar was painted, or that there is none. Dropping the
+    /// geometry also drops the hover, so a cleared scrollback cannot leave the
+    /// bar showing.
+    pub(crate) fn set_scrollbar_geom(&mut self, geom: Option<ScrollbarGeom>) {
+        self.scrollbar_geom = geom;
+        if geom.is_none() {
+            self.scrollbar_hovered = false;
+        }
+    }
+
+    /// Keep the bar up for [`SCROLLBAR_HOLD`] after this moment.
+    fn note_scrollbar_activity(&mut self, cx: &mut Context<Self>) {
+        self.scrollbar_visible_until = Some(Instant::now() + SCROLLBAR_HOLD);
+        self.arm_scrollbar_hide(cx);
+        cx.notify();
+    }
+
+    fn arm_scrollbar_hide(&mut self, cx: &mut Context<Self>) {
+        let Some(until) = self.scrollbar_visible_until else {
+            return;
+        };
+        let wait = until.saturating_duration_since(Instant::now());
+        self.scrollbar_hide_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |view, cx| view.hide_scrollbar_if_idle(cx))
+                .ok();
+        }));
+    }
+
+    fn hide_scrollbar_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.scrollbar_thumb_hot() {
+            return;
+        }
+        // The timer can fire a little early, or a later scroll can have pushed
+        // the deadline out after this task was queued. Wait out the rest.
+        if self
+            .scrollbar_visible_until
+            .is_some_and(|until| until > Instant::now())
+        {
+            self.arm_scrollbar_hide(cx);
+            return;
+        }
+        if self.scrollbar_visible_until.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Show the bar while the pointer is in its lane, and hold it briefly after
+    /// the pointer leaves so it does not vanish under the cursor.
+    pub(crate) fn sync_scrollbar_hover(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let hovered = self.is_over_scrollbar(pos);
+        if hovered == self.scrollbar_hovered {
+            return;
+        }
+        self.scrollbar_hovered = hovered;
+        if hovered {
+            cx.notify();
+        } else if self.scrollbar_drag.is_none() {
+            self.note_scrollbar_activity(cx);
+        }
+    }
+
     /// End an in-progress thumb drag. Returns whether one was actually active (so
     /// the mouse-up handler knows to swallow the event instead of ending a
-    /// selection).
-    pub(crate) fn end_scrollbar_drag(&mut self) -> bool {
-        self.scrollbar_drag.take().is_some()
+    /// selection). The bar stays up while the pointer is still in the lane, and
+    /// otherwise holds for a moment before hiding.
+    pub(crate) fn end_scrollbar_drag(
+        &mut self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.scrollbar_drag.take().is_none() {
+            return false;
+        }
+        self.scrollbar_hovered = self.is_over_scrollbar(pos);
+        if self.scrollbar_hovered {
+            cx.notify();
+        } else {
+            self.note_scrollbar_activity(cx);
+        }
+        true
     }
 
     /// If `pos` lands on the scrollbar, begin a drag and return true so the caller
@@ -625,6 +753,7 @@ impl TerminalView {
         };
         self.scrollbar_drag = Some(grab);
         self.scrollbar_drag_move(pos, cx);
+        cx.notify();
         true
     }
 
@@ -843,6 +972,7 @@ impl TerminalView {
         let step = ((past.as_f32() / line_height.as_f32()).floor() as i32 + 1).clamp(1, 8);
         let delta = dir * step;
 
+        self.note_scrollbar_activity(cx);
         let shell = self.shell.clone();
         cx.background_executor()
             .spawn(async move { shell.scroll_delta(delta).await })
@@ -1271,7 +1401,11 @@ impl TerminalView {
         let line_height_f32 = self
             .last_cell_size
             .map(|(_, line_height)| line_height.as_f32())
-            .unwrap_or_else(|| Preferences::terminal_font_size(cx) * LINE_HEIGHT_FACTOR);
+            .unwrap_or_else(|| {
+                Preferences::terminal_font_size(cx)
+                    * crate::ui::scale::factor()
+                    * LINE_HEIGHT_FACTOR
+            });
         let delta_lines = match event.delta {
             ScrollDelta::Lines(p) => p.y,
             ScrollDelta::Pixels(p) => p.y.as_f32() / line_height_f32,
@@ -1303,6 +1437,7 @@ impl TerminalView {
             return;
         }
 
+        self.note_scrollbar_activity(cx);
         let shell = self.shell.clone();
         cx.background_executor()
             .spawn(async move {
@@ -1393,7 +1528,9 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .size_full()
-            .px(px(SIDE_PADDING))
+            // The right edge is the scrollbar lane, inside the terminal element,
+            // so the bar meets the panel instead of floating over the text.
+            .pl(px(SIDE_PADDING))
             .bg(background)
             // Anchor for the search bar, which pins itself to the top-right.
             .relative()
@@ -1402,9 +1539,6 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(Self::on_copy_selection))
             .on_action(cx.listener(Self::on_select_all))
-            .on_action(cx.listener(Self::on_increase_font_size))
-            .on_action(cx.listener(Self::on_decrease_font_size))
-            .on_action(cx.listener(Self::on_reset_font_size))
             .on_action(cx.listener(Self::on_clear_screen))
             .on_action(cx.listener(Self::on_scroll_page_up))
             .on_action(cx.listener(Self::on_scroll_page_down))

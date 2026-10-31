@@ -1,8 +1,8 @@
 pub mod error;
 pub mod model;
 
-mod hosts;
 pub(crate) mod crypto;
+mod hosts;
 pub mod memory;
 pub mod recovery;
 pub(crate) mod storage;
@@ -10,10 +10,10 @@ pub mod sync;
 
 pub use error::VaultError;
 pub use model::{
-    resolve_jump_chain, resolve_proxy, ssh_command, AuthMethod, Group, HostSnippet, PortForward,
-    ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting,
-    ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage, SshKey, SshKeySummary,
-    Tag, MAX_JUMP_HOSTS,
+    resolve_jump_chain, resolve_proxy, ssh_command, AgentSettings, AuthMethod, Group, HostSnippet,
+    PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind, ProxyMode,
+    ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage, SshKey,
+    SshKeySummary, Tag, MAX_JUMP_HOSTS,
 };
 pub use recovery::RecoveryPhrase;
 
@@ -370,6 +370,7 @@ impl VaultManager {
             sync,
             team_pins: Vec::new(),
             joins: Vec::new(),
+            agent: AgentSettings::default(),
         };
         let enc_payload = Self::encrypt_payload(dek, &payload)?;
 
@@ -999,6 +1000,17 @@ impl VaultManager {
         if self.payload.keys.len() == before {
             return Err(VaultError::KeyNotFound(id));
         }
+        self.save()
+    }
+
+    pub fn agent_settings(&self) -> AgentSettings {
+        self.payload.agent.clone()
+    }
+
+    /// Replace the assistant endpoint. The key is stored with the vault, not
+    /// written into a host file.
+    pub fn set_agent_settings(&mut self, settings: AgentSettings) -> Result<(), VaultError> {
+        self.payload.agent = settings;
         self.save()
     }
 
@@ -3356,6 +3368,7 @@ mod tests {
             sync: None,
             team_pins: Vec::new(),
             joins: Vec::new(),
+            agent: AgentSettings::default(),
         };
         let enc_payload = VaultManager::encrypt_payload(&dek, &payload).unwrap();
         let vault = VaultFile {
@@ -3382,5 +3395,40 @@ mod tests {
 
         let vm = VaultManager::unlock_with_password(&json, &pw("pw")).unwrap();
         assert_eq!(password_of(&vm.get_entry(id).unwrap()), "s3cr3t");
+    }
+
+    #[test]
+    fn agent_settings_stay_in_the_vault_and_out_of_the_host_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let (mut vm, _) = VaultManager::create_with_params(&path, &pw("pw"), fast_kdf()).unwrap();
+        vm.add_entry(test_entry()).unwrap();
+        vm.set_agent_settings(AgentSettings {
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            model: "llama3.2".into(),
+            api_key: "sk-test-secret".into(),
+            system_prompt: "Be brief.".into(),
+            always_allow: vec!["ls".into(), "cd".into()],
+        })
+        .unwrap();
+        vm.lock();
+
+        let host =
+            std::fs::read_to_string(dir.path().join("connections").join("Prod web server.json"))
+                .unwrap();
+        assert!(!host.contains("sk-test-secret"), "{host}");
+        let vault = std::fs::read_to_string(&path).unwrap();
+        assert!(!vault.contains("sk-test-secret"), "{vault}");
+
+        let vm = VaultManager::unlock_with_password(&path, &pw("pw")).unwrap();
+        let settings = vm.agent_settings();
+        assert_eq!(settings.base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(settings.model, "llama3.2");
+        assert_eq!(settings.api_key, "sk-test-secret");
+        assert_eq!(settings.system_prompt, "Be brief.");
+        assert_eq!(
+            settings.always_allow,
+            vec!["ls".to_string(), "cd".to_string()]
+        );
     }
 }

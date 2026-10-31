@@ -2,12 +2,14 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    canvas, deferred, div, point, px, svg, Anchor, AnyElement, App, Bounds, Context, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Point, SharedString, Window,
+    canvas, deferred, div, point, svg, Anchor, AnyElement, App, Bounds, Context, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    Point, SharedString, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,

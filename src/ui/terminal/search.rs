@@ -5,10 +5,10 @@
 //! scrollback and scroll them into view. The matching itself happens in the shell
 //! worker, which owns the terminal buffer: see [`gssh::ssh::terminal`].
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{
-    actions, div, px, AnyElement, App, Context, Entity, Focusable as _, KeyBinding, Window,
-};
+use gpui::{actions, div, AnyElement, App, Context, Entity, Focusable as _, KeyBinding, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -18,7 +18,7 @@ use gpui_component::{
 
 use crate::theme;
 use crate::ui::keyboard::bind_chord;
-use crate::ui::terminal::view::{TerminalView, SIDE_PADDING};
+use crate::ui::terminal::view::{TerminalView, SCROLLBAR_GUTTER};
 
 actions!(
     terminal_search,
@@ -248,9 +248,9 @@ impl TerminalView {
                 .occlude()
                 .absolute()
                 .top(px(8.))
-                // Clear of the scrollbar's grab band on the right edge, or the
-                // bar's hitbox would swallow clicks meant for the thumb.
-                .right(px(20. + SIDE_PADDING))
+                // Clear of the scrollbar lane on the right edge, or the bar's
+                // hitbox would swallow clicks meant for the thumb.
+                .right(px(SCROLLBAR_GUTTER + 8.))
                 .w(px(300.))
                 .items_center()
                 .gap(px(6.))

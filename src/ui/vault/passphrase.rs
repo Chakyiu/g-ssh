@@ -3,8 +3,10 @@
 //! passphrase for it. Validation happens in app_view (it holds the PEM);
 //! wrong answers come back via `set_error`.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, Context, Entity, EventEmitter, Window};
+use gpui::{div, Context, Entity, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogHeader, DialogTitle},

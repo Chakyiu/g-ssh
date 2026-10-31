@@ -27,11 +27,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    anchored, deferred, div, px, Anchor, AnyElement, App, Bounds, FontWeight, Pixels, Point,
+    anchored, deferred, div, Anchor, AnyElement, App, Bounds, FontWeight, Pixels, Point,
     SharedString,
 };
+
 use gpui_component::{h_flex, v_flex, ActiveTheme as _};
 
 use crate::preferences::Preferences;
@@ -794,7 +796,8 @@ impl SuggestionState {
         // The height is estimated from the row count. A popup that does not fit
         // below is anchored by its bottom to the top of the cursor cell, so it
         // grows upward and leaves the current line visible.
-        let est_height = 10.0 + self.matches.len() as f32 * (row_height + 1.0) + FOOTER_HEIGHT;
+        let est_height = crate::ui::scale::factor()
+            * (10.0 + self.matches.len() as f32 * (row_height + 1.0) + FOOTER_HEIGHT);
         let below_y = cursor.origin.y + cursor.size.height;
         let place_above = below_y.as_f32() + est_height + 8.0 > area_bottom.as_f32();
 

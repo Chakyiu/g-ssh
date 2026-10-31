@@ -64,6 +64,21 @@ pub struct GridSelectionRange {
     pub end: GridPoint,
 }
 
+/// Selected terminal text, with 1-based line numbers counted from the top of
+/// the scrollback. Line 1 is the oldest row still in the buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionExcerpt {
+    pub text: String,
+    pub start_line: usize,
+    pub end_line: usize,
+}
+
+/// What the terminal is showing, for the agent to read after a command.
+pub struct TerminalRead {
+    pub text: String,
+    pub alt_screen: bool,
+}
+
 /// Where a scrollback key moves the viewport.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScrollTarget {
@@ -147,6 +162,24 @@ impl ShellHandle {
         rx.await.ok().flatten()
     }
 
+    /// The selection and the scrollback lines it covers. `None` when nothing
+    /// is selected.
+    pub async fn extract_selection_excerpt(&self) -> Option<SelectionExcerpt> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(ShellCmd::ExtractSelectionExcerpt { reply: tx })
+            .await;
+        rx.await.ok().flatten()
+    }
+
+    /// The text on screen, including scrollback. `None` once the session is gone.
+    pub async fn read_terminal(&self) -> Option<TerminalRead> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.cmd_tx.send(ShellCmd::ReadTerminal { reply: tx }).await;
+        rx.await.ok()
+    }
+
     pub async fn select_all(&self) -> Option<GridSelectionRange> {
         let (tx, rx) = oneshot::channel();
         let _ = self.cmd_tx.send(ShellCmd::SelectAll { reply: tx }).await;
@@ -217,6 +250,12 @@ pub enum ShellCmd {
     },
     ExtractSelectionText {
         reply: oneshot::Sender<Option<String>>,
+    },
+    ExtractSelectionExcerpt {
+        reply: oneshot::Sender<Option<SelectionExcerpt>>,
+    },
+    ReadTerminal {
+        reply: oneshot::Sender<TerminalRead>,
     },
     SelectAll {
         reply: oneshot::Sender<Option<GridSelectionRange>>,
@@ -361,6 +400,15 @@ pub async fn handle_shell_commands(
                     }
                     Ok(ShellCmd::ExtractSelectionText { reply }) => {
                         let _ = reply.send(emulator.selection_to_string());
+                    }
+                    Ok(ShellCmd::ExtractSelectionExcerpt { reply }) => {
+                        let _ = reply.send(emulator.selection_excerpt());
+                    }
+                    Ok(ShellCmd::ReadTerminal { reply }) => {
+                        let _ = reply.send(TerminalRead {
+                            text: emulator.buffer_text(),
+                            alt_screen: emulator.is_alt_screen(),
+                        });
                     }
                     Ok(ShellCmd::SelectAll { reply }) => {
                         let range = emulator.select_all();

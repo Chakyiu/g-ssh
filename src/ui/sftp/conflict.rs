@@ -1,8 +1,10 @@
 //! A transfer whose target name is already taken: what the user is asked, the
 //! rules behind the answers, and the dialog that asks.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App, WeakEntity};
+use gpui::{div, App, WeakEntity};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,

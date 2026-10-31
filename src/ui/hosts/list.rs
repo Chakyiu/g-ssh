@@ -3,11 +3,13 @@ use std::time::{Duration, Instant};
 
 use crate::theme;
 use crate::ui::menu::{ContextMenuItem, PopoverMenu};
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, px, svg, Anchor, App, ClipboardItem, Context, Entity, EventEmitter, Focusable,
-    MouseButton, MouseDownEvent, Window,
+    div, svg, Anchor, App, ClipboardItem, Context, Entity, EventEmitter, Focusable, MouseButton,
+    MouseDownEvent, Window,
 };
+
 use gpui_component::{
     h_flex,
     input::{Input, InputState},

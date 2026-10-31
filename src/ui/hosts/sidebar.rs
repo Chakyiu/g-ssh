@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, px, Anchor, AnyElement, Bounds, Context, DragMoveEvent, Entity, EventEmitter, MouseButton,
+    div, Anchor, AnyElement, Bounds, Context, DragMoveEvent, Entity, EventEmitter, MouseButton,
     MouseDownEvent, Pixels, Point, SharedString, Window,
 };
+
 use gpui_component::{h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon, IconName};
 use uuid::Uuid;
 

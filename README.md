@@ -1,7 +1,8 @@
 # g-ssh
 
-SSH and SFTP client. Keys stay in an encrypted vault. Each host is a file
-you can copy out, and the password in that file is sealed with the vault key.
+AI-agent-enabled SSH and SFTP client. Keys stay in an encrypted vault.
+Each host is a file you can copy out, and the password in that file is
+sealed with the vault key.
 
 A host opens as a terminal tab or an SFTP tab on the same connection.
 Several shells can share that connection, and a tab can be split so two
@@ -38,6 +39,24 @@ It runs on macOS 12 or newer, Windows, and Linux (X11 and Wayland).
 Hosts can be imported from `~/.ssh/config` and from a Termius export file.
 On Windows they can also be imported from PuTTY's saved sessions and from a
 Termius install on this computer.
+
+## Agent
+
+The Agent button opens a chat beside the open terminal. Ask agent on the
+terminal menu does the same and attaches the selection. Command+Enter
+sends on a Mac, and Ctrl+Enter elsewhere. A message sent while the agent
+is working waits until it is free.
+
+The chat uses an OpenAI-compatible endpoint from Settings. The default is
+OpenAI. Ollama is a local URL with an empty key. The models are the ones
+the endpoint reports. The API key is stored in the vault and stays on this
+computer. The system prompt is edited in Settings.
+
+The model can ask to type one command into that terminal. The exact
+command is shown and runs after Allow, or when its program is on the
+always-allow list. `ls` on that list allows `ls -la`. A line that starts
+another program still asks. The agent then reads what the terminal prints.
+Chats are saved per host on this computer.
 
 ## Vault
 
@@ -125,8 +144,9 @@ The app writes under `~/.g-ssh`:
 
 | Path | What it is |
 | --- | --- |
-| `vault.json` | The encrypted vault: keys, snippets, groups, and account sync |
+| `vault.json` | The encrypted vault: keys, snippets, groups, account sync, and the agent endpoint |
 | `connections/` | One JSON file per host. The password in the file is sealed |
+| `agent-chats/` | Agent chats, one JSON file per host. This computer only |
 | `preferences.json` | Theme, terminal, and other settings read before unlock |
 | `file_associations.json` | Which local app opens a given file type |
 | `open_tabs.json` | Hosts that were open, so the next start opens them again. This computer only |

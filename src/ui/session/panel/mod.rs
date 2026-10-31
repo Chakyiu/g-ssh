@@ -1,30 +1,50 @@
 //! The panel on the right of a session: what the server is and how busy it
-//! is, and what the vault keeps for it. It reads the host over an exec
-//! channel every two seconds, and only while it is on screen.
+//! is, what the vault keeps for it, and an agent that asks before it runs
+//! a command. Metrics are read over an exec channel every two seconds, and
+//! only while the panel is on screen.
 
+mod agent;
+mod agent_store;
 mod metrics;
 mod snippets;
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::ui::scale::px;
 use futures::channel::mpsc;
 use futures::future::Either;
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
-    div, px, BackgroundExecutor, ClipboardItem, Context, Div, Entity, EventEmitter, Task,
-    WeakEntity, Window,
+    div, Axis, BackgroundExecutor, ClipboardItem, Context, Div, Entity, EntityId, EventEmitter,
+    SharedString, Task, WeakEntity, Window,
 };
-use gpui_component::{h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, StyledExt as _};
+
+use gpui_component::{
+    h_flex, resizable::HandleEdge, resize_handle, tooltip::Tooltip, v_flex, ActiveTheme as _,
+    StyledExt as _,
+};
 
 use crate::host_stats::{self, Sample, SystemInfo};
+use crate::preferences::Preferences;
 use crate::theme;
 use crate::ui::session::ServerSession;
 use crate::ui::VaultState;
 use gssh::ssh::SshConnection;
 
 pub const PANEL_WIDTH: f32 = 320.;
+/// The agent review box holds terminal text, so the panel grows while the
+/// chat is open and a listing line can stay on one row.
+pub const AGENT_PANEL_WIDTH: f32 = 480.;
+/// Dragging the left edge cannot go below this.
+const PANEL_MIN_WIDTH: f32 = 260.;
+/// Or above this.
+const PANEL_MAX_WIDTH: f32 = 720.;
+/// Sidebar, window padding, and a shell that can still be typed in.
+const PANEL_RESERVED: f32 = 520.;
 const TICK: Duration = Duration::from_secs(2);
 /// The first two readings come this fast, so the numbers and the graphs show
 /// within a second of opening: each reading needs the sample before it.
@@ -35,6 +55,8 @@ const CONNECT_RETRY: Duration = Duration::from_millis(500);
 const HISTORY_LEN: usize = 60;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Pages of the inspector. The agent chat is a different panel, opened from
+/// its own button, so it is not a third page here.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Overview,
@@ -43,7 +65,23 @@ enum Tab {
 
 pub enum ServerPanelEvent {
     RunSnippet(uuid::Uuid),
+    /// Open Settings on the agent endpoint page.
+    OpenAgentSettings,
+    /// The panel changed width. The agent chat is wider than the inspector.
+    /// The session lays the panel out again; the panel itself already redraws
+    /// on `notify`.
+    WidthChanged,
 }
+
+pub use agent_store::{
+    clear_host_sessions, clear_session_records, list_session_records, remove_session, SessionRecord,
+};
+
+pub(crate) use agent::{
+    allow_entry, canonical_base as canonical_agent_base, list_models as list_agent_models,
+    requires_key as agent_base_needs_key, session_login, SelectionCite,
+    DEFAULT_BASE as DEFAULT_AGENT_BASE, SYSTEM_PROMPT as AGENT_SYSTEM_PROMPT,
+};
 
 /// One point of the graphs.
 #[derive(Clone, Copy)]
@@ -57,13 +95,21 @@ struct Reading {
 pub struct ServerPanel {
     session: WeakEntity<ServerSession>,
     vault_state: Entity<VaultState>,
+    /// Overview or Snippets. Kept while the agent chat is in front, so the
+    /// inspector opens on the same page.
     tab: Tab,
+    /// The agent chat fills this panel. Overview and snippets are the other
+    /// face, and the two do not share a tab strip.
+    showing_agent: bool,
     info: Option<SystemInfo>,
     /// The host printed no `/proc/stat`: only the system info shows.
     is_unsupported: bool,
     last_sample: Option<Sample>,
     history: VecDeque<Reading>,
     snippet_editor: Option<snippets::SnippetEditor>,
+    agent: Option<agent::Agent>,
+    /// Applied on the next frame, which has a window for the text fields.
+    agent_open: Option<agent::AgentOpen>,
     /// Polling stops when the panel is off screen: hidden, or its tab is not
     /// in front. Every poll ends in a redraw, which keeps this fresh. `None`
     /// until the first render.
@@ -71,6 +117,9 @@ pub struct ServerPanel {
     /// Wakes the poll loop when the panel comes back on screen.
     wake: mpsc::UnboundedSender<()>,
     _poll_task: Task<()>,
+    /// Last seen generation of saved agent chats. Settings bumps it when a
+    /// record is removed, and the next frame drops that chat here too.
+    chat_epoch: u64,
 }
 
 enum NextStep {
@@ -127,14 +176,18 @@ impl ServerPanel {
             session,
             vault_state,
             tab: Tab::Overview,
+            showing_agent: false,
             info: None,
             is_unsupported: false,
             last_sample: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
             snippet_editor: None,
+            agent: None,
+            agent_open: None,
             last_rendered: None,
             wake,
             _poll_task: poll_task,
+            chat_epoch: agent_store::chat_record_epoch(),
         }
     }
 
@@ -238,7 +291,49 @@ impl ServerPanel {
     }
 
     fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
         self.tab = tab;
+        cx.notify();
+    }
+
+    /// Leave the agent chat and show Overview or Snippets, whichever was open last.
+    pub(crate) fn show_inspector(&mut self, cx: &mut Context<Self>) {
+        if !self.showing_agent {
+            return;
+        }
+        self.showing_agent = false;
+        cx.emit(ServerPanelEvent::WidthChanged);
+        cx.notify();
+    }
+
+    pub(super) fn panel_width(&self, cx: &gpui::App) -> f32 {
+        let saved = if self.showing_agent {
+            Preferences::agent_panel_width(cx)
+        } else {
+            Preferences::server_panel_width(cx)
+        };
+        saved.unwrap_or(if self.showing_agent {
+            AGENT_PANEL_WIDTH
+        } else {
+            PANEL_WIDTH
+        })
+    }
+
+    /// Width for this frame: the saved drag, or the face's default, clamped
+    /// so the shell beside the panel keeps room.
+    pub(super) fn laid_out_width(&self, window: &Window, cx: &gpui::App) -> f32 {
+        clamp_panel_width(self.panel_width(cx), window.viewport_size().width.as_f32())
+    }
+
+    pub(super) fn resize_to(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
+        let width = clamp_panel_width(width, window.viewport_size().width.as_f32());
+        if self.panel_width(cx) == width {
+            return;
+        }
+        Preferences::set_dragged_panel_width(self.showing_agent, width, cx);
+        cx.emit(ServerPanelEvent::WidthChanged);
         cx.notify();
     }
 
@@ -280,44 +375,52 @@ impl ServerPanel {
         let session = self.session.upgrade()?;
         uuid::Uuid::parse_str(&session.read(cx).server_id).ok()
     }
+
+    fn scroll_body(&self, content: Vec<gpui::AnyElement>) -> gpui::AnyElement {
+        v_flex()
+            .id("server-panel-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(12.))
+            .pt(px(6.))
+            .pb(px(12.))
+            .gap(px(10.))
+            .children(content)
+            .into_any_element()
+    }
 }
 
 impl Render for ServerPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.is_on_screen() {
             self.come_back_on_screen();
         }
         self.last_rendered = Some(Instant::now());
-        let content = match self.tab {
-            Tab::Overview => self.render_overview(cx),
-            Tab::Snippets => self.render_snippets(cx),
+        let showing_agent = self.showing_agent;
+        let body = if showing_agent {
+            self.render_agent(window, cx)
+        } else {
+            match self.tab {
+                Tab::Overview => self.scroll_body(self.render_overview(cx)),
+                Tab::Snippets => self.scroll_body(self.render_snippets(cx)),
+            }
         };
+        // The session sizes this and draws the resize handle. A fixed width
+        // here would fight that drag.
         v_flex()
-            .w(px(PANEL_WIDTH))
-            .flex_none()
-            .h_full()
-            .border_l_1()
-            .border_color(theme::border())
-            .child(
-                div()
-                    .flex_none()
-                    .px(px(12.))
-                    .pt(px(10.))
-                    .pb(px(6.))
-                    .child(self.render_tabs(cx)),
-            )
-            .child(
-                v_flex()
-                    .id("server-panel-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(12.))
-                    .pt(px(6.))
-                    .pb(px(12.))
-                    .gap(px(10.))
-                    .children(content),
-            )
+            .size_full()
+            .when(!showing_agent, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px(px(12.))
+                        .pt(px(10.))
+                        .pb(px(6.))
+                        .child(self.render_tabs(cx)),
+                )
+            })
+            .child(body)
     }
 }
 
@@ -422,6 +525,77 @@ fn info_row(
         .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copied.clone())))
 }
 
+/// The drag of this panel's left edge. The session hears it anywhere in the
+/// window; the handle only starts it.
+pub(super) struct PanelResize {
+    panel: EntityId,
+    /// Set when the drag starts. `None` until then, so the first move can
+    /// still lock the origin if the start hook has not run.
+    start_x: Rc<Cell<Option<f32>>>,
+    start_width: f32,
+}
+
+impl PanelResize {
+    pub(super) fn is_for(&self, panel: EntityId) -> bool {
+        self.panel == panel
+    }
+
+    /// Width with the pointer at `x`. Dragging left grows the panel.
+    ///
+    /// `x` is a window pixel. The saved width is a designed pixel, the size
+    /// at zoom 1, so the drag is divided by the current zoom.
+    pub(super) fn width_at(&self, x: f32) -> f32 {
+        let start_x = match self.start_x.get() {
+            Some(start) => start,
+            None => {
+                self.start_x.set(Some(x));
+                x
+            }
+        };
+        let delta = (x - start_x) / crate::ui::scale::factor();
+        self.start_width - delta
+    }
+}
+
+struct PanelResizeGhost;
+
+impl Render for PanelResizeGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
+    }
+}
+
+/// The band on the panel's left edge. It hugs that edge so the parent clip
+/// does not eat the grab.
+pub(super) fn panel_resize_handle(panel: EntityId, start_width: f32) -> impl IntoElement {
+    let drag = PanelResize {
+        panel,
+        start_x: Rc::new(Cell::new(None)),
+        start_width,
+    };
+    resize_handle(
+        SharedString::from(format!("server-panel-resize-{}", panel.as_u64())),
+        Axis::Horizontal,
+    )
+    .inside(HandleEdge::Leading)
+    .on_drag(drag, |drag, _, window, cx| {
+        drag.start_x.set(Some(window.mouse_position().x.as_f32()));
+        cx.stop_propagation();
+        cx.new(|_| PanelResizeGhost)
+    })
+}
+
+fn clamp_panel_width(width: f32, window_width: f32) -> f32 {
+    // `window_width` is window pixels. The limits and `width` are designed
+    // pixels, so the window is measured in the same unit as the panel.
+    let window_width = window_width / crate::ui::scale::factor();
+    let max = (window_width - PANEL_RESERVED).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
+    if !width.is_finite() {
+        return PANEL_WIDTH;
+    }
+    width.round().clamp(PANEL_MIN_WIDTH, max)
+}
+
 /// `part` as a share of `whole`, 0 to 100.
 fn share(part: u64, whole: u64) -> f64 {
     if whole == 0 {
@@ -448,6 +622,27 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dragging_the_left_edge_left_widens_the_panel() {
+        let drag = PanelResize {
+            panel: EntityId::from(1),
+            start_x: Rc::new(Cell::new(Some(500.))),
+            start_width: 320.,
+        };
+        assert_eq!(drag.width_at(460.), 360.);
+        assert_eq!(drag.width_at(540.), 280.);
+    }
+
+    #[test]
+    fn panel_width_stays_between_the_shell_and_the_cap() {
+        assert_eq!(clamp_panel_width(100., 1600.), PANEL_MIN_WIDTH);
+        assert_eq!(clamp_panel_width(2000., 1600.), PANEL_MAX_WIDTH);
+        assert_eq!(clamp_panel_width(400., 1600.), 400.);
+        assert_eq!(clamp_panel_width(700., 1100.), 580.);
+        assert_eq!(clamp_panel_width(400., 400.), PANEL_MIN_WIDTH);
+        assert_eq!(clamp_panel_width(f32::NAN, 1600.), PANEL_WIDTH);
+    }
 
     #[test]
     fn sizes_keep_three_figures_at_most() {

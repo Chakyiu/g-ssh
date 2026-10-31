@@ -6,8 +6,10 @@
 
 use std::path::Path;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, Context, Entity, EventEmitter, Window};
+use gpui::{div, Context, Entity, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,

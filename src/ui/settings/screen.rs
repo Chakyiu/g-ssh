@@ -1,10 +1,15 @@
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, KeyBinding, MouseButton, SharedString, Window,
+    actions, canvas, deferred, div, point, Anchor, AnyElement, App, Bounds, ClipboardItem, Context,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, MouseButton, MouseDownEvent,
+    Pixels, Point, ScrollHandle, SharedString, Task, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
@@ -21,11 +26,17 @@ use crate::preferences::{
     DEFAULT_EDITOR_COMMAND, DEFAULT_TERMINAL_FONT_SIZE,
 };
 use crate::ui::hosts::form::read_key_file;
+use crate::ui::menu::AnchoredToTrigger;
+use crate::ui::session::panel::{
+    agent_base_needs_key, allow_entry, canonical_agent_base, clear_host_sessions,
+    clear_session_records, list_agent_models, list_session_records, remove_session, SessionRecord,
+    AGENT_SYSTEM_PROMPT, DEFAULT_AGENT_BASE,
+};
 use crate::ui::terminal::colors::TerminalColors;
 use crate::ui::terminal::element::{terminal_family_name, terminal_font_family};
 use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
 use crate::ui::updates::service::UpdateService;
-use crate::ui::{dialog_chrome, VaultState, DIALOG_WIDE};
+use crate::ui::{dialog_chrome, dialog_wide, VaultState};
 use gssh::vault::{
     ProxyAuth, ProxyChoice, ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting, Snippet,
     SnippetBody, SshKey, SshKeySummary, VaultError,
@@ -89,6 +100,7 @@ enum SettingsMode {
     SnippetsList,
     ProxyList,
     ProxyEditor,
+    Agent,
     About,
 }
 
@@ -142,6 +154,24 @@ pub struct SettingsView {
     proxy_pass: Entity<InputState>,
     proxy_error: Option<String>,
     editor_command: Entity<InputState>,
+    /// Whether the terminal font menu is open.
+    font_menu_open: bool,
+    /// Scroll state for that menu, so the current face stays in view.
+    font_menu_scroll: ScrollHandle,
+    agent_base: Entity<InputState>,
+    agent_key: Entity<InputState>,
+    agent_prompt: Entity<TextareaState>,
+    agent_allow_name: Entity<InputState>,
+    /// A model id the endpoint reported. Empty until one is chosen.
+    agent_model: String,
+    agent_models: Vec<String>,
+    agent_looking: bool,
+    agent_lookup_generation: u64,
+    agent_lookup: Option<Task<()>>,
+    agent_error: Option<String>,
+    agent_saved: bool,
+    /// Host whose saved chats are open under Sessions.
+    agent_session_host: Option<String>,
     vault_pane: Entity<VaultPane>,
 }
 
@@ -208,6 +238,69 @@ impl SettingsView {
         })
         .detach();
 
+        let stored = vault_state
+            .read(cx)
+            .manager()
+            .map(|manager| manager.agent_settings())
+            .unwrap_or_default();
+        let agent_base_value = if stored.base_url.trim().is_empty() {
+            DEFAULT_AGENT_BASE.to_string()
+        } else {
+            stored.base_url
+        };
+        let agent_model = stored.model.trim().to_string();
+        let agent_base = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(DEFAULT_AGENT_BASE)
+                .default_value(SharedString::from(agent_base_value))
+        });
+        let agent_key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("API key")
+                .masked(true)
+                .default_value(SharedString::from(stored.api_key))
+        });
+        cx.subscribe(&agent_base, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.schedule_model_lookup(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&agent_key, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.schedule_model_lookup(cx);
+            }
+        })
+        .detach();
+        let prompt = if stored.system_prompt.trim().is_empty() {
+            AGENT_SYSTEM_PROMPT.to_string()
+        } else {
+            stored.system_prompt.clone()
+        };
+        let agent_prompt = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(12)
+                .default_value(SharedString::from(prompt))
+        });
+        cx.subscribe(&agent_prompt, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.agent_saved = false;
+                cx.notify();
+            }
+        })
+        .detach();
+        let agent_allow_name = cx.new(|cx| InputState::new(window, cx).placeholder("cd, ls, pwd"));
+        cx.subscribe_in(
+            &agent_allow_name,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_agent_allow(window, cx);
+                }
+            },
+        )
+        .detach();
+
         let vault_pane = cx.new(|cx| VaultPane::new(vault_state.clone(), window, cx));
         cx.subscribe(
             &vault_pane,
@@ -259,8 +352,260 @@ impl SettingsView {
             }),
             proxy_error: None,
             editor_command,
+            font_menu_open: false,
+            font_menu_scroll: ScrollHandle::new(),
+            agent_base,
+            agent_key,
+            agent_prompt,
+            agent_allow_name,
+            agent_model,
+            agent_models: Vec::new(),
+            agent_looking: false,
+            agent_lookup_generation: 0,
+            agent_lookup: None,
+            agent_error: None,
+            agent_saved: false,
+            agent_session_host: None,
             vault_pane,
         }
+    }
+
+    pub(crate) fn show_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.active_section = section;
+        self.mode = mode_for(section);
+        self.add_error = None;
+        self.edit_error = None;
+        self.font_menu_open = false;
+        cx.notify();
+        if section == SettingsSection::Agent {
+            self.schedule_model_lookup(cx);
+        }
+    }
+
+    /// Read the model list from the endpoint. A later edit cancels the one
+    /// already in flight, so a slow answer cannot replace a newer one.
+    fn schedule_model_lookup(&mut self, cx: &mut Context<Self>) {
+        self.agent_lookup_generation = self.agent_lookup_generation.wrapping_add(1);
+        let generation = self.agent_lookup_generation;
+        self.agent_saved = false;
+        // Not ready to ask yet. Drop any list from the previous address.
+        if self.agent_model_query(cx).is_none() {
+            self.agent_looking = false;
+            self.agent_models.clear();
+            self.agent_lookup = None;
+            self.agent_error = None;
+            cx.notify();
+            return;
+        }
+        self.agent_looking = true;
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            let query = this
+                .update(cx, |view, cx| view.agent_model_query(cx))
+                .ok()
+                .flatten();
+            let Some((base, api_key)) = query else {
+                this.update(cx, |view, cx| {
+                    if view.agent_lookup_generation != generation {
+                        return;
+                    }
+                    view.agent_looking = false;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+            let found = cx
+                .background_executor()
+                .spawn(async move { list_agent_models(&base, &api_key) })
+                .await;
+            this.update(cx, |view, cx| {
+                if view.agent_lookup_generation != generation {
+                    return;
+                }
+                view.agent_looking = false;
+                match found {
+                    Ok(models) => {
+                        if !models.iter().any(|model| model == &view.agent_model) {
+                            view.agent_model = if models.len() == 1 {
+                                models[0].clone()
+                            } else {
+                                String::new()
+                            };
+                        }
+                        view.agent_models = models;
+                        view.agent_error = None;
+                    }
+                    Err(error) => {
+                        view.agent_error = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.agent_lookup = Some(task);
+        cx.notify();
+    }
+
+    /// `None` while the URL or the key is not ready to ask. That is not an
+    /// error: the user may still be typing.
+    fn agent_model_query(&self, cx: &App) -> Option<(String, String)> {
+        let base = canonical_agent_base(&self.agent_base.read(cx).value()).ok()?;
+        let api_key = self.agent_key.read(cx).value().trim().to_string();
+        if agent_base_needs_key(&base) && api_key.is_empty() {
+            return None;
+        }
+        Some((base, api_key))
+    }
+
+    fn save_agent_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = match canonical_agent_base(&self.agent_base.read(cx).value()) {
+            Ok(base) => base,
+            Err(error) => {
+                self.agent_error = Some(error);
+                self.agent_saved = false;
+                cx.notify();
+                return;
+            }
+        };
+        if self.agent_looking {
+            self.agent_error = Some("Still asking the endpoint which models it has.".into());
+            self.agent_saved = false;
+            cx.notify();
+            return;
+        }
+        let model = self.agent_model.trim().to_string();
+        if model.is_empty() || !self.agent_models.iter().any(|known| known == &model) {
+            self.agent_error = Some("Choose one of the models this endpoint reported.".into());
+            self.agent_saved = false;
+            cx.notify();
+            return;
+        }
+        let api_key = self.agent_key.read(cx).value().trim().to_string();
+        if agent_base_needs_key(&base) && api_key.is_empty() {
+            self.agent_error = Some(
+                "This endpoint needs an API key. For a local server such as Ollama, use its \
+                 address and leave the key empty."
+                    .into(),
+            );
+            self.agent_saved = false;
+            cx.notify();
+            return;
+        }
+        let prompt_text = self.agent_prompt.read(cx).value().to_string();
+        let system_prompt = if prompt_text.trim() == AGENT_SYSTEM_PROMPT {
+            String::new()
+        } else {
+            prompt_text
+        };
+        let saved = self.vault_state.update(cx, |vault, cx| {
+            cx.notify();
+            let manager = vault.manager_mut()?;
+            let mut settings = manager.agent_settings();
+            settings.base_url = base.clone();
+            settings.model = model.clone();
+            settings.api_key = api_key;
+            settings.system_prompt = system_prompt;
+            Some(manager.set_agent_settings(settings))
+        });
+        match saved {
+            Some(Ok(())) => {
+                self.agent_base
+                    .update(cx, |input, cx| input.set_value(base, window, cx));
+                self.agent_error = None;
+                self.agent_saved = true;
+                tracing::info!("agent endpoint saved");
+            }
+            Some(Err(error)) => {
+                self.agent_error = Some(format!("Could not save the endpoint: {error}"));
+                self.agent_saved = false;
+            }
+            None => {
+                self.agent_error = Some("Unlock the vault to save the endpoint.".into());
+                self.agent_saved = false;
+            }
+        }
+        cx.notify();
+    }
+
+    fn reset_agent_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.agent_prompt.read(cx).value().to_string();
+        if current == AGENT_SYSTEM_PROMPT {
+            return;
+        }
+        self.agent_prompt.update(cx, |state, cx| {
+            state.set_value(AGENT_SYSTEM_PROMPT, window, cx);
+        });
+        self.agent_saved = false;
+        cx.notify();
+    }
+
+    fn add_agent_allow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.agent_allow_name.read(cx).value().to_string();
+        let Some(name) = allow_entry(&raw) else {
+            self.agent_error = Some("Enter a command, or a name such as ls or cd.".into());
+            cx.notify();
+            return;
+        };
+        let saved = self.vault_state.update(cx, |vault, cx| {
+            let manager = vault.manager_mut()?;
+            let mut settings = manager.agent_settings();
+            if settings.always_allow.iter().any(|have| have == &name) {
+                return Some(Ok(false));
+            }
+            settings.always_allow.push(name.clone());
+            Some(manager.set_agent_settings(settings).map(|()| {
+                cx.notify();
+                true
+            }))
+        });
+        match saved {
+            Some(Ok(true)) => {
+                self.agent_allow_name
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.agent_error = None;
+            }
+            Some(Ok(false)) => {
+                self.agent_allow_name
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.agent_error = Some(format!("{name} is already on the list."));
+            }
+            Some(Err(error)) => {
+                self.agent_error = Some(format!("Could not save the command list: {error}"));
+            }
+            None => {
+                self.agent_error = Some("Unlock the vault to change the command list.".into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_agent_allow(&mut self, name: String, cx: &mut Context<Self>) {
+        let saved = self.vault_state.update(cx, |vault, cx| {
+            let manager = vault.manager_mut()?;
+            let mut settings = manager.agent_settings();
+            let before = settings.always_allow.len();
+            settings.always_allow.retain(|have| have != &name);
+            if settings.always_allow.len() == before {
+                return Some(Ok(()));
+            }
+            let saved = manager.set_agent_settings(settings);
+            cx.notify();
+            Some(saved)
+        });
+        match saved {
+            Some(Ok(())) => self.agent_error = None,
+            Some(Err(error)) => {
+                self.agent_error = Some(format!("Could not save the command list: {error}"));
+            }
+            None => {
+                self.agent_error = Some("Unlock the vault to change the command list.".into());
+            }
+        }
+        cx.notify();
     }
 
     fn enter_add_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1248,6 +1593,63 @@ impl SettingsView {
                         )
                     })),
             )
+            .child(group_title("Interface size", cx).mt(px(6.)))
+            .child(self.render_interface_scale(cx))
+    }
+
+    fn render_interface_scale(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let scale = Preferences::ui_scale(cx);
+        let percent = (scale * 100.).round() as i32;
+
+        h_flex()
+            .gap(px(4.))
+            .items_center()
+            .child(icon_button(
+                "interface-scale-smaller",
+                Icon::new(IconName::Minus).size(px(12.)),
+                false,
+                cx.listener(|_, _, _, cx| {
+                    crate::ui::app::step_interface_scale(-1, cx);
+                    cx.notify();
+                }),
+                cx,
+            ))
+            .child(
+                div()
+                    .w(px(48.))
+                    .text_center()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child(format!("{percent}%")),
+            )
+            .child(icon_button(
+                "interface-scale-larger",
+                Icon::new(IconName::Plus).size(px(12.)),
+                false,
+                cx.listener(|_, _, _, cx| {
+                    crate::ui::app::step_interface_scale(1, cx);
+                    cx.notify();
+                }),
+                cx,
+            ))
+            .when(scale != crate::ui::scale::DEFAULT_UI_SCALE, |el| {
+                el.child(
+                    select_chip("interface-scale-reset", "Reset", false, cx)
+                        .ml(px(4.))
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            crate::ui::app::reset_interface_scale(cx);
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .ml(px(6.))
+                    .text_size(px(11.5))
+                    .text_color(theme.muted_foreground)
+                    .child(interface_scale_shortcut()),
+            )
     }
 
     fn render_terminal(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1386,31 +1788,34 @@ impl SettingsView {
                     .ml(px(6.))
                     .text_size(px(11.5))
                     .text_color(muted_fg)
-                    .child("Shared by every terminal. The zoom shortcuts change it too."),
+                    .child("Shared by every terminal. Interface size scales it on screen."),
             )
     }
 
     fn render_terminal_fonts(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = Preferences::terminal_font(cx);
+        let open = self.font_menu_open;
+        // The probe writes the button's window bounds; the menu reads them
+        // after layout, once it is drawn above the scrolling page.
+        let anchor = Rc::new(Cell::new(Point::default()));
+        let trigger = Rc::new(Cell::new(Bounds::default()));
+        let scroll = self.font_menu_scroll.clone();
 
-        // The bundled font is always there, so it shows while the list loads.
-        let fonts = cx
-            .try_global::<InstalledTerminalFonts>()
-            .and_then(|fonts| fonts.0.clone())
-            .unwrap_or_else(|| vec![TerminalFont::CascadiaCode]);
-
-        h_flex()
-            .flex_wrap()
-            .gap(px(4.))
-            .children(fonts.into_iter().enumerate().map(|(ix, font)| {
-                let family = terminal_family_name(font, cx);
-                select_chip(("terminal-font", ix), family, font == current, cx)
-                    .font_family(family)
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        Preferences::update(cx, |prefs| prefs.terminal_font = font);
-                        cx.notify();
-                    }))
-            }))
+        div()
+            .w(px(FONT_MENU_WIDTH))
+            .flex_none()
+            .self_start()
+            .child(font_menu_button(current, open, &anchor, &trigger, cx))
+            .when(open, |el| {
+                el.child(font_menu_panel(
+                    installed_terminal_fonts(cx),
+                    current,
+                    &scroll,
+                    &anchor,
+                    &trigger,
+                    cx,
+                ))
+            })
     }
 
     fn render_terminal_schemes(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1524,8 +1929,337 @@ impl SettingsView {
         )
         .detach();
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog_chrome(dialog).w(DIALOG_WIDE).child(view.clone())
+            dialog_chrome(dialog).w(dialog_wide()).child(view.clone())
         });
+    }
+
+    fn agent_sessions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let records: Vec<SessionRecord> = list_session_records();
+        let labels = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .and_then(|manager| manager.list_entries().ok())
+            .unwrap_or_default();
+        let mut hosts: Vec<HostChats> = Vec::new();
+        for record in records {
+            let label = labels
+                .iter()
+                .find(|entry| entry.id.to_string() == record.host_id)
+                .map(|entry| {
+                    if entry.label.is_empty() {
+                        entry.host.clone()
+                    } else {
+                        entry.label.clone()
+                    }
+                })
+                .unwrap_or_else(|| record.host_id.clone());
+            if let Some(host) = hosts.iter_mut().find(|host| host.id == record.host_id) {
+                host.chats.push((record.chat_id, record.title));
+            } else {
+                hosts.push(HostChats {
+                    label,
+                    id: record.host_id,
+                    chats: vec![(record.chat_id, record.title)],
+                });
+            }
+        }
+        hosts.sort_by(|a, b| a.label.cmp(&b.label));
+        for host in &mut hosts {
+            host.chats.sort_by(|a, b| a.1.cmp(&b.1));
+        }
+        let open_id = self.agent_session_host.clone();
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let empty = hosts.is_empty();
+        v_flex()
+            .mt(px(10.))
+            .gap(px(8.))
+            .max_w(px(640.))
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(div().flex_1().child(field_label("Sessions", cx)))
+                    .when(!empty, |el| {
+                        el.child(
+                            Button::new("agent-sessions-clear")
+                                .ghost()
+                                .xsmall()
+                                .child("Clear all")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_agent_sessions(cx);
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(muted)
+                    .child("One row per connection. Open … to remove that connection’s chats."),
+            )
+            .when(empty, |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("No saved chats."),
+                )
+            })
+            .children(
+                hosts.into_iter().enumerate().map(|(ix, host)| {
+                    connection_sessions(ix, host, open_id.as_deref(), fg, muted, cx)
+                }),
+            )
+    }
+
+    fn clear_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        clear_session_records();
+        self.agent_session_host = None;
+        cx.notify();
+    }
+
+    fn clear_host_agent_sessions(&mut self, host_id: String, cx: &mut Context<Self>) {
+        clear_host_sessions(&host_id);
+        if self.agent_session_host.as_deref() == Some(host_id.as_str()) {
+            self.agent_session_host = None;
+        }
+        cx.notify();
+    }
+
+    fn remove_agent_session(&mut self, host_id: String, chat_id: String, cx: &mut Context<Self>) {
+        remove_session(&host_id, &chat_id);
+        cx.notify();
+    }
+
+    fn render_agent_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let error = self.agent_error.clone();
+        let saved = self.agent_saved;
+        let looking = self.agent_looking;
+        let chosen = self.agent_model.clone();
+        let models = self.agent_models.clone();
+        let allow_list = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .map(|manager| manager.agent_settings().always_allow)
+            .unwrap_or_default();
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let chip_hover = crate::theme::element_hover();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(
+                v_flex()
+                    .id("agent-settings-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(20.))
+                    .py(px(16.))
+                    .gap(px(8.))
+                    .child(group_title("Endpoint", cx))
+                    .child(field_label("Base URL", cx))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .child(Input::new(&self.agent_base).small()),
+                    )
+                    .child(field_label("API key", cx))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .child(Input::new(&self.agent_key).small().mask_toggle()),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(520.))
+                            .text_size(px(11.5))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "An OpenAI-compatible endpoint. The key is saved in the vault. \
+                         Ollama is http://127.0.0.1:11434/v1 with an empty key. The model \
+                         is read from the endpoint.",
+                            ),
+                    )
+                    .child(field_label("Model", cx))
+                    .child(if looking {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Asking the endpoint which models it has.")
+                            .into_any_element()
+                    } else if models.is_empty() {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(if error.is_some() {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(error.clone().unwrap_or_else(|| {
+                                "Models show up here once the endpoint answers.".into()
+                            }))
+                            .into_any_element()
+                    } else {
+                        v_flex()
+                            .gap(px(2.))
+                            .children(models.into_iter().enumerate().map(|(ix, name)| {
+                                let selected = name == chosen;
+                                radio_row(("agent-model", ix), name.clone(), selected, cx).on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.agent_model = name.clone();
+                                        this.agent_saved = false;
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .into_any_element()
+                    })
+                    .child(
+                        h_flex()
+                            .mt(px(10.))
+                            .items_center()
+                            .max_w(px(640.))
+                            .child(div().flex_1().child(field_label("System prompt", cx)))
+                            .child(
+                                Button::new("agent-prompt-reset")
+                                    .ghost()
+                                    .xsmall()
+                                    .child("Reset to default")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reset_agent_prompt(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(640.))
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child("Sent with every question. Reset restores the built-in prompt."),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(640.))
+                            .child(Textarea::new(&self.agent_prompt).h(px(220.))),
+                    )
+                    .child(div().mt(px(10.)).child(field_label("Always allow", cx)))
+                    .child(
+                        div()
+                            .max_w(px(640.))
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(
+                            "A name such as ls runs that program without asking, including ls -la. \
+                         A line that can run another program still asks, unless Always allow \
+                         remembered that exact line.",
+                        ),
+                    )
+                    .when(!allow_list.is_empty(), |el| {
+                        el.child(h_flex().flex_wrap().gap(px(6.)).max_w(px(640.)).children(
+                            allow_list.iter().enumerate().map(|(ix, name)| {
+                                let name = name.clone();
+                                h_flex()
+                                    .h(px(26.))
+                                    .pl(px(9.))
+                                    .pr(px(4.))
+                                    .gap(px(4.))
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(crate::theme::border())
+                                    .bg(crate::theme::field())
+                                    .text_size(px(12.5))
+                                    .font_family(terminal_font_family(cx))
+                                    .text_color(fg)
+                                    .child(name.clone())
+                                    .child(
+                                        div()
+                                            .id(("agent-allow-remove", ix))
+                                            .size(px(18.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(4.))
+                                            .text_color(muted)
+                                            .cursor_pointer()
+                                            .hover(move |style| style.bg(chip_hover).text_color(fg))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_agent_allow(name.clone(), cx);
+                                            }))
+                                            .child(Icon::new(IconName::Close).size(px(12.))),
+                                    )
+                            }),
+                        ))
+                    })
+                    .when(allow_list.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(muted)
+                                .child("None yet. Add a name such as cd or ls."),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .items_center()
+                            .max_w(px(420.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&self.agent_allow_name).small()),
+                            )
+                            .child(
+                                Button::new("agent-allow-add")
+                                    .small()
+                                    .child("Add")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_agent_allow(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(self.agent_sessions(cx)),
+            )
+            .child(
+                v_flex()
+                    .flex_none()
+                    .px(px(20.))
+                    .py(px(12.))
+                    .gap(px(8.))
+                    .border_t_1()
+                    .border_color(crate::theme::border())
+                    .children(error.map(|error| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().danger)
+                            .child(error)
+                    }))
+                    .child(
+                        h_flex()
+                            .gap(px(8.))
+                            .items_center()
+                            .child(
+                                Button::new("agent-settings-save")
+                                    .small()
+                                    .primary()
+                                    .child("Save")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_agent_endpoint(window, cx);
+                                    })),
+                            )
+                            .when(saved, |el| {
+                                el.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Saved"),
+                                )
+                            }),
+                    ),
+            )
     }
 
     fn render_about(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1985,8 +2719,14 @@ impl SettingsView {
                         }
                     })),
             );
+        // A public key is one long token. Give the block the pane width so it
+        // wraps, and refuse to shrink it: the scroll view would otherwise
+        // compress the block to nothing and the key would stay hidden.
         let pubkey_block = div()
             .id("pubkey-body")
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
             .p(px(12.))
             .rounded(px(8.))
             .bg(bg_deep)
@@ -1994,7 +2734,9 @@ impl SettingsView {
             .border_color(border)
             .font_family(terminal_font)
             .text_size(px(12.5))
+            .line_height(px(18.))
             .text_color(text_editor)
+            .whitespace_normal()
             .child(pub_line);
 
         v_flex()
@@ -2007,20 +2749,27 @@ impl SettingsView {
                     .id("key-detail-body")
                     .flex_1()
                     .min_h_0()
+                    .w_full()
                     .overflow_y_scroll()
-                    .gap(px(12.))
-                    .px(px(20.))
-                    .py(px(16.))
-                    .child(fingerprint)
-                    .child(in_use_section_h)
-                    .child(in_use_body)
-                    .child(pubkey_section_h)
-                    .child(pubkey_block)
                     .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(muted_fg)
-                            .child("The private key stays encrypted in the vault."),
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_shrink_0()
+                            .gap(px(12.))
+                            .px(px(20.))
+                            .py(px(16.))
+                            .child(fingerprint)
+                            .child(in_use_section_h)
+                            .child(in_use_body)
+                            .child(pubkey_section_h)
+                            .child(pubkey_block)
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(muted_fg)
+                                    .child("The private key stays encrypted in the vault."),
+                            ),
                     ),
             )
     }
@@ -2961,21 +3710,7 @@ impl Render for SettingsView {
                     })
                     .child(section.icon().size(px(15.)).text_color(icon_color))
                     .child(section.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_section = section;
-                        this.mode = match section {
-                            SettingsSection::Vault => SettingsMode::Vault,
-                            SettingsSection::Appearance => SettingsMode::Appearance,
-                            SettingsSection::Terminal => SettingsMode::Terminal,
-                            SettingsSection::Keys => SettingsMode::KeysList,
-                            SettingsSection::Snippets => SettingsMode::SnippetsList,
-                            SettingsSection::Network => SettingsMode::ProxyList,
-                            SettingsSection::About => SettingsMode::About,
-                        };
-                        this.add_error = None;
-                        this.edit_error = None;
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.show_section(section, cx)))
             });
 
         let close_button = div()
@@ -3032,6 +3767,7 @@ impl Render for SettingsView {
             SettingsMode::Vault
             | SettingsMode::Appearance
             | SettingsMode::Terminal
+            | SettingsMode::Agent
             | SettingsMode::About => Some(self.active_section.label()),
             _ => None,
         };
@@ -3040,6 +3776,7 @@ impl Render for SettingsView {
             SettingsMode::Vault => self.vault_pane.clone().into_any_element(),
             SettingsMode::Appearance => self.render_appearance(cx).into_any_element(),
             SettingsMode::Terminal => self.render_terminal(cx).into_any_element(),
+            SettingsMode::Agent => self.render_agent_settings(cx).into_any_element(),
             SettingsMode::KeysList => self.render_keys_list(cx).into_any_element(),
             SettingsMode::AddKey => self.render_add_key(cx).into_any_element(),
             SettingsMode::SnippetsList => self.render_snippets_list(cx).into_any_element(),
@@ -3084,7 +3821,12 @@ impl Render for SettingsView {
             )
             .key_context("Settings")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|_this, _: &CloseSettings, _, cx| {
+            .on_action(cx.listener(|this, _: &CloseSettings, _, cx| {
+                if this.font_menu_open {
+                    this.font_menu_open = false;
+                    cx.notify();
+                    return;
+                }
                 cx.emit(SettingsViewEvent::Close);
             }))
             .child(
@@ -3224,6 +3966,162 @@ fn row_tile(icon: Icon, color: Hsla) -> impl IntoElement {
         .rounded(px(7.))
         .bg(color.opacity(0.16))
         .child(icon.size(px(15.)).text_color(color))
+}
+
+fn mode_for(section: SettingsSection) -> SettingsMode {
+    match section {
+        SettingsSection::Vault => SettingsMode::Vault,
+        SettingsSection::Appearance => SettingsMode::Appearance,
+        SettingsSection::Terminal => SettingsMode::Terminal,
+        SettingsSection::Agent => SettingsMode::Agent,
+        SettingsSection::Keys => SettingsMode::KeysList,
+        SettingsSection::Snippets => SettingsMode::SnippetsList,
+        SettingsSection::Network => SettingsMode::ProxyList,
+        SettingsSection::About => SettingsMode::About,
+    }
+}
+
+struct HostChats {
+    label: String,
+    id: String,
+    chats: Vec<(String, String)>,
+}
+
+fn connection_sessions(
+    ix: usize,
+    host: HostChats,
+    open_id: Option<&str>,
+    fg: Hsla,
+    muted: Hsla,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    let open = open_id == Some(host.id.as_str());
+    let count = host.chats.len();
+    let count_label = if count == 1 {
+        "1 chat".to_string()
+    } else {
+        format!("{count} chats")
+    };
+    let host_id = host.id.clone();
+    let toggle_id = host.id.clone();
+    let clear_id = host.id.clone();
+    let chip_hover = crate::theme::element_hover();
+    let pressed = crate::theme::element_active();
+    v_flex()
+        .gap(px(2.))
+        .child(
+            h_flex()
+                .h(px(32.))
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.))
+                        .text_color(fg)
+                        .child(host.label.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child(count_label),
+                )
+                .child(
+                    div()
+                        .id(("agent-session-more", ix))
+                        .size(px(24.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .text_color(if open { fg } else { muted })
+                        .when(open, |el| el.bg(pressed))
+                        .when(!open, |el| {
+                            el.hover(|style| style.bg(chip_hover).text_color(fg))
+                        })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.agent_session_host.as_deref() == Some(toggle_id.as_str()) {
+                                this.agent_session_host = None;
+                            } else {
+                                this.agent_session_host = Some(toggle_id.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::Ellipsis).size(px(14.))),
+                ),
+        )
+        .when(open, |el| {
+            el.child(
+                v_flex()
+                    .pl(px(12.))
+                    .pb(px(6.))
+                    .gap(px(2.))
+                    .children(host.chats.into_iter().enumerate().map(
+                        |(chat_ix, (chat_id, title))| {
+                            let host_id = host_id.clone();
+                            let chat_id = chat_id.clone();
+                            h_flex()
+                                .h(px(28.))
+                                .items_center()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .text_color(fg)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .id(("agent-session-remove", ix * 1000 + chat_ix))
+                                        .size(px(18.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(4.))
+                                        .text_color(muted)
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(chip_hover).text_color(fg))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.remove_agent_session(
+                                                host_id.clone(),
+                                                chat_id.clone(),
+                                                cx,
+                                            );
+                                        }))
+                                        .child(Icon::new(IconName::Close).size(px(12.))),
+                                )
+                        },
+                    ))
+                    .child(
+                        Button::new(("agent-session-clear-host", ix))
+                            .ghost()
+                            .xsmall()
+                            .child("Clear this connection")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clear_host_agent_sessions(clear_id.clone(), cx);
+                            })),
+                    ),
+            )
+        })
+}
+
+fn interface_scale_shortcut() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "\u{2318}+ and \u{2318}\u{2212} change it from anywhere. \u{2318}0 restores 100%."
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Ctrl++ and Ctrl+\u{2212} change it from anywhere. Ctrl+0 restores 100%."
+    }
 }
 
 /// Heading of one group of controls on a settings page.
@@ -3527,6 +4425,205 @@ fn split_variables(s: &str) -> Vec<(bool, String)> {
         out.push((false, buf));
     }
     out
+}
+
+/// Width of the terminal font menu. Long enough for a Nerd Font Mono name.
+const FONT_MENU_WIDTH: f32 = 320.;
+
+/// Stacks with gpui-component popups: above dialogs, below tooltips.
+const FONT_MENU_PRIORITY: usize = 100;
+
+/// The bundled font is always there, so the menu has a row while the
+/// system list is still loading.
+fn installed_terminal_fonts(cx: &App) -> Vec<TerminalFont> {
+    cx.try_global::<InstalledTerminalFonts>()
+        .and_then(|fonts| fonts.0.clone())
+        .unwrap_or_else(|| vec![TerminalFont::CascadiaCode])
+}
+
+/// The button that opens the font menu: the current face on the left, a
+/// caret on the right, and the probe that tells the list where to sit.
+fn font_menu_button(
+    current: TerminalFont,
+    open: bool,
+    anchor: &Rc<Cell<Point<Pixels>>>,
+    trigger: &Rc<Cell<Bounds<Pixels>>>,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    let family = terminal_family_name(current, cx);
+    let theme = cx.theme();
+    let muted_fg = theme.muted_foreground;
+
+    div()
+        .id("terminal-font-menu")
+        .relative()
+        .w_full()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .px(px(10.))
+        .rounded(px(7.))
+        .border_1()
+        .border_color(if open {
+            crate::theme::accent()
+        } else {
+            crate::theme::border()
+        })
+        .bg(crate::theme::field())
+        .cursor_pointer()
+        .hover(|s| s.bg(crate::theme::element_hover()))
+        .text_size(px(13.))
+        .text_color(theme.foreground)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.font_menu_open = !this.font_menu_open;
+                if this.font_menu_open {
+                    let current = Preferences::terminal_font(cx);
+                    let fonts = installed_terminal_fonts(cx);
+                    if let Some(ix) = fonts.iter().position(|font| *font == current) {
+                        this.font_menu_scroll.scroll_to_item(ix);
+                    }
+                }
+                cx.notify();
+            }),
+        )
+        .child(menu_anchor_probe(anchor.clone(), trigger.clone()))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .font_family(family)
+                        .child(family),
+                )
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(14.))
+                        .text_color(muted_fg),
+                ),
+        )
+}
+
+/// The list a font button opens. Drawn later so the settings page, which
+/// scrolls, does not clip it, and anchored to the button's probe.
+fn font_menu_panel(
+    fonts: Vec<TerminalFont>,
+    current: TerminalFont,
+    scroll: &ScrollHandle,
+    anchor: &Rc<Cell<Point<Pixels>>>,
+    trigger: &Rc<Cell<Bounds<Pixels>>>,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    let trigger = trigger.clone();
+    let fg = cx.theme().foreground;
+    let items: Vec<AnyElement> = fonts
+        .into_iter()
+        .enumerate()
+        .map(|(ix, font)| {
+            let family = terminal_family_name(font, cx);
+            let selected = font == current;
+            div()
+                .id(("terminal-font-option", ix))
+                .h(px(30.))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .text_color(fg)
+                .cursor_pointer()
+                .when(selected, |el| {
+                    el.bg(crate::theme::accent_soft())
+                        .hover(|s| s.bg(crate::theme::accent_soft_press()))
+                })
+                .when(!selected, |el| {
+                    el.hover(|s| s.bg(crate::theme::field()))
+                        .active(|s| s.bg(crate::theme::element_active()))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    Preferences::update(cx, |prefs| prefs.terminal_font = font);
+                    this.font_menu_open = false;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .font_family(family)
+                        .child(family),
+                )
+                .when(selected, |el| {
+                    el.child(
+                        div().flex_none().child(
+                            Icon::new(IconName::Check)
+                                .size(px(12.))
+                                .text_color(crate::theme::accent()),
+                        ),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect();
+
+    let panel = div()
+        .id("terminal-font-menu-popup")
+        .occlude()
+        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            // Fires in the capture phase, before the button's own toggle.
+            // A click on the button must not close the list and then reopen it.
+            if trigger.get().contains(&event.position) {
+                return;
+            }
+            this.font_menu_open = false;
+            cx.notify();
+        }))
+        .track_scroll(scroll)
+        .w(px(FONT_MENU_WIDTH))
+        .max_h(px(280.))
+        .overflow_y_scroll()
+        .p(px(4.))
+        .bg(crate::theme::pop_surface())
+        .border_1()
+        .border_color(crate::theme::float_border())
+        .rounded(px(9.))
+        .shadow(crate::ui::modal_shadow())
+        .children(items);
+
+    deferred(AnchoredToTrigger {
+        anchor: Anchor::TopLeft,
+        anchor_point: anchor.clone(),
+        margin: px(8.),
+        child: panel.into_any_element(),
+    })
+    .with_priority(FONT_MENU_PRIORITY)
+}
+
+/// Reports the button's bottom-left corner at prepaint. `absolute` keeps it
+/// out of layout, so the button's own size is untouched.
+fn menu_anchor_probe(
+    anchor_point: Rc<Cell<Point<Pixels>>>,
+    trigger_bounds: Rc<Cell<Bounds<Pixels>>>,
+) -> impl IntoElement {
+    canvas(
+        move |bounds: Bounds<Pixels>, _, _| {
+            let corner = bounds.corner(Anchor::BottomLeft);
+            anchor_point.set(point(corner.x, corner.y + px(4.)));
+            trigger_bounds.set(bounds);
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
 }
 
 /// Pill-shaped selectable chip (used for proxy default + per-server override).

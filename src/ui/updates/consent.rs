@@ -2,8 +2,10 @@
 //! the user answers it. Closing it without an answer leaves it for the next
 //! start.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, Context, EventEmitter, Window};
+use gpui::{div, Context, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogHeader, DialogTitle},

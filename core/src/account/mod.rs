@@ -2,8 +2,8 @@
 //! Argon2id, so it runs on worker threads; results go into the vault on the main thread.
 
 pub mod api;
-pub mod rounds;
 pub mod oauth;
+pub mod rounds;
 pub mod team;
 
 use std::sync::atomic::AtomicBool;

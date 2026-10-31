@@ -2,11 +2,13 @@
 //! browser. Dropping a tab on another tab reorders the strip. Dropping it on
 //! an edge splits that cell, so two different connections can sit side by side.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, px, relative, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EventEmitter, Hsla,
+    div, relative, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EventEmitter, Hsla,
     MouseButton, Pixels, Point, SharedString, Window,
 };
+
 use gpui_component::{
     h_flex,
     resizable::{h_resizable, resizable_panel, v_resizable, ResizableState},
@@ -508,6 +510,7 @@ impl Workspace {
                 .items_center()
                 .when_some(session.render_forward_chip(cx), |el, chip| el.child(chip))
                 .when_some(session.render_task_pills(cx), |el, pills| el.child(pills))
+                .child(session.render_agent_button(cx))
                 .child(session.render_server_panel_toggle(cx))
                 .into_any_element()
         })

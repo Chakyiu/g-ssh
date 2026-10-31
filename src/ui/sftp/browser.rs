@@ -1,8 +1,10 @@
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
+    div, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
     Subscription, Task, Window,
 };
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,

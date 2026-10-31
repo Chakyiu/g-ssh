@@ -2,11 +2,13 @@
 
 use std::time::Duration;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, ease_out_quint, linear_color_stop, linear_gradient, px, relative, Animation,
-    AnimationElement, AnimationExt as _, AnyElement, Context, Div, ElementId, Hsla, SharedString,
+    div, ease_out_quint, linear_color_stop, linear_gradient, relative, Animation, AnimationElement,
+    AnimationExt as _, AnyElement, Context, Div, ElementId, Hsla, SharedString,
 };
+
 use gpui_component::{chart::AreaChart, h_flex, v_flex, ActiveTheme as _, StyledExt as _};
 
 use super::{format_bytes, info_row, note, section_title, share, Reading, ServerPanel, TICK};

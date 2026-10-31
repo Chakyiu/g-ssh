@@ -1,11 +1,13 @@
+use crate::ui::scale::px;
 use gpui::{
-    fill, font, outline, px, relative, size, App, BorderStyle, Bounds, CursorStyle, DispatchPhase,
+    fill, font, outline, relative, size, App, BorderStyle, Bounds, CursorStyle, DispatchPhase,
     Element, ElementId, Entity, Font, FontStyle, FontWeight, GlobalElementId, Hitbox,
     HitboxBehavior, Hsla, InputHandler, InspectorElementId, IntoElement, LayoutId, Modifiers,
     MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, ShapedLine, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, WeakEntity,
     Window,
 };
+
 use gpui_component::ActiveTheme as _;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -15,7 +17,9 @@ use crate::preferences::{Preferences, TerminalFont};
 use crate::theme;
 use crate::ui::terminal::colors::{self, ColorKey, TerminalColors};
 use crate::ui::terminal::link::TerminalLink;
-use crate::ui::terminal::view::{ScrollbarGeom, TerminalView, SIDE_PADDING};
+use crate::ui::terminal::view::{
+    ScrollbarGeom, TerminalView, SCROLLBAR_EDGE_INSET, SCROLLBAR_GUTTER, SCROLLBAR_WIDTH,
+};
 use gssh::ssh::shell::{GridPoint, GridSelectionRange, SelectionSide, TermSnapshot};
 
 /// Height of a terminal row, as a multiple of the font size.
@@ -59,6 +63,34 @@ pub fn pixel_to_grid(
         },
         side,
     )
+}
+
+/// Columns that fit in `width` once the scrollbar lane is set aside.
+fn grid_columns(width: Pixels, cell_width: Pixels) -> u16 {
+    let text_width = (width - px(SCROLLBAR_GUTTER)).max(cell_width);
+    let cols = (text_width / cell_width).floor() as u16;
+    cols.max(1)
+}
+
+/// The scrollbar's painted track and the lane it lives in, in window coordinates.
+/// The lane is the right-hand gutter of `bounds`. The track sits inside that
+/// lane, inset from the panel edge, so it never covers a glyph.
+struct ScrollbarTrack {
+    x: Pixels,
+    width: Pixels,
+    lane_x0: Pixels,
+    lane_x1: Pixels,
+}
+
+fn scrollbar_track(bounds: Bounds<Pixels>) -> ScrollbarTrack {
+    let width = px(SCROLLBAR_WIDTH);
+    let lane_x1 = bounds.origin.x + bounds.size.width;
+    ScrollbarTrack {
+        x: lane_x1 - width - px(SCROLLBAR_EDGE_INSET),
+        width,
+        lane_x0: lane_x1 - px(SCROLLBAR_GUTTER),
+        lane_x1,
+    }
 }
 
 /// Pull a viewport point back onto a grid of `rows` by `cols` cells.
@@ -448,8 +480,8 @@ pub(crate) fn terminal_font_family(cx: &App) -> &'static str {
 }
 
 /// The family name to draw `font` with, when this machine has it. A font the
-/// text system cannot resolve keeps its typographic name, so a chip label
-/// still names that face.
+/// text system cannot resolve keeps its typographic name, so the menu still
+/// names that face.
 pub(crate) fn terminal_family_name(font: TerminalFont, cx: &App) -> &'static str {
     resolvable_family(font, cx).unwrap_or_else(|| font.family())
 }
@@ -820,7 +852,7 @@ impl Element for TerminalElement {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         if bounds.size.width.as_f32() > 0.0 && bounds.size.height.as_f32() > 0.0 {
-            let cols = (bounds.size.width / cell_width).floor() as u16;
+            let cols = grid_columns(bounds.size.width, cell_width);
             let rows = (bounds.size.height / line_height).floor() as u16;
             let cols = cols.max(1);
             let rows = rows.max(1);
@@ -1062,6 +1094,10 @@ impl Element for TerminalElement {
                 return;
             };
             if event.pressed_button.is_none() {
+                let hovered = view.read(cx).is_over_scrollbar(event.position);
+                if hovered != view.read(cx).is_scrollbar_hovered() {
+                    view.update(cx, |view, cx| view.sync_scrollbar_hover(event.position, cx));
+                }
                 repaint_if_link_changed(
                     &view,
                     &hitbox_for_move,
@@ -1138,7 +1174,7 @@ impl Element for TerminalElement {
                 return;
             }
             // Finish a scrollbar drag before falling through to selection handling.
-            if view.update(cx, |view, _| view.end_scrollbar_drag()) {
+            if view.update(cx, |view, cx| view.end_scrollbar_drag(event.position, cx)) {
                 return;
             }
             view.update(cx, |view, _| {
@@ -1291,28 +1327,16 @@ impl Element for TerminalElement {
             let _ = shaped.paint(pos, line_height, TextAlign::Left, None, window, cx);
         }
 
-        // Scrollbar: an overlay on the right edge, shown whenever there is
-        // scrollback. Hit-testing for the drag lives in TerminalView's mouse
-        // handlers.
+        // Scrollbar: a lane on the panel's right edge, not an overlay on the
+        // glyphs. It is painted only while scrolling, hovering the lane, or
+        // dragging; the lane stays hit-testable the rest of the time so the
+        // pointer can bring it back. The drag itself is handled on TerminalView.
         if layout.history_size > 0 {
-            let track_color = cx.theme().scrollbar;
-            let thumb_color = cx.theme().scrollbar_thumb;
+            let margin = px(2.0); // inset from the top and bottom edges
+            let track = scrollbar_track(bounds);
 
-            let margin = px(2.0); // inset from the edges
-            let width = px(6.0);
-            let radius = width * 0.5; // pill ends
-
-            let track_x = bounds.origin.x + bounds.size.width - width - margin;
             let track_y = bounds.origin.y + margin;
             let track_h = (bounds.size.height - margin * 2.0).max(px(0.0));
-
-            window.paint_quad(
-                fill(
-                    Bounds::new(Point::new(track_x, track_y), size(width, track_h)),
-                    track_color,
-                )
-                .corner_radii(radius),
-            );
 
             // Thumb sized to the visible fraction, with a floor so it stays grabbable
             // on long scrollback. The top is placed along the remaining travel.
@@ -1328,22 +1352,29 @@ impl Element for TerminalElement {
             let denom = (1.0 - thumb_frac).max(f32::EPSILON);
             let thumb_y = track_y + travel * (top_frac / denom).clamp(0.0, 1.0);
 
-            window.paint_quad(
-                fill(
-                    Bounds::new(Point::new(track_x, thumb_y), size(width, thumb_h)),
-                    thumb_color,
-                )
-                .corner_radii(radius),
-            );
+            let shown = self.view.read(cx).scrollbar_shown();
+            if shown {
+                let thumb_color = if self.view.read(cx).scrollbar_thumb_hot() {
+                    cx.theme().scrollbar_thumb_hover
+                } else {
+                    cx.theme().scrollbar_thumb
+                };
+                let radius = track.width * 0.5; // pill ends
+                window.paint_quad(
+                    fill(
+                        Bounds::new(Point::new(track.x, thumb_y), size(track.width, thumb_h)),
+                        thumb_color,
+                    )
+                    .corner_radii(radius),
+                );
+            }
 
-            // The clickable band is wider than the painted bar: a few pixels to
-            // its left, the right margin and the view's side padding out to the
-            // window edge, and the full height, so the thin bar is easy to grab.
-            let grab_pad = px(4.0);
+            // The whole lane is the grab target, out to the panel edge, so the
+            // thin bar is easy to take hold of without reaching into the text.
             self.view.update(cx, |view, _| {
-                view.scrollbar_geom = Some(ScrollbarGeom {
-                    hit_x0: track_x - grab_pad,
-                    hit_x1: bounds.origin.x + bounds.size.width + px(SIDE_PADDING),
+                view.set_scrollbar_geom(Some(ScrollbarGeom {
+                    hit_x0: track.lane_x0,
+                    hit_x1: track.lane_x1,
                     hit_y0: bounds.origin.y,
                     hit_y1: bounds.origin.y + bounds.size.height,
                     track_y,
@@ -1351,10 +1382,11 @@ impl Element for TerminalElement {
                     thumb_y,
                     thumb_h,
                     history_size: layout.history_size,
-                });
+                }));
             });
         } else {
-            self.view.update(cx, |view, _| view.scrollbar_geom = None);
+            self.view
+                .update(cx, |view, _| view.set_scrollbar_geom(None));
         }
 
         let focus_handle = self.view.read(cx).focus_handle.clone();
@@ -1426,6 +1458,22 @@ mod tests {
             clamp_to_grid(GridPoint { line: 1, column: 1 }, 0, 0),
             GridPoint { line: 0, column: 0 }
         );
+    }
+
+    #[test]
+    fn the_scrollbar_lane_stays_clear_of_the_text() {
+        let width = px(800.);
+        let cell = px(8.);
+        let cols = grid_columns(width, cell);
+        let text_right = px(cell.as_f32() * cols as f32);
+        let bounds = Bounds::new(Point::new(px(0.), px(0.)), size(width, px(400.)));
+        let track = scrollbar_track(bounds);
+
+        assert!(SCROLLBAR_GUTTER >= SCROLLBAR_WIDTH + SCROLLBAR_EDGE_INSET);
+        assert!(text_right <= track.lane_x0);
+        assert!(track.x >= track.lane_x0);
+        assert!(track.x + track.width <= track.lane_x1);
+        assert!(text_right <= track.x);
     }
 
     #[test]

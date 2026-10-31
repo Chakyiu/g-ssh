@@ -1,8 +1,10 @@
 //! The Vault section of Settings: lock the vault now, Touch ID, change the
 //! master password or the recovery phrase, and delete the vault.
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App, Context, Entity, EventEmitter, Window};
+use gpui::{div, App, Context, Entity, EventEmitter, Window};
+
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,

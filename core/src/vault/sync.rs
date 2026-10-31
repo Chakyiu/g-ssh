@@ -1583,8 +1583,7 @@ mod tests {
     fn synced_vault(dir: &tempfile::TempDir, name: &str) -> VaultManager {
         let path = dir.path().join(name);
         let (mut vault, _) =
-            VaultManager::create_with_params(&path, &SecretString::from("pw"), fast_kdf())
-                .unwrap();
+            VaultManager::create_with_params(&path, &SecretString::from("pw"), fast_kdf()).unwrap();
         vault.payload.sync = Some(SyncState::new(
             Uuid::nil(),
             "alice".into(),
@@ -2914,8 +2913,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.json");
         let (mut vault, phrase) =
-            VaultManager::create_with_params(&path, &SecretString::from("pw"), fast_kdf())
-                .unwrap();
+            VaultManager::create_with_params(&path, &SecretString::from("pw"), fast_kdf()).unwrap();
         vault.payload.sync = Some(SyncState::new(
             Uuid::nil(),
             "alice".into(),

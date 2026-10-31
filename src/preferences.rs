@@ -251,11 +251,15 @@ pub struct Preferences {
     /// character the layout composes.
     #[serde(default)]
     pub is_option_meta: bool,
-    /// Shared by every terminal, so zoom carries over to new tabs and to
-    /// the next start. Read it through `Preferences::terminal_font_size`,
-    /// which clamps a hand-edited value.
+    /// Shared by every terminal, so a chosen size carries over to new tabs
+    /// and to the next start. Read it through `Preferences::terminal_font_size`,
+    /// which clamps a hand-edited value. The interface zoom scales it on screen.
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f32,
+    /// Whole-interface zoom. 1 is the designed size. Read it through
+    /// `Preferences::ui_scale`, which snaps a hand-edited value onto the ladder.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
     #[serde(default)]
     pub terminal_font: TerminalFont,
     #[serde(default)]
@@ -282,6 +286,13 @@ pub struct Preferences {
     /// Whether a session shows the server panel on its right.
     #[serde(default)]
     pub is_server_panel_shown: bool,
+    /// Inspector width in pixels, once the user has dragged its edge.
+    /// Missing means the built-in width.
+    #[serde(default)]
+    pub server_panel_width: Option<f32>,
+    /// Agent chat width in pixels, once the user has dragged its edge.
+    #[serde(default)]
+    pub agent_panel_width: Option<f32>,
     /// The command that edits a remote file in a terminal tab. Read it
     /// through `Preferences::editor_command`, which fills in an empty one.
     #[serde(default = "default_editor_command")]
@@ -319,12 +330,20 @@ fn default_true() -> bool {
     true
 }
 
+fn finite_width(width: Option<f32>) -> Option<f32> {
+    width.filter(|width| width.is_finite() && *width > 0.)
+}
+
 fn default_editor_command() -> String {
     DEFAULT_EDITOR_COMMAND.to_string()
 }
 
 fn default_terminal_font_size() -> f32 {
     DEFAULT_TERMINAL_FONT_SIZE
+}
+
+fn default_ui_scale() -> f32 {
+    crate::ui::scale::DEFAULT_UI_SCALE
 }
 
 /// A size the terminal can lay out. The file is hand-editable, so the stored
@@ -343,6 +362,7 @@ impl Default for Preferences {
             is_suggestions_enabled: true,
             is_option_meta: false,
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            ui_scale: default_ui_scale(),
             terminal_font: TerminalFont::default(),
             terminal_scheme: TerminalScheme::default(),
             update_checks: None,
@@ -351,6 +371,8 @@ impl Default for Preferences {
             is_sidebar_shown: true,
             is_touch_id_enabled: false,
             is_server_panel_shown: false,
+            server_panel_width: None,
+            agent_panel_width: None,
             editor_command: default_editor_command(),
             is_editor_default_open: false,
             has_account: false,
@@ -389,6 +411,16 @@ impl Preferences {
             })
     }
 
+    /// Interface zoom, snapped onto the shortcut's ladder. 1 when preferences
+    /// were never loaded.
+    pub fn ui_scale(cx: &gpui::App) -> f32 {
+        crate::ui::scale::clamp(
+            cx.try_global::<Self>()
+                .map(|prefs| prefs.ui_scale)
+                .unwrap_or(crate::ui::scale::DEFAULT_UI_SCALE),
+        )
+    }
+
     pub fn terminal_font(cx: &gpui::App) -> TerminalFont {
         cx.try_global::<Self>()
             .map(|prefs| prefs.terminal_font)
@@ -415,6 +447,66 @@ impl Preferences {
     pub fn is_touch_id_enabled(cx: &gpui::App) -> bool {
         cx.try_global::<Self>()
             .is_some_and(|prefs| prefs.is_touch_id_enabled)
+    }
+
+    /// Inspector width the user dragged to, if they have.
+    pub fn server_panel_width(cx: &gpui::App) -> Option<f32> {
+        finite_width(
+            cx.try_global::<Self>()
+                .and_then(|prefs| prefs.server_panel_width),
+        )
+    }
+
+    /// Agent chat width the user dragged to, if they have.
+    pub fn agent_panel_width(cx: &gpui::App) -> Option<f32> {
+        finite_width(
+            cx.try_global::<Self>()
+                .and_then(|prefs| prefs.agent_panel_width),
+        )
+    }
+
+    /// Remember a width from dragging the server panel. The write waits until
+    /// the pointer settles, so a drag is one write.
+    pub fn set_dragged_panel_width(agent: bool, width: f32, cx: &mut gpui::App) {
+        if !width.is_finite() {
+            return;
+        }
+        let prefs = cx.default_global::<Self>();
+        let current = if agent {
+            prefs.agent_panel_width
+        } else {
+            prefs.server_panel_width
+        };
+        if current == Some(width) {
+            return;
+        }
+        if agent {
+            prefs.agent_panel_width = Some(width);
+        } else {
+            prefs.server_panel_width = Some(width);
+        }
+
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(FONT_SIZE_SAVE_DELAY).await;
+            cx.update(|cx| {
+                let Some(prefs) = cx.try_global::<Self>() else {
+                    return;
+                };
+                let stored = if agent {
+                    prefs.agent_panel_width
+                } else {
+                    prefs.server_panel_width
+                };
+                // A later drag started its own timer and will do the write.
+                if stored != Some(width) {
+                    return;
+                }
+                if let Err(e) = prefs.save() {
+                    tracing::warn!(?e, "failed to save server panel width");
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn editor_command(cx: &gpui::App) -> String {
@@ -449,7 +541,7 @@ impl Preferences {
     }
 
     /// Set the font size of every terminal. The write to disk waits until the
-    /// size settles, so holding the zoom shortcut gives one write.
+    /// size settles, so holding a stepper gives one write.
     pub fn set_terminal_font_size(size: f32, cx: &mut gpui::App) {
         let size = clamp_terminal_font_size(size);
         if Self::terminal_font_size(cx) == size {
@@ -478,6 +570,35 @@ impl Preferences {
         .detach();
     }
 
+    /// Set the interface zoom and remember it once it stops changing. Returns
+    /// whether the zoom actually moved. The caller repaints; this only stores
+    /// the number and the scale [`crate::ui::scale::px`] reads.
+    pub fn set_ui_scale(scale: f32, cx: &mut gpui::App) -> bool {
+        let scale = crate::ui::scale::clamp(scale);
+        if Self::ui_scale(cx) == scale {
+            return false;
+        }
+        cx.default_global::<Self>().ui_scale = scale;
+        crate::ui::scale::set_factor(scale);
+
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(FONT_SIZE_SAVE_DELAY).await;
+            cx.update(|cx| {
+                let Some(prefs) = cx.try_global::<Self>() else {
+                    return;
+                };
+                if prefs.ui_scale != scale {
+                    return;
+                }
+                if let Err(e) = prefs.save() {
+                    tracing::warn!(?e, "failed to save interface zoom");
+                }
+            });
+        })
+        .detach();
+        true
+    }
+
     pub fn load_or_default() -> Self {
         match Self::path() {
             Some(path) => Self::load_from(&path),
@@ -502,10 +623,11 @@ impl Preferences {
                 return Self::default();
             }
         };
-        let prefs = serde_json::from_slice::<Self>(&data).unwrap_or_else(|e| {
+        let mut prefs = serde_json::from_slice::<Self>(&data).unwrap_or_else(|e| {
             tracing::warn!(?e, "invalid preferences.json, using defaults");
             Self::default()
         });
+        prefs.ui_scale = crate::ui::scale::clamp(prefs.ui_scale);
         Self {
             update_checks: update_checks_in(&data),
             has_account: has_account_in(&data),
@@ -735,6 +857,23 @@ mod tests {
     }
 
     #[test]
+    fn server_panel_width_defaults_when_missing_and_round_trips() {
+        let old: Preferences = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        assert_eq!(old.server_panel_width, None);
+        assert_eq!(old.agent_panel_width, None);
+
+        let changed = Preferences {
+            server_panel_width: Some(400.),
+            agent_panel_width: Some(560.),
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&changed).unwrap();
+        let back: Preferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.server_panel_width, Some(400.));
+        assert_eq!(back.agent_panel_width, Some(560.));
+    }
+
+    #[test]
     fn sidebar_is_shown_when_missing_and_round_trips() {
         let old: Preferences = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
         assert!(old.is_sidebar_shown);
@@ -791,6 +930,16 @@ mod tests {
         assert_eq!(back.terminal_font_size, 17.0);
         assert_eq!(back.terminal_font, TerminalFont::JetBrainsMono);
         assert_eq!(back.terminal_scheme, TerminalScheme::TokyoNight);
+    }
+
+    #[test]
+    fn ui_scale_defaults_when_missing() {
+        assert_eq!(
+            Preferences::default().ui_scale,
+            crate::ui::scale::DEFAULT_UI_SCALE
+        );
+        let old: Preferences = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        assert_eq!(old.ui_scale, crate::ui::scale::DEFAULT_UI_SCALE);
     }
 
     #[test]

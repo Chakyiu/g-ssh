@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
+use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, px, App, Global, Modifiers, SharedString, Window};
+use gpui::{div, App, Global, Modifiers, SharedString, Window};
 
 use crate::theme;
 

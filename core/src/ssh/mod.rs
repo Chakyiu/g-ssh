@@ -308,6 +308,12 @@ pub enum SshCmd {
         cmd: String,
         reply: tokio::sync::oneshot::Sender<Result<ExecHandle, SshError>>,
     },
+    /// Like `OpenExec`, and also returns stderr, the exit status, and a way
+    /// to close the channel when the caller drops the handle.
+    OpenExecCaptured {
+        cmd: String,
+        reply: tokio::sync::oneshot::Sender<Result<CapturedExec, SshError>>,
+    },
     /// No reply channel: the result and every later change arrive as
     /// [`SshConnectionEvent::ForwardChanged`].
     StartForward {
@@ -327,6 +333,38 @@ pub struct ExecHandle {
 impl ExecHandle {
     pub fn subscribe(&self) -> async_channel::Receiver<Vec<u8>> {
         self.stdout_rx.clone()
+    }
+}
+
+/// A one-shot remote command whose stdout, stderr, and exit status are all
+/// returned. Dropping it closes the channel, so a caller that stops waiting
+/// does not leave the command running.
+pub struct CapturedExec {
+    stdout_rx: async_channel::Receiver<Vec<u8>>,
+    stderr_rx: async_channel::Receiver<Vec<u8>>,
+    exit_rx: async_channel::Receiver<u32>,
+    /// Dropped to wake the pump, which then closes the channel.
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for CapturedExec {
+    fn drop(&mut self) {
+        self.cancel.take();
+    }
+}
+
+impl CapturedExec {
+    pub fn stdout(&self) -> async_channel::Receiver<Vec<u8>> {
+        self.stdout_rx.clone()
+    }
+
+    pub fn stderr(&self) -> async_channel::Receiver<Vec<u8>> {
+        self.stderr_rx.clone()
+    }
+
+    /// One message when the server reports an exit status.
+    pub fn exit_status(&self) -> async_channel::Receiver<u32> {
+        self.exit_rx.clone()
     }
 }
 
@@ -750,6 +788,20 @@ impl SshConnection {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(SshCmd::OpenExec {
+                cmd,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| SshError::ConnectionClosed)?;
+        reply_rx.await.map_err(|_| SshError::ConnectionClosed)?
+    }
+
+    /// Run `cmd` and keep stderr and the exit status. The command string is
+    /// sent unchanged. Drop the handle to close the channel.
+    pub async fn open_exec_captured(&self, cmd: String) -> Result<CapturedExec, SshError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(SshCmd::OpenExecCaptured {
                 cmd,
                 reply: reply_tx,
             })
@@ -1205,6 +1257,9 @@ async fn run_connection(
                     SshCmd::OpenExec { cmd, reply } => {
                         let _ = reply.send(open_exec_channel(&handle, cmd).await);
                     }
+                    SshCmd::OpenExecCaptured { cmd, reply } => {
+                        let _ = reply.send(open_exec_captured(&handle, cmd).await);
+                    }
                     SshCmd::StartForward { spec } => {
                         start_forward(
                             &mut handle, spec, &mut forwards, &forward_tx, &forward_event_tx,
@@ -1595,6 +1650,82 @@ async fn open_exec_channel(
     tokio::task::spawn_local(drive_exec_channel(channel, stdout_tx));
 
     Ok(ExecHandle { stdout_rx })
+}
+
+async fn open_exec_captured(
+    handle: &client::Handle<ClientHandler>,
+    cmd: String,
+) -> Result<CapturedExec, SshError> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| SshError::ChannelOpen(e.to_string()))?;
+
+    channel
+        .exec(true, cmd.as_bytes())
+        .await
+        .map_err(|e| SshError::ChannelOpen(e.to_string()))?;
+
+    // The command itself is not logged: it can contain a secret the user
+    // just allowed the assistant to run.
+    tracing::debug!(bytes = cmd.len(), "captured exec channel opened");
+
+    let (stdout_tx, stdout_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (stderr_tx, stderr_rx) = async_channel::unbounded::<Vec<u8>>();
+    let (exit_tx, exit_rx) = async_channel::bounded::<u32>(1);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+
+    tokio::task::spawn_local(drive_captured_exec(
+        channel, stdout_tx, stderr_tx, exit_tx, cancel_rx,
+    ));
+
+    Ok(CapturedExec {
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+        cancel: Some(cancel_tx),
+    })
+}
+
+/// Pump one captured exec. A dropped [`CapturedExec`] completes `cancel`,
+/// and the channel is closed so the remote command is not left running.
+async fn drive_captured_exec(
+    mut channel: Channel<client::Msg>,
+    stdout_tx: async_channel::Sender<Vec<u8>>,
+    stderr_tx: async_channel::Sender<Vec<u8>>,
+    exit_tx: async_channel::Sender<u32>,
+    mut cancel: tokio::sync::oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut cancel => {
+                let _ = channel.close().await;
+                break;
+            }
+            msg = channel.wait() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    ChannelMsg::Data { data } => {
+                        if stdout_tx.try_send(data.to_vec()).is_err() {
+                            let _ = channel.close().await;
+                            break;
+                        }
+                    }
+                    ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        if stderr_tx.try_send(data.to_vec()).is_err() {
+                            let _ = channel.close().await;
+                            break;
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        let _ = exit_tx.try_send(exit_status);
+                    }
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Pump one exec channel until the command exits. Dropping the handle closes
@@ -4295,13 +4426,14 @@ fn known_hosts_verdict(recorded: &[PublicKey], presented: &PublicKey) -> KnownHo
 
 impl ClientHandler {
     fn check_known_hosts(&self, presented: &PublicKey) -> KnownHosts {
-        let recorded: Vec<PublicKey> = match keys::known_hosts::known_host_keys(&self.host, self.port) {
-            Ok(lines) => lines.into_iter().map(|(_, key)| key).collect(),
-            Err(e) => {
-                tracing::warn!(host = %self.host, %e, "could not read ~/.ssh/known_hosts");
-                Vec::new()
-            }
-        };
+        let recorded: Vec<PublicKey> =
+            match keys::known_hosts::known_host_keys(&self.host, self.port) {
+                Ok(lines) => lines.into_iter().map(|(_, key)| key).collect(),
+                Err(e) => {
+                    tracing::warn!(host = %self.host, %e, "could not read ~/.ssh/known_hosts");
+                    Vec::new()
+                }
+            };
         known_hosts_verdict(&recorded, presented)
     }
 }
