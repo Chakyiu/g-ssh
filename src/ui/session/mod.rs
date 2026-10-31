@@ -6,22 +6,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gssh::ssh::connection::{Connection, ForwardSpec};
 use crate::files::associations::SharedFileAssociations;
 use crate::preferences::Preferences;
-use gssh::ssh::shell::ShellHandle;
-use gssh::ssh::{
-    AuthCredential, AuthError, AuthPromptField, CancelFlag, ForwardState, SshConnection,
-    SshConnectionEvent, SshRoute, TransferOutcome,
-};
 use crate::theme;
-use crate::ui::sftp::peer::{Link, PeerLink};
 use crate::ui::session::panel::{ServerPanel, ServerPanelEvent, PANEL_WIDTH};
 use crate::ui::sftp::browser::{
     BrowserEvent, PreservedFiles, RestorePaths, SftpBrowser, TransferKind,
 };
-use crate::ui::terminal::view::TerminalView;
+use crate::ui::sftp::peer::{Link, PeerLink};
 use crate::ui::sftp::rate::TransferRate;
+use crate::ui::terminal::view::TerminalView;
 use crate::ui::VaultState;
 use gpui::prelude::*;
 use gpui::{
@@ -36,6 +30,12 @@ use gpui_component::{
     resizable::ResizableState,
     spinner::Spinner,
     v_flex, ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
+};
+use gssh::ssh::connection::{Connection, ForwardSpec};
+use gssh::ssh::shell::ShellHandle;
+use gssh::ssh::{
+    AuthCredential, AuthError, AuthPromptField, CancelFlag, ForwardState, SshConnection,
+    SshConnectionEvent, SshRoute, TransferOutcome,
 };
 use zeroize::Zeroizing;
 

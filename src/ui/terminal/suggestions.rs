@@ -35,9 +35,9 @@ use gpui::{
 use gpui_component::{h_flex, v_flex, ActiveTheme as _};
 
 use crate::preferences::Preferences;
-use gssh::ssh::shell::TermSnapshot;
 use crate::theme;
 use crate::ui::terminal::element::terminal_font_family;
+use gssh::ssh::shell::TermSnapshot;
 
 /// Cap on how many history entries we keep in memory per session.
 const MAX_HISTORY: usize = 5_000;

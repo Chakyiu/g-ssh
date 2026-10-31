@@ -218,22 +218,21 @@ impl ServersView {
             )
             .child(Icon::new(IconName::Ellipsis).size(px(14.)));
 
-        let sharing_items: Vec<ContextMenuItem> =
-            sharing::menu_choices(&self.vault_state, id, cx)
-                .into_iter()
-                .enumerate()
-                .map(|(choice_ix, (label, target))| {
-                    ContextMenuItem::new(
-                        ("row-menu-share", choice_ix),
-                        label,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_menu_for = None;
-                            sharing::set_shared(&this.vault_state, id, target, cx);
-                            cx.notify();
-                        }),
-                    )
-                })
-                .collect();
+        let sharing_items: Vec<ContextMenuItem> = sharing::menu_choices(&self.vault_state, id, cx)
+            .into_iter()
+            .enumerate()
+            .map(|(choice_ix, (label, target))| {
+                ContextMenuItem::new(
+                    ("row-menu-share", choice_ix),
+                    label,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_menu_for = None;
+                        sharing::set_shared(&this.vault_state, id, target, cx);
+                        cx.notify();
+                    }),
+                )
+            })
+            .collect();
 
         PopoverMenu::new(("server-row-more", ix), is_menu_open, trigger)
             .anchor(Anchor::TopRight)

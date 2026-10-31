@@ -21,8 +21,8 @@ use crate::preferences::{
     DEFAULT_EDITOR_COMMAND, DEFAULT_TERMINAL_FONT_SIZE,
 };
 use crate::ui::hosts::form::read_key_file;
-use crate::ui::terminal::element::{terminal_family_name, terminal_font_family};
 use crate::ui::terminal::colors::TerminalColors;
+use crate::ui::terminal::element::{terminal_family_name, terminal_font_family};
 use crate::ui::updates::service::UpdateService;
 use crate::ui::{dialog_chrome, VaultState};
 use gssh::vault::{

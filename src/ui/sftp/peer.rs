@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex};
 use gpui::{AsyncApp, Context, Task, WeakEntity};
 use zeroize::Zeroizing;
 
-use gssh::ssh::connection::Connection;
-use gssh::ssh::{AuthError, SftpHandle, SshConnection, SshConnectionEvent, SshRoute};
 use crate::ui::session::{
     failure_message, set_hop_password, AuthPromptState, ConnectFailure, HostKeyPromptState,
     ServerSession, ServerSessionEvent, CONNECTION_CLOSED,
 };
 use crate::ui::sftp::browser::LeftServerCarry;
+use gssh::ssh::connection::Connection;
+use gssh::ssh::{AuthError, SftpHandle, SshConnection, SshConnectionEvent, SshRoute};
 
 /// Which of a session's two connections a prompt or a hop belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

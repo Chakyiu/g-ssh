@@ -4,13 +4,13 @@ use gpui::{App, Context, Entity, FocusHandle, Focusable, Window};
 use gssh::vault::VaultError;
 
 use super::app::AppView;
+use super::sync::SyncService;
+use super::VaultState;
+use crate::ui::updates::service::UpdateService;
 use crate::ui::vault::create::CreateVaultView;
 use crate::ui::vault::onboarding::{OnboardingEvent, OnboardingView};
 use crate::ui::vault::phrase::PhraseView;
-use super::sync::SyncService;
 use crate::ui::vault::unlock::UnlockView;
-use crate::ui::updates::service::UpdateService;
-use super::VaultState;
 
 fn is_vault_on_disk() -> bool {
     gssh::vault::default_vault_path().is_ok_and(|path| gssh::vault::vault_path_occupied(&path))

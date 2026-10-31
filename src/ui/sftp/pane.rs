@@ -20,14 +20,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::files::open;
 use crate::preferences::Preferences;
-use gssh::ssh::shell;
-use gssh::ssh::{EntryKind, FileEntry};
 use crate::ui::sftp::keys::{
     self, hint, pane_command, type_ahead_match, typed_text, PaneCommand, RowMove, SwitchPane,
     TypeAhead,
 };
 use crate::ui::sftp::preview::{preview_plan, FilePreview, PreviewContent, PreviewPlan};
 use crate::ui::sftp::selection::{ClickKind, FileSelection};
+use gssh::ssh::shell;
+use gssh::ssh::{EntryKind, FileEntry};
 
 #[derive(Clone, Debug)]
 pub enum SyncIndicator {

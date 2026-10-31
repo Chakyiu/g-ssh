@@ -16,36 +16,34 @@ use gpui_component::{
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use gssh::ssh::connection::Connection;
 use crate::files::associations::{FileAssociations, SharedFileAssociations};
 use crate::open_tabs::OpenTabs;
 use crate::preferences::Preferences;
-use gssh::ssh::{AuthCredential, ForwardState, SshRoute, TransferOutcome};
-use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
-use crate::ui::sftp::picker::{AppPicker, AppPickerEvent};
-use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
-use crate::ui::hosts::import::{plural, ImportView, ImportViewEvent};
-use crate::ui::keyboard::bind_chord;
-use crate::ui::vault::passphrase::{PassphrasePromptEvent, PassphrasePromptView};
+use crate::ui::chrome;
+use crate::ui::hints;
 use crate::ui::hosts::form::{FormEvent, FormMode, ServerFormView};
-use crate::ui::session::{
-    connect_time_message, ForwardRuntime, ServerSession, ServerSessionEvent,
-};
+use crate::ui::hosts::import::{plural, ImportView, ImportViewEvent};
 use crate::ui::hosts::list::{ServersView, ServersViewEvent};
+use crate::ui::hosts::sidebar::{HostStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH};
+use crate::ui::keyboard::bind_chord;
+use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
+use crate::ui::session::{connect_time_message, ForwardRuntime, ServerSession, ServerSessionEvent};
 use crate::ui::settings::{SettingsView, SettingsViewEvent};
 use crate::ui::sftp::browser::{RestorePaths, TransferKind};
-use crate::ui::hints;
-use crate::ui::hosts::sidebar::{HostStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH};
-use crate::ui::sync::SyncService;
 use crate::ui::sftp::conflict::transfer_conflict_dialog;
+use crate::ui::sftp::picker::{AppPicker, AppPickerEvent};
+use crate::ui::sync::SyncService;
 use crate::ui::updates::consent::{UpdateConsentEvent, UpdateConsentView};
-use crate::ui::updates::service::{Download, UpdateService};
 use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
-use crate::ui::chrome;
+use crate::ui::updates::service::{Download, UpdateService};
+use crate::ui::vault::passphrase::{PassphrasePromptEvent, PassphrasePromptView};
 use crate::ui::workspace::{WorkKind, Workspace, WorkspaceEvent};
 use crate::ui::{dialog_chrome, VaultState, DIALOG_FORM, DIALOG_NARROW, DIALOG_WIDE};
-use gssh::vault::{AuthMethod, ServerEntry};
+use gssh::ssh::connection::Connection;
 use gssh::ssh::route::{self, CredentialIssue};
+use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
+use gssh::ssh::{AuthCredential, ForwardState, SshRoute, TransferOutcome};
+use gssh::vault::{AuthMethod, ServerEntry};
 
 actions!(
     app_view,
@@ -339,6 +337,16 @@ impl AppView {
         cx.on_app_quit(|this, cx| {
             this.save_vault_now(cx);
             async {}
+        })
+        .detach();
+
+        // Closing the window quits. Flush a vault write that is still waiting
+        // out its delay before this view is dropped.
+        let weak_for_close = cx.entity().downgrade();
+        cx.on_window_closed(move |cx, _| {
+            weak_for_close
+                .update(cx, |this, cx| this.save_vault_now(cx))
+                .ok();
         })
         .detach();
 
@@ -984,9 +992,7 @@ impl AppView {
             return;
         }
         self.hint_task = Some(cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(hints::SHOW_DELAY)
-                .await;
+            cx.background_executor().timer(hints::SHOW_DELAY).await;
             this.update_in(cx, |this, window, cx| {
                 this.hint_task = None;
                 hints::set_shown(true, window, cx);

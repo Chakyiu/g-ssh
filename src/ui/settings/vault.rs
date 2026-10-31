@@ -12,10 +12,10 @@ use gpui_component::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
-use gssh::account::{self, AccountError, Api};
 use crate::preferences::Preferences;
 use crate::ui::app::LOCK_SHORTCUT;
 use crate::ui::VaultState;
+use gssh::account::{self, AccountError, Api};
 use gssh::vault::{NewPasswordSlot, VaultError, VaultManager};
 
 pub enum VaultPaneEvent {

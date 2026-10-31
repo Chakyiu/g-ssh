@@ -17,11 +17,11 @@ use gpui_component::{
     v_flex, ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _,
 };
 
-use gssh::ssh::connection::{is_loopback_bind, ForwardKind};
-use gssh::ssh::ForwardState;
 use crate::theme;
 use crate::ui::session::{ForwardRuntime, ServerSession};
 use crate::ui::terminal::tabs::header_button;
+use gssh::ssh::connection::{is_loopback_bind, ForwardKind};
+use gssh::ssh::ForwardState;
 
 const POPOVER_W: f32 = 340.0;
 

@@ -18,23 +18,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-use gssh::ssh::connection::Connection;
 use crate::files::associations::SharedFileAssociations;
 use crate::files::edit::{FileEditSession, SyncState};
 use crate::files::open::OpenError;
 use crate::preferences::Preferences;
-use gssh::ssh::{
-    CancelFlag, DownloadResult, FileEntry, FileHead, SftpEvent, SftpHandle, StageItem,
-    TransferOutcome,
-};
 use crate::theme;
+use crate::ui::sftp::conflict::{free_name, ConflictChoice, Endpoint, FileFacts, TransferConflict};
+use crate::ui::sftp::keys::{pane_command, PaneCommand, SwitchPane, KEY_CONTEXT};
 use crate::ui::sftp::pane::{
     source_icon, source_pill, DraggedEntry, EntryRef, FilePane, FilePaneEvent, PaneKind,
     SourcePillClick, StagedFile, SyncIndicator,
 };
-use crate::ui::sftp::keys::{pane_command, PaneCommand, SwitchPane, KEY_CONTEXT};
-use crate::ui::sftp::conflict::{
-    free_name, ConflictChoice, Endpoint, FileFacts, TransferConflict,
+use gssh::ssh::connection::Connection;
+use gssh::ssh::{
+    CancelFlag, DownloadResult, FileEntry, FileHead, SftpEvent, SftpHandle, StageItem,
+    TransferOutcome,
 };
 
 const MAX_VISITED: usize = 50;

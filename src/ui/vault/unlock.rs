@@ -8,9 +8,9 @@ use gpui_component::{
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
+use super::lock;
 use crate::preferences::Preferences;
 use crate::touch_id::{self, TouchIdError};
-use super::lock;
 use crate::ui::VaultState;
 
 const RECOVERY_WORD_COUNT: usize = 24;
@@ -223,9 +223,8 @@ impl UnlockView {
         self.error = None;
         cx.notify();
 
-        let (tx, rx) = async_channel::bounded::<
-            Result<gssh::vault::VaultManager, gssh::vault::VaultError>,
-        >(1);
+        let (tx, rx) =
+            async_channel::bounded::<Result<gssh::vault::VaultManager, gssh::vault::VaultError>>(1);
 
         std::thread::spawn(move || {
             let result = (|| -> Result<_, gssh::vault::VaultError> {
@@ -524,15 +523,15 @@ impl UnlockView {
             .child(
                 lock::links()
                     .child(
-                        lock::link("back-to-pw", "Back to password unlock").on_click(
-                            cx.listener(|this, _, window, cx| {
+                        lock::link("back-to-pw", "Back to password unlock").on_click(cx.listener(
+                            |this, _, window, cx| {
                                 this.step = Step::PasswordForm;
                                 this.error = None;
                                 this.password
                                     .update(cx, |state, cx| state.focus(window, cx));
                                 cx.notify();
-                            }),
-                        ),
+                            },
+                        )),
                     )
                     .child(
                         lock::link(
@@ -580,9 +579,9 @@ impl UnlockView {
                     .disabled(!is_confirmed)
                     .on_click(cx.listener(|this, _, _, cx| this.delete_vault(cx))),
             )
-            .child(lock::links().child(
-                lock::link("delete-vault-cancel", "Cancel").on_click(cx.listener(
-                    |this, _, window, cx| {
+            .child(
+                lock::links().child(lock::link("delete-vault-cancel", "Cancel").on_click(
+                    cx.listener(|this, _, window, cx| {
                         this.step = Step::RecoveryForm;
                         this.error = None;
                         this.delete_word
@@ -590,9 +589,9 @@ impl UnlockView {
                         this.phrase_input
                             .update(cx, |state, cx| state.focus(window, cx));
                         cx.notify();
-                    },
+                    }),
                 )),
-            ))
+            )
             .into_any_element()
     }
 }

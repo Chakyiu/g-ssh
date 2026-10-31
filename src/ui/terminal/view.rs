@@ -10,22 +10,22 @@ use gpui::{
 };
 
 use crate::preferences::{Preferences, DEFAULT_TERMINAL_FONT_SIZE};
-use gssh::ssh::shell::{
-    GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionSide, SelectionType,
-    ShellEvent, ShellHandle, TermSnapshot,
-};
 use crate::theme;
-use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::keyboard::bind_chord;
-use crate::ui::terminal::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseEventKind};
+use crate::ui::menu::{ContextMenu, ContextMenuItem};
+use crate::ui::terminal::colors::TerminalColors;
 use crate::ui::terminal::element::{
     clamp_to_grid, pixel_to_grid, CachedGrid, ShapedLines, TerminalElement, LINE_HEIGHT_FACTOR,
 };
 use crate::ui::terminal::keymap;
 use crate::ui::terminal::link::{self, TerminalLink};
-use crate::ui::terminal::colors::TerminalColors;
+use crate::ui::terminal::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseEventKind};
 use crate::ui::terminal::search::{self, SearchState};
 use crate::ui::terminal::suggestions::{NavAction, SuggestionState};
+use gssh::ssh::shell::{
+    GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionSide, SelectionType,
+    ShellEvent, ShellHandle, TermSnapshot,
+};
 
 actions!(
     terminal_view,
@@ -569,8 +569,7 @@ impl TerminalView {
     /// the click is not on a link, so it stays a normal click: the remote app
     /// still gets its Ctrl+click when mouse mode is on.
     fn try_open_link(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) -> bool {
-        if event.button != MouseButton::Left
-            || !crate::ui::keyboard::is_secondary(&event.modifiers)
+        if event.button != MouseButton::Left || !crate::ui::keyboard::is_secondary(&event.modifiers)
         {
             return false;
         }
@@ -1268,12 +1267,7 @@ impl TerminalView {
         true
     }
 
-    fn on_scroll(
-        &mut self,
-        event: &ScrollEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let line_height_f32 = self
             .last_cell_size
             .map(|(_, line_height)| line_height.as_f32())
@@ -1348,11 +1342,7 @@ impl TerminalView {
 
     fn key_bytes(&self, keystroke: &Keystroke, cx: &App) -> Option<Vec<u8>> {
         let is_app_cursor = self.last_snapshot.as_ref().is_some_and(|s| s.is_app_cursor);
-        keymap::keystroke_to_bytes(
-            keystroke,
-            Preferences::is_option_meta(cx),
-            is_app_cursor,
-        )
+        keymap::keystroke_to_bytes(keystroke, Preferences::is_option_meta(cx), is_app_cursor)
     }
 }
 

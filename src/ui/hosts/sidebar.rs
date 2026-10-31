@@ -11,9 +11,9 @@ use uuid::Uuid;
 
 use crate::theme;
 use crate::ui::app::ToggleSettings;
-use crate::ui::menu::{ContextMenu, ContextMenuItem, PopoverMenu};
-use crate::ui::hosts::sharing;
 use crate::ui::hints;
+use crate::ui::hosts::sharing;
+use crate::ui::menu::{ContextMenu, ContextMenuItem, PopoverMenu};
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
 use gssh::vault::ServerEntrySummary;
@@ -249,9 +249,7 @@ impl Sidebar {
                     .flex_none()
                     .gap(px(1.))
                     .items_center()
-                    .when_some(hint.clone(), |row, keys| {
-                        row.child(hints::badge(keys))
-                    })
+                    .when_some(hint.clone(), |row, keys| row.child(hints::badge(keys)))
                     .when(show_close && hint.is_none(), |row| {
                         row.child(
                             div()
@@ -1097,9 +1095,7 @@ impl Sidebar {
                 .build(window, cx)
             })
             .child(icon.size(px(15.)))
-            .when_some(hint, |el, keys| {
-                el.child(hints::corner_badge(keys))
-            })
+            .when_some(hint, |el, keys| el.child(hints::corner_badge(keys)))
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(event())))
     }
 }

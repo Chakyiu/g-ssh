@@ -9,8 +9,8 @@ use gpui_component::{
 };
 
 use crate::preferences::{Preferences, UpdateChecks};
-use crate::ui::vault::lock;
 use crate::ui::updates::service::UpdateService;
+use crate::ui::vault::lock;
 
 pub enum OnboardingEvent {
     Finished,

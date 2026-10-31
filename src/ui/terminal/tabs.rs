@@ -25,15 +25,15 @@ use gpui_component::{
 };
 
 use crate::preferences::Preferences;
-use gssh::ssh::shell::ShellHandle;
 use crate::theme;
-use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::dialog_chrome;
+use crate::ui::hints;
+use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::session::{
     DockEdge, LayoutNode, ServerSession, ServerSessionEvent, TermPane, TerminalTabMenu,
 };
-use crate::ui::hints;
 use crate::ui::terminal::view::{TabColor, TerminalEvent, TerminalView};
+use gssh::ssh::shell::ShellHandle;
 
 /// Tabs past this would not fit the header. It is also close to what a server
 /// allows: OpenSSH's default `MaxSessions` is 10 and SFTP takes two of them.

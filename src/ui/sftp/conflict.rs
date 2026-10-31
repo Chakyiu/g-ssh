@@ -11,8 +11,8 @@ use gpui_component::{
 };
 
 use crate::ui::dialog_chrome;
-use crate::ui::sftp::pane::{fmt_mtime, fmt_size};
 use crate::ui::sftp::browser::{SftpBrowser, Side};
+use crate::ui::sftp::pane::{fmt_mtime, fmt_size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictChoice {

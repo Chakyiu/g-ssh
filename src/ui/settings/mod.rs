@@ -1,5 +1,5 @@
-mod vault;
 pub mod screen;
+mod vault;
 
 pub(crate) use screen::set_theme_preference;
 pub use screen::{SettingsView, SettingsViewEvent};

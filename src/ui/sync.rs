@@ -8,12 +8,12 @@ use gpui::{App, AppContext as _, Context, Entity, Global};
 use secrecy::SecretString;
 use uuid::Uuid;
 
+use crate::preferences::Preferences;
+use crate::ui::VaultState;
 use gssh::account::api::JoinRequest;
 use gssh::account::rounds::{log_out_quietly, take_in, Round, RoundWork};
 use gssh::account::team::{self, Roster, TeamError, TeamKeys};
 use gssh::account::Api;
-use crate::preferences::Preferences;
-use crate::ui::VaultState;
 use gssh::vault::sync::{InviteSecret, PendingJoin, TeamContext, TeamUpdate};
 use gssh::vault::VaultManager;
 

@@ -19,12 +19,12 @@ use gpui_component::{
 };
 use uuid::Uuid;
 
-use crate::ui::menu::AnchoredToTrigger;
 use crate::ui::dialog_max_height;
+use crate::ui::menu::AnchoredToTrigger;
 
+use crate::ui::VaultState;
 use gssh::ssh::connection::{is_loopback_bind, ForwardKind};
 use gssh::ssh::target::{find_saved_jump_host, parse_host_field};
-use crate::ui::VaultState;
 use gssh::vault::{
     AuthMethod, HostSnippet, PortForward, ServerEntry, ServerEntrySummary, VaultError,
 };

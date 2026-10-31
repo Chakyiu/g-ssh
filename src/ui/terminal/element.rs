@@ -12,11 +12,11 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::preferences::{Preferences, TerminalFont};
-use gssh::ssh::shell::{GridPoint, GridSelectionRange, SelectionSide, TermSnapshot};
 use crate::theme;
-use crate::ui::terminal::link::TerminalLink;
 use crate::ui::terminal::colors::{self, ColorKey, TerminalColors};
+use crate::ui::terminal::link::TerminalLink;
 use crate::ui::terminal::view::{ScrollbarGeom, TerminalView, SIDE_PADDING};
+use gssh::ssh::shell::{GridPoint, GridSelectionRange, SelectionSide, TermSnapshot};
 
 /// Height of a terminal row, as a multiple of the font size.
 pub(crate) const LINE_HEIGHT_FACTOR: f32 = 1.3;

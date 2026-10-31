@@ -17,12 +17,12 @@ use gpui_component::{
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 
-use gssh::ssh::TransferOutcome;
 use crate::theme;
-use crate::ui::sftp::pane::fmt_size;
 use crate::ui::session::{ServerSession, TransferTask};
 use crate::ui::sftp::browser::TransferKind;
+use crate::ui::sftp::pane::fmt_size;
 use crate::ui::terminal::tabs::header_button;
+use gssh::ssh::TransferOutcome;
 
 const POPOVER_W: f32 = 340.0;
 

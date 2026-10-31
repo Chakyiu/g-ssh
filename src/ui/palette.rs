@@ -11,15 +11,15 @@ use gpui_component::{
 use uuid::Uuid;
 
 use crate::preferences::{Preferences, ThemePreference};
-use gssh::ssh::target::{find_saved_host, find_saved_host_by_name, parse_ssh_target, SshTarget};
 use crate::theme;
-use crate::ui::sftp::pane::{self, PaneKind};
 use crate::ui::hosts::icon::host_icon;
 use crate::ui::hosts::sidebar::host_order_key;
+use crate::ui::sftp::pane::{self, PaneKind};
 use crate::ui::terminal::tabs::{
     NEW_TERMINAL_SHORTCUT, SERVER_PANEL_SHORTCUT, TOGGLE_FILES_SHORTCUT,
 };
 use crate::ui::VaultState;
+use gssh::ssh::target::{find_saved_host, find_saved_host_by_name, parse_ssh_target, SshTarget};
 use gssh::vault::{ServerEntrySummary, Snippet};
 
 actions!(command_palette, [Close, Up, Down, Activate]);

@@ -9,8 +9,8 @@ use gpui_component::{
 };
 use zeroize::Zeroizing;
 
-use crate::ui::vault::phrase_panel::{phrase_file_text, phrase_panel};
 use super::lock;
+use crate::ui::vault::phrase_panel::{phrase_file_text, phrase_panel};
 use crate::ui::VaultState;
 
 const COPIED_LABEL_DURATION: Duration = Duration::from_secs(2);

@@ -533,12 +533,16 @@ fn fetch_to(
         return Err(UpdateError::Cancelled);
     }
     let response = open_download(url)?;
-    let announced = header_str(&response, "content-length").and_then(|length| length.parse::<u64>().ok());
+    let announced =
+        header_str(&response, "content-length").and_then(|length| length.parse::<u64>().ok());
     if announced.is_some_and(|length| length != release.size_bytes) {
         return Err(UpdateError::WrongSize);
     }
     // One byte more than expected is enough to see that the file is too long.
-    let body = response.into_body().into_reader().take(release.size_bytes + 1);
+    let body = response
+        .into_body()
+        .into_reader()
+        .take(release.size_bytes + 1);
     let mut file = File::create_new(part)?;
     let (size, checksum) = copy_and_hash(body, &mut file, is_cancelled, on_progress)?;
     file.sync_all()?;

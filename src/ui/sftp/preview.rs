@@ -14,8 +14,8 @@ use gpui_component::{
     v_flex, ActiveTheme as _,
 };
 
-use gssh::ssh::{EntryKind, FileEntry, FileHead};
 use crate::ui::sftp::pane::{fmt_mtime, fmt_size};
+use gssh::ssh::{EntryKind, FileEntry, FileHead};
 
 /// How much of a text file is read. Enough for any config file; a log shows
 /// its start.

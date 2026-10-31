@@ -19,10 +19,10 @@ use gpui::{
 use gpui_component::{h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, StyledExt as _};
 
 use crate::host_stats::{self, Sample, SystemInfo};
-use gssh::ssh::SshConnection;
 use crate::theme;
 use crate::ui::session::ServerSession;
 use crate::ui::VaultState;
+use gssh::ssh::SshConnection;
 
 pub const PANEL_WIDTH: f32 = 320.;
 const TICK: Duration = Duration::from_secs(2);
