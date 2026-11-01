@@ -1,8 +1,8 @@
 [package]
 name = "core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
-description = "The part of g-ssh without UI: SSH, SFTP, terminal emulator, vault and sync"
+description = "The part of g-ssh without UI: SSH, SFTP, Telnet, terminal emulator, vault and sync"
 license = "MIT"
 publish = false
 

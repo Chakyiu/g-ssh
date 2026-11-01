@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, Anchor, AnyElement, Bounds, Context, DragMoveEvent, Entity, EventEmitter, MouseButton,
-    MouseDownEvent, Pixels, Point, SharedString, Window,
+    div, Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EventEmitter,
+    MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window,
 };
 
 use gpui_component::{h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon, IconName};
@@ -18,7 +18,7 @@ use crate::ui::hosts::sharing;
 use crate::ui::menu::{ContextMenu, ContextMenuItem, PopoverMenu};
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
-use gssh::vault::{ProxyChoice, ServerEntrySummary};
+use gssh::vault::{ConnectionKind, ProxyChoice, ServerEntrySummary};
 
 pub(crate) const SIDEBAR_WIDTH: f32 = 232.;
 const ROW_HEIGHT: f32 = 28.;
@@ -61,6 +61,8 @@ struct DraggedHost {
 pub enum SidebarEvent {
     OpenServer(Uuid),
     OpenSftp(Uuid),
+    /// A terminal for a host whose click opens files.
+    OpenTerminal(Uuid),
     CloseServer(Uuid),
     AddServerRequested,
     ShowAllServers,
@@ -297,7 +299,7 @@ impl Sidebar {
                         )
                     })
                     .when(hint.is_none(), |row| {
-                        row.child(self.host_more_menu(ui_idx, entry_id, show_close, cx))
+                        row.child(self.host_more_menu(ui_idx, entry_id, show_close, entry.kind, cx))
                     }),
             )
             .on_click(cx.listener(move |_, _, _, cx| {
@@ -341,6 +343,7 @@ impl Sidebar {
         ui_idx: usize,
         entry_id: Uuid,
         has_session: bool,
+        kind: ConnectionKind,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -412,8 +415,22 @@ impl Sidebar {
                 .collect();
 
         let mut menu = PopoverMenu::new(("sidebar-host-more", ui_idx), is_menu_open, trigger)
-            .anchor(Anchor::TopRight)
-            .item(
+            .anchor(Anchor::TopRight);
+        menu = match kind {
+            ConnectionKind::Telnet => menu,
+            ConnectionKind::Sftp => menu.item(
+                ContextMenuItem::new(
+                    "sidebar-menu-terminal",
+                    "Open terminal",
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_menu_for = None;
+                        cx.emit(SidebarEvent::OpenTerminal(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/square-terminal.svg"),
+            ),
+            ConnectionKind::Ssh => menu.item(
                 ContextMenuItem::new(
                     "sidebar-menu-sftp",
                     "Open SFTP",
@@ -424,7 +441,9 @@ impl Sidebar {
                     }),
                 )
                 .icon("icons/folder-open.svg"),
-            )
+            ),
+        };
+        menu = menu
             .item(
                 ContextMenuItem::new(
                     "sidebar-menu-edit",
@@ -1357,29 +1376,73 @@ impl Render for Sidebar {
 }
 
 impl Sidebar {
+    fn kind_of(&self, id: Uuid, cx: &App) -> ConnectionKind {
+        self.vault_state
+            .read(cx)
+            .manager()
+            .and_then(|vm| vm.get_entry(id).ok())
+            .map(|entry| entry.kind)
+            .unwrap_or(ConnectionKind::Ssh)
+    }
+
     fn render_host_menu(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (entry_id, position) = self.host_menu?;
-        let items = vec![
-            ContextMenuItem::new(
-                "host-menu-terminal",
-                "Open terminal",
-                cx.listener(move |this, _, _, cx| {
-                    this.host_menu = None;
-                    cx.emit(SidebarEvent::OpenServer(entry_id));
-                    cx.notify();
-                }),
-            )
-            .icon("icons/square-terminal.svg"),
-            ContextMenuItem::new(
-                "host-menu-sftp",
-                "Open SFTP",
-                cx.listener(move |this, _, _, cx| {
-                    this.host_menu = None;
-                    cx.emit(SidebarEvent::OpenSftp(entry_id));
-                    cx.notify();
-                }),
-            )
-            .icon("icons/folder-open.svg"),
+        let kind = self.kind_of(entry_id, cx);
+        let mut items = Vec::new();
+        if kind != ConnectionKind::Sftp {
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-terminal",
+                    "Open terminal",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenServer(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/square-terminal.svg"),
+            );
+        } else {
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-sftp",
+                    "Open SFTP",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenServer(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/folder-open.svg"),
+            );
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-terminal",
+                    "Open terminal",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenTerminal(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/square-terminal.svg"),
+            );
+        }
+        if kind == ConnectionKind::Ssh {
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-sftp",
+                    "Open SFTP",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenSftp(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/folder-open.svg"),
+            );
+        }
+        items.push(
             ContextMenuItem::new(
                 "host-menu-duplicate",
                 "Duplicate",
@@ -1390,7 +1453,7 @@ impl Sidebar {
                 }),
             )
             .icon("icons/clipboard-copy.svg"),
-        ];
+        );
         Some(
             ContextMenu::new(
                 "sidebar-host-menu",
@@ -1423,16 +1486,7 @@ struct HostDetail {
 }
 
 fn host_address(entry: &ServerEntrySummary) -> String {
-    let host = if entry.port == 22 {
-        entry.host.clone()
-    } else {
-        format!("{}:{}", entry.host, entry.port)
-    };
-    if entry.username.is_empty() {
-        host
-    } else {
-        format!("{}@{host}", entry.username)
-    }
+    gssh::vault::endpoint_label(entry.kind, &entry.username, &entry.host, entry.port)
 }
 
 fn status_label(status: HostStatus) -> &'static str {
@@ -1469,7 +1523,10 @@ fn host_detail(
     } else {
         entry.label.clone()
     };
-    let mut lines = vec![("Status", status_label(status).to_string())];
+    let mut lines = vec![
+        ("Status", status_label(status).to_string()),
+        ("Type", entry.kind.label().to_string()),
+    ];
     if let Some(os) = entry.os.as_ref().filter(|os| !os.trim().is_empty()) {
         lines.push(("System", os.clone()));
     }
@@ -1579,6 +1636,7 @@ mod tests {
             host: "example".to_string(),
             port: 22,
             username: "me".to_string(),
+            kind: ConnectionKind::Ssh,
             os: None,
             last_opened_at: None,
             sort_order: 0,
@@ -1703,6 +1761,7 @@ mod tests {
             detail.lines,
             vec![
                 ("Status", "Connected".into()),
+                ("Type", "SSH".into()),
                 ("System", "Ubuntu".into()),
                 ("Folder", "Prod".into()),
                 ("Tags", "db, eu".into()),
@@ -1715,7 +1774,13 @@ mod tests {
         let detail = host_detail(&bare, HostStatus::Offline, None, 0);
         assert_eq!(detail.name, "example");
         assert_eq!(detail.address, "me@example");
-        assert_eq!(detail.lines, vec![("Status", "Not connected".into())]);
+        assert_eq!(
+            detail.lines,
+            vec![
+                ("Status", "Not connected".into()),
+                ("Type", "SSH".into()),
+            ]
+        );
     }
 
     #[test]

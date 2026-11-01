@@ -245,6 +245,7 @@ mod tests {
             host: host.to_string(),
             port,
             username: user.to_string(),
+            kind: crate::vault::ConnectionKind::Ssh,
             os: None,
             last_opened_at: None,
             sort_order: 0,

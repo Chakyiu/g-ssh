@@ -436,6 +436,16 @@ pub fn resolve_jump_chain<'a>(
     Ok(chain)
 }
 
+/// `telnet host [port]`. The port is left off when it is 23.
+pub fn telnet_command(entry: &ServerEntry) -> String {
+    let host = shell_quote(&entry.host);
+    if entry.port == crate::ssh::connection::ConnectionKind::Telnet.default_port() {
+        format!("telnet {host}")
+    } else {
+        format!("telnet {host} {}", entry.port)
+    }
+}
+
 /// OpenSSH command for a chain: `ssh -J ops@bastion,ops@inner:2200 -p 2222 deploy@db`.
 /// It is pasted into a shell and hosts may come from others, so shell syntax is quoted.
 pub fn ssh_command(chain: &[&ServerEntry]) -> String {
@@ -709,6 +719,12 @@ pub struct ServerEntry {
     pub label: String,
     pub host: String,
     pub port: u16,
+    /// Missing from a host saved before connection types existed, so it is SSH.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::ssh::connection::ConnectionKind::is_ssh"
+    )]
+    pub kind: crate::ssh::connection::ConnectionKind,
     pub username: String,
     pub auth: AuthMethod,
     pub notes: Option<String>,
@@ -767,6 +783,7 @@ impl fmt::Debug for ServerEntry {
             .field("label", &self.label)
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("kind", &self.kind)
             .field("username", &self.username)
             .field("auth", &self.auth)
             // People keep passwords and tokens in the notes.
@@ -814,6 +831,7 @@ pub struct ServerEntrySummary {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub kind: crate::ssh::connection::ConnectionKind,
     pub os: Option<String>,
     pub last_opened_at: Option<i64>,
     /// Sidebar place within the folder. `0` = not placed yet.
@@ -837,6 +855,7 @@ impl From<&ServerEntry> for ServerEntrySummary {
             host: e.host.clone(),
             port: e.port,
             username: e.username.clone(),
+            kind: e.kind,
             os: e.os.clone(),
             last_opened_at: e.last_opened_at,
             sort_order: e.sort_order,
@@ -954,6 +973,7 @@ mod tests {
         assert_eq!(loaded.entries.len(), 1);
         assert!(loaded.entries[0].forwards.is_empty());
         assert_eq!(loaded.entries[0].sort_order, 0);
+        assert!(loaded.entries[0].kind.is_ssh());
     }
 
     #[test]

@@ -79,6 +79,7 @@ pub struct ImportedHost {
     pub host: String,
     pub port: u16,
     pub username: Option<String>,
+    pub kind: gssh::vault::ConnectionKind,
     /// Resolved `IdentityFile` path, if the config names one.
     pub identity_file: Option<PathBuf>,
     /// `identity_file` was not named by the config: it is a default key
@@ -120,6 +121,7 @@ impl ImportedHost {
             host,
             port,
             username,
+            kind: gssh::vault::ConnectionKind::Ssh,
             identity_file: None,
             is_default_identity: false,
             key_pem: None,
@@ -146,6 +148,7 @@ impl std::fmt::Debug for ImportedHost {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("username", &self.username)
+            .field("kind", &self.kind)
             .field("identity_file", &self.identity_file)
             .field("is_default_identity", &self.is_default_identity)
             .field("key_pem", &redacted(&self.key_pem))
@@ -866,9 +869,11 @@ pub fn scan_putty_sessions() -> Vec<ImportedHost> {
         };
 
         let protocol: String = session.get_value("Protocol").unwrap_or_default();
-        if !protocol.is_empty() && protocol != "ssh" {
-            continue;
-        }
+        let kind = match protocol.to_ascii_lowercase().as_str() {
+            "" | "ssh" => gssh::vault::ConnectionKind::Ssh,
+            "telnet" => gssh::vault::ConnectionKind::Telnet,
+            _ => continue,
+        };
         let mut host: String = session.get_value("HostName").unwrap_or_default();
         if host.trim().is_empty() {
             continue; // "Default Settings" and other host-less sessions
@@ -881,16 +886,20 @@ pub fn scan_putty_sessions() -> Vec<ImportedHost> {
             }
             host = h.to_string();
         }
-        let port: u32 = session.get_value("PortNumber").unwrap_or(22);
+        let port: u32 = session
+            .get_value("PortNumber")
+            .unwrap_or(u32::from(kind.default_port()));
 
         // PuTTY keys are .ppk, which cannot be imported as PEM, so no identity.
-        hosts.push(ImportedHost::new(
+        let mut imported = ImportedHost::new(
             percent_decode(&name),
             host.trim().to_string(),
-            u16::try_from(port).unwrap_or(22),
+            u16::try_from(port).unwrap_or(kind.default_port()),
             (!username.trim().is_empty()).then(|| username.trim().to_string()),
             ImportSource::Putty,
-        ));
+        );
+        imported.kind = kind;
+        hosts.push(imported);
     }
     hosts
 }

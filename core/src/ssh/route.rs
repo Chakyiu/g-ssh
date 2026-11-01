@@ -5,6 +5,8 @@ use zeroize::Zeroizing;
 
 use crate::ssh::connection::ResolvedProxy;
 use crate::ssh::{self, AuthCredential, KeyIssue, SshHop, SshRoute};
+use uuid::Uuid;
+
 use crate::vault::{AuthMethod, ProxyKind, ServerEntry, VaultManager};
 
 /// Why the host's own credential needs the user before connecting.
@@ -48,6 +50,21 @@ pub fn target_credential(
     })
 }
 
+/// The proxy this host is dialled through, if it does not connect directly.
+pub fn resolved_proxy(vault: &VaultManager, entry_id: Uuid) -> Option<ResolvedProxy> {
+    vault.resolve_proxy_for(entry_id).map(|proxy| {
+        let addr = format!("{}:{}", proxy.host, proxy.port);
+        let auth = proxy
+            .auth
+            .as_ref()
+            .map(|auth| (auth.username.clone(), auth.password.clone()));
+        match proxy.kind {
+            ProxyKind::Socks5 => ResolvedProxy::Socks5 { addr, auth },
+            ProxyKind::Http => ResolvedProxy::Http { addr, auth },
+        }
+    })
+}
+
 /// Every bastion in front of `entry`, then `entry` with `credential`.
 pub fn route_for(
     vault: &VaultManager,
@@ -61,17 +78,7 @@ pub fn route_for(
     // Only the first hop is dialled over TCP, so its proxy is the one that counts; a jumped
     // target is never reached from this network at all.
     let dialled = chain.first().map(|hop| hop.id).unwrap_or(entry.id);
-    let proxy = vault.resolve_proxy_for(dialled).map(|p| {
-        let addr = format!("{}:{}", p.host, p.port);
-        let auth = p
-            .auth
-            .as_ref()
-            .map(|a| (a.username.clone(), a.password.clone()));
-        match p.kind {
-            ProxyKind::Socks5 => ResolvedProxy::Socks5 { addr, auth },
-            ProxyKind::Http => ResolvedProxy::Http { addr, auth },
-        }
-    });
+    let proxy = resolved_proxy(vault, dialled);
 
     // The chain ends with the target, whose credential the caller already has.
     let mut jumps = Vec::new();

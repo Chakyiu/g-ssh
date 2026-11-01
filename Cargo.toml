@@ -1,8 +1,8 @@
 [package]
 name = "g-ssh"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
-description = "SSH and SFTP client"
+description = "SSH, SFTP and Telnet client"
 license = "MIT"
 repository = "https://github.com/Chakyiu/g-ssh"
 rust-version = "1.98"

@@ -328,6 +328,7 @@ mod tests {
             label: label.into(),
             host: format!("{label}.example.com"),
             port: 22,
+            kind: crate::vault::ConnectionKind::Ssh,
             username: "root".into(),
             auth: AuthMethod::Password("hunter2".into()),
             notes: None,

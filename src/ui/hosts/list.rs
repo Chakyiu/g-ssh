@@ -37,6 +37,15 @@ const ADD_HOST_HINT: &str = "or press Cmd+T to add a host";
 #[cfg(not(target_os = "macos"))]
 const ADD_HOST_HINT: &str = "or press Ctrl+Shift+T to add a host";
 
+fn host_line(entry: &gssh::vault::ServerEntrySummary) -> String {
+    let address = gssh::vault::endpoint_label(entry.kind, &entry.username, &entry.host, entry.port);
+    if entry.kind.is_ssh() {
+        address
+    } else {
+        format!("{address} · {}", entry.kind.label())
+    }
+}
+
 /// The empty-state line that offers the hosts of `~/.ssh/config`.
 fn ssh_config_offer(host_count: usize) -> Option<String> {
     match host_count {
@@ -176,6 +185,7 @@ impl ServersView {
         &self,
         ix: usize,
         id: Uuid,
+        kind: gssh::vault::ConnectionKind,
         is_menu_open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -258,7 +268,12 @@ impl ServersView {
             ))
             .item(ContextMenuItem::new(
                 "row-menu-copy-ssh",
-                "Copy SSH command",
+                match kind {
+                    gssh::vault::ConnectionKind::Telnet => "Copy Telnet command",
+                    gssh::vault::ConnectionKind::Ssh | gssh::vault::ConnectionKind::Sftp => {
+                        "Copy SSH command"
+                    }
+                },
                 cx.listener(move |this, _, _, cx| {
                     this.open_menu_for = None;
                     this.copy_ssh_command(id, cx);
@@ -421,17 +436,13 @@ impl ServersView {
         let inner_radius = px(CARD_RADIUS - 1.);
 
         let id = entry.id;
+        let kind = entry.kind;
         let name = if entry.label.is_empty() {
             entry.host.clone()
         } else {
             entry.label.clone()
         };
-        // Port 22 is implied; only an unusual port is worth the space.
-        let addr = if entry.port == 22 {
-            format!("{}@{}", entry.username, entry.host)
-        } else {
-            format!("{}@{}:{}", entry.username, entry.host, entry.port)
-        };
+        let addr = host_line(&entry);
         let last_opened = entry
             .last_opened_at
             .map(|at| crate::ui::hosts::sidebar::relative_time(at, now))
@@ -569,7 +580,7 @@ impl ServersView {
                                 el.invisible()
                                     .group_hover(group_id.clone(), |s| s.visible())
                             })
-                            .child(self.row_more_menu(ix, id, is_menu_open, cx)),
+                            .child(self.row_more_menu(ix, id, kind, is_menu_open, cx)),
                     ),
             )
             .into_any_element()

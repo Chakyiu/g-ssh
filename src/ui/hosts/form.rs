@@ -28,7 +28,8 @@ use crate::ui::VaultState;
 use gssh::ssh::connection::{is_loopback_bind, ForwardKind};
 use gssh::ssh::target::{find_saved_jump_host, parse_host_field};
 use gssh::vault::{
-    AuthMethod, HostSnippet, PortForward, ServerEntry, ServerEntrySummary, VaultError,
+    AuthMethod, ConnectionKind, HostSnippet, PortForward, ServerEntry, ServerEntrySummary,
+    VaultError,
 };
 
 pub enum FormMode {
@@ -78,6 +79,7 @@ pub struct ServerFormView {
     mode: FormMode,
     form_state: FormState,
 
+    kind: ConnectionKind,
     auth_mode: AuthMode,
 
     name_input: Entity<InputState>,
@@ -185,6 +187,10 @@ impl ServerFormView {
         })
         .detach();
 
+        let kind = prefill
+            .as_ref()
+            .map(|entry| entry.kind)
+            .unwrap_or(ConnectionKind::Ssh);
         let (label, host, port, user, password, auth_mode, selected_key_id) = match &prefill {
             None => (
                 String::new(),
@@ -360,6 +366,7 @@ impl ServerFormView {
             focus_handle: cx.focus_handle(),
             mode,
             form_state: FormState::Main,
+            kind,
             auth_mode,
             name_input,
             host_input,
@@ -493,10 +500,16 @@ impl ServerFormView {
         let port_str = strip_whitespace(&self.port_input.read(cx).value());
         let user = strip_whitespace(&self.user_input.read(cx).value());
 
-        if host.is_empty() || user.is_empty() {
+        if host.is_empty() {
             return false;
         }
         if port_str.parse::<u16>().map(|p| p < 1).unwrap_or(true) {
+            return false;
+        }
+        if self.kind == ConnectionKind::Telnet {
+            return true;
+        }
+        if user.is_empty() {
             return false;
         }
 
@@ -772,6 +785,7 @@ impl ServerFormView {
                 label,
                 host,
                 port,
+                kind: self.kind,
                 username,
                 auth,
                 notes: None,
@@ -783,8 +797,8 @@ impl ServerFormView {
                 group,
                 tags,
                 proxy: gssh::vault::ProxyChoice::Default,
-                jump_host: self.selected_jump_id,
-                forwards: self.forwards.clone(),
+                jump_host: self.jump_to_save(),
+                forwards: self.forwards_to_save(),
                 startup_snippet,
                 snippets,
                 sort_order: 0,
@@ -796,6 +810,7 @@ impl ServerFormView {
                 label,
                 host,
                 port,
+                kind: self.kind,
                 username,
                 auth,
                 notes: None,
@@ -809,8 +824,8 @@ impl ServerFormView {
                 tags,
                 // Carried over from the stored entry on save (see app_view).
                 proxy: gssh::vault::ProxyChoice::Default,
-                jump_host: self.selected_jump_id,
-                forwards: self.forwards.clone(),
+                jump_host: self.jump_to_save(),
+                forwards: self.forwards_to_save(),
                 startup_snippet,
                 snippets,
                 sort_order: 0,
@@ -820,6 +835,41 @@ impl ServerFormView {
         };
 
         cx.emit(FormEvent::Saved(entry));
+    }
+
+    /// A port left at the previous kind's default follows the new kind.
+    /// A port the user typed stays.
+    fn pick_kind(&mut self, kind: ConnectionKind, window: &mut Window, cx: &mut Context<Self>) {
+        if kind == self.kind {
+            return;
+        }
+        let port_text = strip_whitespace(&self.port_input.read(cx).value());
+        let port = port_text.parse::<u16>().ok();
+        if port_text.is_empty() || port == Some(self.kind.default_port()) {
+            let next = kind.default_port().to_string();
+            self.port_input
+                .update(cx, |input, cx| input.set_value(next, window, cx));
+        }
+        self.kind = kind;
+        self.close_dropdowns(cx);
+        cx.notify();
+    }
+
+    /// Telnet has no SSH tunnel, so a jump host is kept in the form but not saved.
+    fn jump_to_save(&self) -> Option<Uuid> {
+        if self.kind == ConnectionKind::Telnet {
+            None
+        } else {
+            self.selected_jump_id
+        }
+    }
+
+    fn forwards_to_save(&self) -> Vec<PortForward> {
+        if self.kind == ConnectionKind::Telnet {
+            Vec::new()
+        } else {
+            self.forwards.clone()
+        }
     }
 
     /// The startup choice as the entry stores it. A typed command goes into
@@ -1297,24 +1347,46 @@ impl Render for ServerFormView {
             ],
             self.auth_mode,
             cx,
-            |this, mode, cx| {
+            |this, mode, _, cx| {
                 this.auth_mode = mode;
                 this.key_dropdown_open = false;
                 cx.notify();
             },
         );
+        let kind_switch = segmented(
+            "connection-kind",
+            &[
+                (ConnectionKind::Ssh, "SSH"),
+                (ConnectionKind::Sftp, "SFTP"),
+                (ConnectionKind::Telnet, "Telnet"),
+            ],
+            self.kind,
+            cx,
+            |this, kind, window, cx| this.pick_kind(kind, window, cx),
+        );
+        let is_telnet = self.kind == ConnectionKind::Telnet;
+        let kind_note = match self.kind {
+            ConnectionKind::Ssh => None,
+            ConnectionKind::Sftp => {
+                Some("Opens the file browser. A shell is opened too when the server allows one.")
+            }
+            ConnectionKind::Telnet => Some("Opens a terminal. Sign in at the prompt."),
+        };
 
         // User @ host : port, the order ssh writes it in. A pasted
         // `user@host:port` in the host field is split across the three.
+        // Telnet has no user until the remote login asks.
         let address_row = h_flex()
             .gap(px(8.))
             .items_end()
-            .child(
-                labeled("User", cx, Input::new(&self.user_input))
-                    .w(px(150.))
-                    .flex_shrink(1.),
-            )
-            .child(address_separator("@"))
+            .when(!is_telnet, |row| {
+                row.child(
+                    labeled("User", cx, Input::new(&self.user_input))
+                        .w(px(150.))
+                        .flex_shrink(1.),
+                )
+                .child(address_separator("@"))
+            })
             .child(
                 labeled("Host", cx, Input::new(&self.host_input))
                     .flex_1()
@@ -1377,22 +1449,33 @@ impl Render for ServerFormView {
             .child(
                 v_flex()
                     .gap(px(12.))
-                    .child(section_title("Connection", cx))
-                    .child(address_row)
-                    .child(labeled("Name", cx, Input::new(&self.name_input))),
-            )
-            .child(
-                v_flex()
-                    .gap(px(12.))
                     .child(
                         h_flex()
                             .justify_between()
                             .items_center()
-                            .child(section_title("Authentication", cx))
-                            .child(auth_switch),
+                            .child(section_title("Connection", cx))
+                            .child(kind_switch),
                     )
-                    .child(auth_body),
+                    .when_some(kind_note, |column, note| {
+                        column.child(div().text_size(px(12.)).text_color(muted_fg).child(note))
+                    })
+                    .child(address_row)
+                    .child(labeled("Name", cx, Input::new(&self.name_input))),
             )
+            .when(!is_telnet, |column| {
+                column.child(
+                    v_flex()
+                        .gap(px(12.))
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(section_title("Authentication", cx))
+                                .child(auth_switch),
+                        )
+                        .child(auth_body),
+                )
+            })
             .child(
                 v_flex()
                     .gap(px(12.))
@@ -1405,11 +1488,10 @@ impl Render for ServerFormView {
                             .child(tags_field.flex_1().min_w_0()),
                     ),
             )
-            .child(
-                v_flex()
-                    .gap(px(12.))
-                    .child(advanced_toggle)
-                    .when(is_advanced_open, |el| {
+            .when(!is_telnet, |column| {
+                column.child(v_flex().gap(px(12.)).child(advanced_toggle).when(
+                    is_advanced_open,
+                    |el| {
                         el.child(
                             h_flex()
                                 .gap(px(12.))
@@ -1421,8 +1503,9 @@ impl Render for ServerFormView {
                             el.child(self.render_startup_command(cx))
                         })
                         .child(self.render_forwards_section(cx))
-                    }),
-            );
+                    },
+                ))
+            });
 
         let footer_note = footer_message.or_else(|| {
             self.missing_hint(cx)
@@ -1544,12 +1627,17 @@ impl ServerFormView {
         if strip_whitespace(&self.host_input.read(cx).value()).is_empty() {
             return Some("Enter the host.");
         }
-        if strip_whitespace(&self.user_input.read(cx).value()).is_empty() {
+        if self.kind != ConnectionKind::Telnet
+            && strip_whitespace(&self.user_input.read(cx).value()).is_empty()
+        {
             return Some("Enter the user.");
         }
         let port = strip_whitespace(&self.port_input.read(cx).value());
         if port.parse::<u16>().map(|p| p < 1).unwrap_or(true) {
             return Some("The port is a number from 1 to 65535.");
+        }
+        if self.kind == ConnectionKind::Telnet {
+            return None;
         }
         match self.auth_mode {
             AuthMode::Password if self.pass_input.read(cx).value().is_empty() => {
@@ -2601,7 +2689,9 @@ fn segmented<T: Copy + PartialEq + 'static>(
     options: &[(T, &'static str)],
     selected: T,
     cx: &Context<ServerFormView>,
-    on_pick: impl Fn(&mut ServerFormView, T, &mut Context<ServerFormView>) + Clone + 'static,
+    on_pick: impl Fn(&mut ServerFormView, T, &mut Window, &mut Context<ServerFormView>)
+        + Clone
+        + 'static,
 ) -> impl IntoElement {
     let fg = cx.theme().foreground;
     h_flex()
@@ -2636,7 +2726,7 @@ fn segmented<T: Copy + PartialEq + 'static>(
                         .hover(move |s| s.text_color(fg))
                 })
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| on_pick(this, value, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| on_pick(this, value, window, cx)))
         }))
 }
 

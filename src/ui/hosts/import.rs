@@ -501,10 +501,14 @@ fn write_selected(
                 label: host.label.clone(),
                 host: host.host.clone(),
                 port: host.port,
-                username: host
-                    .username
-                    .clone()
-                    .unwrap_or_else(|| default_user.clone()),
+                kind: host.kind,
+                username: host.username.clone().unwrap_or_else(|| {
+                    if host.kind == gssh::vault::ConnectionKind::Telnet {
+                        String::new()
+                    } else {
+                        default_user.clone()
+                    }
+                }),
                 auth,
                 notes: Some(format!("Imported from {}", host.source.display_label())),
                 os: host.os.clone(),
@@ -1130,6 +1134,7 @@ mod tests {
             host: host.to_string(),
             port,
             username: "deploy".to_string(),
+            kind: gssh::vault::ConnectionKind::Ssh,
             os: None,
             last_opened_at: None,
             sort_order: 0,
@@ -1201,6 +1206,7 @@ mod tests {
             host: format!("{label}.example.com"),
             port: 22,
             username: Some("deploy".to_string()),
+            kind: gssh::vault::ConnectionKind::Ssh,
             identity_file: None,
             is_default_identity: false,
             key_pem: None,

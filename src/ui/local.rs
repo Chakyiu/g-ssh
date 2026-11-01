@@ -56,7 +56,9 @@ pub struct LocalTerminal {
 impl LocalTerminal {
     pub fn new(vault_state: Entity<VaultState>, cx: &mut Context<Self>) -> Self {
         let local = cx.entity().downgrade();
-        let panel = cx.new(|cx| ServerPanel::new(PanelHost::Local(local), vault_state.clone(), cx));
+        let panel = cx.new(|cx| {
+            ServerPanel::new(PanelHost::Local(local), false, vault_state.clone(), cx)
+        });
         cx.subscribe(&panel, |this, _, event, cx| this.on_panel(event, cx))
             .detach();
         Self {

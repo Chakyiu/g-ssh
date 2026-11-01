@@ -39,6 +39,8 @@ use gssh::ssh::{
     AuthCredential, AuthError, AuthPromptField, CancelFlag, ForwardState, SshConnection,
     SshConnectionEvent, SshRoute, TransferOutcome,
 };
+use gssh::telnet::{TelnetConnection, TelnetEvent, TelnetTarget};
+use gssh::vault::ConnectionKind;
 use zeroize::Zeroizing;
 
 pub struct DisconnectedState {
@@ -420,6 +422,11 @@ async fn drive_connection(
     while let Ok(event) = event_rx.recv().await {
         match event {
             SshConnectionEvent::Connected => {
+                let shell_optional = this
+                    .update(cx, |session, _| {
+                        session.conn_info.kind == ConnectionKind::Sftp
+                    })
+                    .unwrap_or(false);
                 let sftp_result = conn.open_sftp().await;
                 let shell_result = match sftp_result {
                     Ok((sftp_primary, home_dir)) => {
@@ -446,6 +453,14 @@ async fn drive_connection(
                                 let mut shells = vec![shell];
                                 shells.extend(open_extra_shells(&conn, extra_count).await);
                                 Ok((sftp_primary, sftp_prefetch, home_dir, shells))
+                            }
+                            Err(e) if shell_optional => {
+                                tracing::warn!(
+                                    target: "g-ssh::ssh",
+                                    error = %e,
+                                    "this SFTP host did not open a shell"
+                                );
+                                Ok((sftp_primary, sftp_prefetch, home_dir, Vec::new()))
                             }
                             Err(e) => Err(format!("Could not open a shell: {e}")),
                         }
@@ -594,39 +609,8 @@ async fn drive_connection(
                             .detach();
                             session.browser = Some(browser);
                             session.restore_peer(left_server, cx);
-                            // The new shells replace the views. A name or colour
-                            // belongs to the tab, so it moves onto the new one.
-                            let tab_looks: Vec<_> = session
-                                .terminals
-                                .iter()
-                                .map(|terminal| {
-                                    let view = terminal.read(cx);
-                                    (view.tab_title.clone(), view.tab_color)
-                                })
-                                .collect();
-                            let panes = session.panes.clone();
-                            let layout = session.layout.clone();
-                            let focused = session.focused_pane;
-                            session.terminals.clear();
-                            session.terminal_tab_menu = None;
-                            for shell in shells {
-                                session.add_terminal(shell, cx);
-                            }
-                            for (terminal, (title, color)) in
-                                session.terminals.iter().zip(tab_looks)
-                            {
-                                terminal.update(cx, |view, _| {
-                                    view.tab_title = title;
-                                    view.tab_color = color;
-                                });
-                            }
-                            // A shell the server refused to reopen may have
-                            // been the active one.
-                            session.active_terminal = session
-                                .active_terminal
-                                .min(session.terminals.len().saturating_sub(1));
-                            session.restore_layout(panes, layout, focused);
-                            session.is_terminal_focus_pending = true;
+                            session.adopt_shells(shells, cx);
+                            session.has_connected_once = true;
                             session.reconnecting = None;
                             session.disconnected = None;
                             session.connect_failure = None;
@@ -771,6 +755,182 @@ async fn drive_connection(
     SessionOutcome::Ended(None)
 }
 
+/// The Telnet counterpart of the SSH reconnect loop. Each try dials again.
+async fn run_telnet_loop(
+    this: WeakEntity<ServerSession>,
+    cx: &mut AsyncApp,
+    target: TelnetTarget,
+    first: TelnetConnection,
+    retry_rx: async_channel::Receiver<()>,
+    target_id: String,
+    mut connect_started: Instant,
+) {
+    let mut conn = first;
+    let mut attempt: u32 = 0;
+    loop {
+        if this
+            .update(cx, |session, cx| {
+                session.telnet = Some(conn.clone());
+                session.connection = None;
+                session.connection_generation = session.connection_generation.wrapping_add(1);
+                session.reconnecting = (attempt > 0).then_some(attempt);
+                session.auth_prompt = None;
+                session.host_key_prompt = None;
+                cx.notify();
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        let failure = match drive_telnet(conn.clone(), connect_started, &this, cx).await {
+            SessionOutcome::Gone => break,
+            SessionOutcome::Ended(failure) => failure.unwrap_or_else(|| ConnectFailure {
+                entry_id: target_id.clone(),
+                message: CONNECTION_CLOSED.to_string(),
+                is_password_rejected: false,
+                is_transient: true,
+            }),
+        };
+        let Ok((has_connected, has_recovered)) = this.update(cx, |session, _| {
+            (session.has_connected_once, session.reconnecting.is_none())
+        }) else {
+            break;
+        };
+        if has_recovered {
+            attempt = 0;
+        }
+        let is_retrying = has_connected && failure.is_transient && attempt < MAX_RECONNECT_ATTEMPTS;
+        if !is_retrying {
+            if this
+                .update(cx, |session, cx| session.give_up(failure, cx))
+                .is_err()
+                || has_connected
+            {
+                break;
+            }
+            drop(conn);
+            while retry_rx.try_recv().is_ok() {}
+            if retry_rx.recv().await.is_err() {
+                break;
+            }
+        } else {
+            attempt += 1;
+            if this
+                .update(cx, |session, cx| {
+                    session.reconnecting = Some(attempt);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+            while retry_rx.try_recv().is_ok() {}
+            let backoff = Duration::from_secs(1u64 << (attempt - 1).min(3));
+            let timer = cx.background_executor().timer(backoff);
+            futures::future::select(Box::pin(timer), Box::pin(retry_rx.recv())).await;
+        }
+        connect_started = Instant::now();
+        conn = TelnetConnection::spawn(target.clone());
+    }
+}
+
+/// Dial Telnet, open one shell per terminal tab, and wait until the link ends.
+async fn drive_telnet(
+    conn: TelnetConnection,
+    connect_started: Instant,
+    this: &WeakEntity<ServerSession>,
+    cx: &mut AsyncApp,
+) -> SessionOutcome {
+    let events = conn.subscribe_events();
+    while let Ok(event) = events.recv().await {
+        match event {
+            TelnetEvent::Connected => {
+                let extra_count = this
+                    .update(cx, |session, _| session.terminals.len().saturating_sub(1))
+                    .unwrap_or(0);
+                let shell = match conn.open_shell(24, 80).await {
+                    Ok(shell) => shell,
+                    Err(error) => {
+                        let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone())
+                        else {
+                            return SessionOutcome::Gone;
+                        };
+                        return SessionOutcome::Ended(Some(ConnectFailure {
+                            entry_id,
+                            message: format!("Could not open a terminal: {error}"),
+                            is_password_rejected: false,
+                            is_transient: true,
+                        }));
+                    }
+                };
+                let mut shells = vec![shell];
+                for _ in 0..extra_count {
+                    match conn.open_shell(24, 80).await {
+                        Ok(shell) => shells.push(shell),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "g-ssh::telnet",
+                                error,
+                                reopened = shells.len(),
+                                "telnet did not reopen a terminal"
+                            );
+                            break;
+                        }
+                    }
+                }
+                let elapsed = connect_started.elapsed();
+                let built = this.update(cx, |session, cx| {
+                    let is_reconnect = session.has_connected_once;
+                    tracing::info!(
+                        target: "g-ssh::telnet",
+                        host = %session.conn_info.display_name(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        is_reconnect,
+                        "telnet session ready"
+                    );
+                    session.adopt_shells(shells, cx);
+                    session.has_connected_once = true;
+                    session.reconnecting = None;
+                    session.disconnected = None;
+                    session.connect_failure = None;
+                    cx.emit(ServerSessionEvent::Connected {
+                        elapsed: shown_connect_time(elapsed, is_reconnect, false),
+                    });
+                    cx.notify();
+                });
+                if built.is_err() {
+                    return SessionOutcome::Gone;
+                }
+            }
+            TelnetEvent::Failed(detail) => {
+                tracing::warn!(target: "g-ssh::telnet", error = detail, "telnet connect failed");
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message: capitalize_first(&detail),
+                    is_password_rejected: false,
+                    is_transient: true,
+                }));
+            }
+            TelnetEvent::Closed { is_transient } => {
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message: CONNECTION_CLOSED.to_string(),
+                    is_password_rejected: false,
+                    is_transient,
+                }));
+            }
+        }
+    }
+    SessionOutcome::Ended(None)
+}
+
 /// Which terminal tab the right-click menu belongs to, and where it opened.
 pub(crate) struct TerminalTabMenu {
     pub(crate) ix: usize,
@@ -813,6 +973,11 @@ pub struct ServerSession {
     pub server_id: String,
     pub conn_info: Connection,
     pub connection: Option<SshConnection>,
+    /// Set for a Telnet host. SSH and SFTP leave this empty.
+    pub(crate) telnet: Option<TelnetConnection>,
+    /// True after a connect has shown a shell or a file browser. A later drop
+    /// can then retry, including Telnet, which has no browser to mark it by.
+    has_connected_once: bool,
     pub browser: Option<Entity<SftpBrowser>>,
     /// One per shell, all on the same connection. Empty until connected.
     /// See [`crate::ui::terminal::tabs`].
@@ -917,6 +1082,7 @@ impl ServerSession {
     pub fn start_connect(
         conn_info: Connection,
         route: SshRoute,
+        telnet_target: Option<TelnetTarget>,
         initial_restore: Option<RestorePaths>,
         forwards: Vec<ForwardRuntime>,
         file_associations: SharedFileAssociations,
@@ -926,9 +1092,11 @@ impl ServerSession {
         let server_id = conn_info.id.clone();
         let stored_conn = conn_info.clone();
         let session = cx.entity().downgrade();
+        let is_telnet = conn_info.kind == ConnectionKind::Telnet;
         let server_panel = cx.new(|cx| {
             ServerPanel::new(
                 crate::ui::session::panel::PanelHost::Remote(session),
+                is_telnet,
                 vault_state,
                 cx,
             )
@@ -944,125 +1112,154 @@ impl ServerSession {
         // First connection. The reconnect loop spawns later ones from a fresh
         // clone of the route, so the credentials it carries stay available.
         let mut connect_started = Instant::now();
-        let ssh_conn = SshConnection::spawn(route.lock().expect("route mutex").clone());
-
-        let task = {
-            let first_conn = ssh_conn.clone();
-            let route = route.clone();
+        let (ssh_conn, telnet_conn, task) = if let Some(target) = telnet_target {
+            let telnet = TelnetConnection::spawn(target.clone());
+            let first = telnet.clone();
             let retry_rx = retry_rx.clone();
             let target_id = server_id.clone();
-            cx.spawn(async move |this, cx| {
-                let mut conn = first_conn;
-                let mut attempt: u32 = 0;
-                loop {
-                    // Publish the active connection (and any reconnect status) so the
-                    // UI and snippet runs see the live handle.
-                    if this
-                        .update(cx, |session, cx| {
-                            session.connection = Some(conn.clone());
-                            session.connection_generation =
-                                session.connection_generation.wrapping_add(1);
-                            session.reconnecting = (attempt > 0).then_some(attempt);
-                            // Prompts from a dead connection cannot be
-                            // answered. Drop them so a stale modal does not
-                            // stay over the reconnect or lost screen.
-                            session.auth_prompt = None;
-                            session.host_key_prompt = None;
-                            // Forwards never survive a connection, so a row
-                            // still showing "bound" would be lying.
-                            for forward in session.forwards.iter_mut() {
-                                forward.state = ForwardState::Stopped { reason: None };
-                            }
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-
-                    let failure =
-                        match drive_connection(conn.clone(), connect_started, &this, cx).await {
-                            SessionOutcome::Gone => break,
-                            SessionOutcome::Ended(failure) => {
-                                failure.unwrap_or_else(|| ConnectFailure {
-                                    entry_id: target_id.clone(),
-                                    message: CONNECTION_CLOSED.to_string(),
-                                    is_password_rejected: false,
-                                    is_transient: true,
+            let task = cx.spawn(async move |this, cx| {
+                run_telnet_loop(
+                    this,
+                    cx,
+                    target,
+                    first,
+                    retry_rx,
+                    target_id,
+                    connect_started,
+                )
+                .await;
+            });
+            (None, Some(telnet), task)
+        } else {
+            let ssh_conn = SshConnection::spawn(route.lock().expect("route mutex").clone());
+            let task =
+                {
+                    let first_conn = ssh_conn.clone();
+                    let route = route.clone();
+                    let retry_rx = retry_rx.clone();
+                    let target_id = server_id.clone();
+                    cx.spawn(async move |this, cx| {
+                        let mut conn = first_conn;
+                        let mut attempt: u32 = 0;
+                        loop {
+                            // Publish the active connection (and any reconnect status) so the
+                            // UI and snippet runs see the live handle.
+                            if this
+                                .update(cx, |session, cx| {
+                                    session.connection = Some(conn.clone());
+                                    session.connection_generation =
+                                        session.connection_generation.wrapping_add(1);
+                                    session.reconnecting = (attempt > 0).then_some(attempt);
+                                    // Prompts from a dead connection cannot be
+                                    // answered. Drop them so a stale modal does not
+                                    // stay over the reconnect or lost screen.
+                                    session.auth_prompt = None;
+                                    session.host_key_prompt = None;
+                                    // Forwards never survive a connection, so a row
+                                    // still showing "bound" would be lying.
+                                    for forward in session.forwards.iter_mut() {
+                                        forward.state = ForwardState::Stopped { reason: None };
+                                    }
+                                    cx.notify();
                                 })
+                                .is_err()
+                            {
+                                break;
                             }
-                        };
-                    // The workers of this connection went down without a final
-                    // report. The left server stays connected, and so does a
-                    // transfer between it and this computer.
-                    let Ok((has_connected, has_recovered)) = this.update(cx, |session, cx| {
-                        session.fail_open_transfers(&failure.message, cx);
-                        // Only a connect that got through clears `reconnecting`.
-                        (session.browser.is_some(), session.reconnecting.is_none())
-                    }) else {
-                        break;
-                    };
-                    // The retries are counted per drop. Without this a tab
-                    // that recovered five times would give up on the sixth
-                    // drop without a single try.
-                    if has_recovered {
-                        attempt = 0;
-                    }
 
-                    // The retry ladder is for a link that dropped. A host that
-                    // never connected is more likely mistyped than flaky, so
-                    // the user gets the reason at once instead of a long wait.
-                    let is_retrying =
-                        has_connected && failure.is_transient && attempt < MAX_RECONNECT_ATTEMPTS;
-                    if !is_retrying {
-                        if this
-                            .update(cx, |session, cx| session.give_up(failure, cx))
-                            .is_err()
-                            || has_connected
-                        {
-                            break;
+                            let failure =
+                                match drive_connection(conn.clone(), connect_started, &this, cx)
+                                    .await
+                                {
+                                    SessionOutcome::Gone => break,
+                                    SessionOutcome::Ended(failure) => {
+                                        failure.unwrap_or_else(|| ConnectFailure {
+                                            entry_id: target_id.clone(),
+                                            message: CONNECTION_CLOSED.to_string(),
+                                            is_password_rejected: false,
+                                            is_transient: true,
+                                        })
+                                    }
+                                };
+                            // The workers of this connection went down without a final
+                            // report. The left server stays connected, and so does a
+                            // transfer between it and this computer.
+                            let Ok((has_connected, has_recovered)) =
+                                this.update(cx, |session, cx| {
+                                    session.fail_open_transfers(&failure.message, cx);
+                                    // Only a connect that got through clears `reconnecting`.
+                                    (session.browser.is_some(), session.reconnecting.is_none())
+                                })
+                            else {
+                                break;
+                            };
+                            // The retries are counted per drop. Without this a tab
+                            // that recovered five times would give up on the sixth
+                            // drop without a single try.
+                            if has_recovered {
+                                attempt = 0;
+                            }
+
+                            // The retry ladder is for a link that dropped. A host that
+                            // never connected is more likely mistyped than flaky, so
+                            // the user gets the reason at once instead of a long wait.
+                            let is_retrying = has_connected
+                                && failure.is_transient
+                                && attempt < MAX_RECONNECT_ATTEMPTS;
+                            if !is_retrying {
+                                if this
+                                    .update(cx, |session, cx| session.give_up(failure, cx))
+                                    .is_err()
+                                    || has_connected
+                                {
+                                    break;
+                                }
+                                // A connect that got as far as logging in is still
+                                // open. Dropping the last handle closes it, so it does
+                                // not sit idle behind the error card.
+                                drop(conn);
+                                // The error card is up. Wait there until the user (or a
+                                // system wake) asks for another try.
+                                while retry_rx.try_recv().is_ok() {}
+                                if retry_rx.recv().await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                attempt += 1;
+                                // Back off 1s, 2s, 4s, then 8s between tries.
+                                if this
+                                    .update(cx, |session, cx| {
+                                        session.reconnecting = Some(attempt);
+                                        cx.notify();
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                // A nudge that arrived while the link was healthy says
+                                // nothing about this wait. Drop it before listening.
+                                while retry_rx.try_recv().is_ok() {}
+                                let backoff = Duration::from_secs(1u64 << (attempt - 1).min(3));
+                                let timer = cx.background_executor().timer(backoff);
+                                futures::future::select(Box::pin(timer), Box::pin(retry_rx.recv()))
+                                    .await;
+                            }
+                            connect_started = Instant::now();
+                            // Clone out of the mutex in one statement: the guard must
+                            // not be alive across the next await.
+                            conn = SshConnection::spawn(route.lock().expect("route mutex").clone());
                         }
-                        // A connect that got as far as logging in is still
-                        // open. Dropping the last handle closes it, so it does
-                        // not sit idle behind the error card.
-                        drop(conn);
-                        // The error card is up. Wait there until the user (or a
-                        // system wake) asks for another try.
-                        while retry_rx.try_recv().is_ok() {}
-                        if retry_rx.recv().await.is_err() {
-                            break;
-                        }
-                    } else {
-                        attempt += 1;
-                        // Back off 1s, 2s, 4s, then 8s between tries.
-                        if this
-                            .update(cx, |session, cx| {
-                                session.reconnecting = Some(attempt);
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        // A nudge that arrived while the link was healthy says
-                        // nothing about this wait. Drop it before listening.
-                        while retry_rx.try_recv().is_ok() {}
-                        let backoff = Duration::from_secs(1u64 << (attempt - 1).min(3));
-                        let timer = cx.background_executor().timer(backoff);
-                        futures::future::select(Box::pin(timer), Box::pin(retry_rx.recv())).await;
-                    }
-                    connect_started = Instant::now();
-                    // Clone out of the mutex in one statement: the guard must
-                    // not be alive across the next await.
-                    conn = SshConnection::spawn(route.lock().expect("route mutex").clone());
-                }
-            })
+                    })
+                };
+            (Some(ssh_conn), None, task)
         };
 
         Self {
             server_id,
             conn_info: stored_conn,
-            connection: Some(ssh_conn),
+            connection: ssh_conn,
+            telnet: telnet_conn,
+            has_connected_once: false,
             browser: None,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -1262,6 +1459,7 @@ impl ServerSession {
             "giving up on the connection",
         );
         self.connection = None;
+        self.telnet = None;
         self.probe_task = None;
         self.reconnecting = None;
         // Nothing is left to answer these prompts.
@@ -1279,6 +1477,18 @@ impl ServerSession {
                 self.disconnected = Some(DisconnectedState {
                     host: self.conn_info.display_name().to_string(),
                     preserved,
+                    reason: failure.message,
+                });
+            }
+            // Telnet has no file browser. Once it has been up, the same
+            // "connection lost" card covers the terminal it left on screen.
+            None if self.has_connected_once => {
+                self.disconnected = Some(DisconnectedState {
+                    host: self.conn_info.display_name().to_string(),
+                    preserved: PreservedFiles {
+                        count: 0,
+                        cache_root: PathBuf::new(),
+                    },
                     reason: failure.message,
                 });
             }
@@ -2235,7 +2445,8 @@ impl ServerSession {
     }
 
     fn render_server_panel(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.is_server_panel_shown || self.browser.is_none() {
+        let is_ready = self.browser.is_some() || self.has_connected_once;
+        if !self.is_server_panel_shown || !is_ready {
             return None;
         }
         // The panel is cached so a terminal frame does not redraw it. The
@@ -2272,6 +2483,22 @@ impl ServerSession {
 }
 
 impl ServerSession {
+    fn render_plain_message(&self, text: &'static str) -> AnyElement {
+        let _ = self;
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .px(px(24.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(crate::theme::text_dim())
+                    .child(text),
+            )
+            .into_any_element()
+    }
+
     /// The session body. `show_files` draws the SFTP browser; otherwise the
     /// terminal grid. A workspace cell picks one, so one connection can be a
     /// terminal tab and an SFTP tab at the same time.
@@ -2298,25 +2525,25 @@ impl ServerSession {
         let server_panel = self.render_server_panel(window, cx);
         let theme = cx.theme();
 
-        let content: AnyElement = if let (Some(browser), Some(_)) =
-            (&self.browser, self.active_terminal())
-        {
+        let has_terminal = self.active_terminal().is_some();
+        let has_files = self.browser.is_some();
+        let content: AnyElement = if has_terminal || has_files {
             // One fills the session: the SFTP tab, or the terminal. The strip
             // above switches between them. Cached so terminal output, which
             // redraws the session many times a second, leaves the file panes
-            // alone while they are the ones on screen.
-            let body = if !show_files {
-                self.render_terminal_block(cx)
-            } else {
+            // alone while they are the ones on screen. Telnet has no files,
+            // and an SFTP-only server may have no shell.
+            let body = if show_files && has_files {
+                let browser = self.browser.clone().expect("has files");
                 div()
                     .size_full()
                     .overflow_hidden()
-                    .child(
-                        browser
-                            .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    )
+                    .child(browser.cached(StyleRefinement::default().size_full()))
                     .into_any_element()
+            } else if has_terminal {
+                self.render_terminal_block(cx)
+            } else {
+                self.render_plain_message("This server did not open a shell.")
             };
             let split = v_flex().size_full().child(
                 h_flex()

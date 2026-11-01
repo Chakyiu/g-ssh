@@ -489,6 +489,7 @@ fn connection_file(
             label: entry.label.clone(),
             host: entry.host.clone(),
             port: entry.port,
+            kind: entry.kind,
             username: entry.username.clone(),
             auth,
             notes: entry.notes.clone(),
@@ -564,6 +565,7 @@ fn entry_from_file(
             label: file.label,
             host: file.host,
             port: file.port,
+            kind: file.kind,
             username: file.username,
             auth,
             notes: file.notes,
@@ -593,6 +595,11 @@ struct ConnectionFile {
     label: String,
     host: String,
     port: u16,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::ssh::connection::ConnectionKind::is_ssh"
+    )]
+    kind: crate::ssh::connection::ConnectionKind,
     username: String,
     auth: FileAuth,
     #[serde(default)]
@@ -687,5 +694,27 @@ mod tests {
         assert!(serde_json::to_string(&placed)
             .unwrap()
             .contains("\"sort_order\":4"));
+    }
+
+    #[test]
+    fn a_connection_file_without_a_kind_is_ssh_and_omits_the_field() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "label": "web",
+            "host": "web.example.com",
+            "port": 22,
+            "username": "me",
+            "auth": { "method": "agent" }
+        }"#;
+        let file: ConnectionFile = serde_json::from_str(json).unwrap();
+        assert!(file.kind.is_ssh());
+        let written = serde_json::to_string(&file).unwrap();
+        assert!(!written.contains("kind"), "{written}");
+
+        let mut telnet: ConnectionFile = serde_json::from_str(json).unwrap();
+        telnet.kind = crate::ssh::connection::ConnectionKind::Telnet;
+        telnet.port = 23;
+        let written = serde_json::to_string(&telnet).unwrap();
+        assert!(written.contains("\"kind\":\"telnet\""), "{written}");
     }
 }

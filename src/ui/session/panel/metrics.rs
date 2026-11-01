@@ -15,7 +15,7 @@ use super::{format_bytes, info_row, note, section_title, share, Reading, ServerP
 use crate::host_stats::SystemInfo;
 use crate::theme;
 use crate::ui::hosts::icon::host_icon;
-use gssh::vault::{AuthMethod, ProxyChoice, ServerEntry, VaultManager};
+use gssh::vault::{AuthMethod, ConnectionKind, ProxyChoice, ServerEntry, VaultManager};
 
 const CHART_HEIGHT: f32 = 48.;
 /// Keeps a line at zero clear of the card's bottom border.
@@ -27,6 +27,9 @@ const BLANK: &str = "\u{a0}";
 impl ServerPanel {
     fn render_identity(&self, cx: &Context<Self>) -> AnyElement {
         let Some(info) = &self.info else {
+            if self.is_telnet {
+                return identity_row(None, "Telnet".into(), None, cx).into_any_element();
+            }
             // The same two lines as below, so nothing moves when the info comes.
             let waiting = if self.is_local() {
                 "Reading this computer\u{2026}"
@@ -53,6 +56,8 @@ impl ServerPanel {
         if self.is_unsupported {
             let message = if self.is_local() {
                 "Live metrics are not available on this computer."
+            } else if self.info.is_none() {
+                "Live metrics are not available for this connection."
             } else {
                 "Live metrics need a Linux server."
             };
@@ -61,7 +66,10 @@ impl ServerPanel {
             children.extend(self.render_metrics(cx));
         }
         // Disks and System come with the host's first answer, in one fade.
-        if self.info.is_some() || self.last_sample.is_some() {
+        if self.info.is_some()
+            || self.last_sample.is_some()
+            || (self.is_unsupported && !self.is_local())
+        {
             children.push(fade_in("server-details", self.render_details(cx)).into_any_element());
         }
         children
@@ -449,10 +457,15 @@ fn system_rows(info: &SystemInfo) -> Vec<(&'static str, String)> {
 
 /// How g-ssh reaches the host, as the vault has it.
 fn connection_rows(entry: &ServerEntry, vault: &VaultManager) -> Vec<(&'static str, String)> {
-    let mut rows = vec![(
-        "SSH",
-        format!("{}@{}:{}", entry.username, entry.host, entry.port),
-    )];
+    let endpoint = if entry.kind == ConnectionKind::Telnet && entry.username.is_empty() {
+        format!("{}:{}", entry.host, entry.port)
+    } else {
+        format!("{}@{}:{}", entry.username, entry.host, entry.port)
+    };
+    let mut rows = vec![(entry.kind.label(), endpoint)];
+    if !entry.kind.uses_ssh() {
+        return finish_connection_rows(rows, entry, vault);
+    }
     let login = match &entry.auth {
         AuthMethod::Password(_) => "Password".to_string(),
         AuthMethod::PrivateKey { key_id } => match vault.get_key(*key_id) {
@@ -484,6 +497,27 @@ fn connection_rows(entry: &ServerEntry, vault: &VaultManager) -> Vec<(&'static s
     }
     if let Some(fingerprint) = &entry.host_key_fingerprint {
         rows.push(("Host key", fingerprint.clone()));
+    }
+    rows
+}
+
+fn finish_connection_rows(
+    mut rows: Vec<(&'static str, String)>,
+    entry: &ServerEntry,
+    vault: &VaultManager,
+) -> Vec<(&'static str, String)> {
+    let proxy = match entry.proxy {
+        ProxyChoice::Default => None,
+        ProxyChoice::Direct => Some("Direct".to_string()),
+        ProxyChoice::Use(id) => Some(
+            vault
+                .get_proxy(id)
+                .map(|proxy| proxy.name.clone())
+                .unwrap_or_else(|_| "(missing)".to_string()),
+        ),
+    };
+    if let Some(proxy) = proxy {
+        rows.push(("Proxy", proxy));
     }
     rows
 }

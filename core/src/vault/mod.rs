@@ -8,13 +8,14 @@ pub mod recovery;
 pub(crate) mod storage;
 pub mod sync;
 
+pub use crate::ssh::connection::{endpoint_label, ConnectionKind};
 pub use crypto::AgentChatKey;
 pub use error::VaultError;
 pub use model::{
-    resolve_jump_chain, resolve_proxy, ssh_command, AgentSettings, AuthMethod, Group, HostSnippet,
-    PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind, ProxyMode,
-    ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage, SshKey,
-    SshKeySummary, Tag, MAX_JUMP_HOSTS,
+    resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, AgentSettings, AuthMethod,
+    Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind,
+    ProxyMode, ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage,
+    SshKey, SshKeySummary, Tag, MAX_JUMP_HOSTS,
 };
 pub use recovery::RecoveryPhrase;
 
@@ -819,6 +820,14 @@ impl VaultManager {
     fn check_jump_link(&self, id: Uuid, jump: Option<Uuid>) -> Result<(), VaultError> {
         let Some(jump_id) = jump else { return Ok(()) };
         let candidate = self.get_entry(jump_id)?;
+        if candidate.kind == crate::ssh::connection::ConnectionKind::Telnet {
+            let name = if candidate.label.is_empty() {
+                candidate.host
+            } else {
+                candidate.label
+            };
+            return Err(VaultError::JumpNotSsh(name));
+        }
         if jump_id == id {
             return Err(VaultError::JumpCycle(candidate.label));
         }
@@ -898,6 +907,9 @@ impl VaultManager {
             .iter()
             .find(|e| e.id == entry_id)
             .ok_or(VaultError::EntryNotFound(entry_id))?;
+        if entry.kind == crate::ssh::connection::ConnectionKind::Telnet {
+            return Ok(telnet_command(entry));
+        }
         let chain = resolve_jump_chain(entry, &self.payload.entries).unwrap_or_else(|e| {
             // A broken chain cannot be written as -J; the direct command beats copying nothing.
             tracing::warn!(error = %e, host = %entry.host, "jump chain is broken, copying the direct ssh command");
@@ -930,6 +942,9 @@ impl VaultManager {
         exclude: Option<Uuid>,
         behind: usize,
     ) -> bool {
+        if candidate.kind == crate::ssh::connection::ConnectionKind::Telnet {
+            return false;
+        }
         let Ok(chain) = resolve_jump_chain(candidate, &self.payload.entries) else {
             return true;
         };
@@ -1672,6 +1687,7 @@ mod tests {
             label: "Prod web server".into(),
             host: "prod.example.com".into(),
             port: 22,
+            kind: ConnectionKind::Ssh,
             username: "deploy".into(),
             auth: AuthMethod::Password("s3cr3t".into()),
             notes: Some("main production host".into()),

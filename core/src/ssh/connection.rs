@@ -5,6 +5,59 @@ pub struct Connection {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub kind: ConnectionKind,
+}
+
+/// How a saved host is reached. Missing from older connection files, which
+/// are SSH.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionKind {
+    #[default]
+    Ssh,
+    Sftp,
+    Telnet,
+}
+
+impl ConnectionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectionKind::Ssh => "SSH",
+            ConnectionKind::Sftp => "SFTP",
+            ConnectionKind::Telnet => "Telnet",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            ConnectionKind::Telnet => 23,
+            ConnectionKind::Ssh | ConnectionKind::Sftp => 22,
+        }
+    }
+
+    pub fn is_ssh(&self) -> bool {
+        *self == ConnectionKind::Ssh
+    }
+
+    /// SSH and SFTP both log in over SSH. Telnet does not.
+    pub fn uses_ssh(self) -> bool {
+        matches!(self, ConnectionKind::Ssh | ConnectionKind::Sftp)
+    }
+}
+
+/// `user@host` with the port only when it is not the kind's default.
+/// An empty user is left off, which is normal for Telnet.
+pub fn endpoint_label(kind: ConnectionKind, username: &str, host: &str, port: u16) -> String {
+    let address = if port == kind.default_port() {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    if username.is_empty() {
+        address
+    } else {
+        format!("{username}@{address}")
+    }
 }
 
 impl Connection {
@@ -130,6 +183,30 @@ mod tests {
             ..spec(ForwardKind::Dynamic)
         };
         assert_eq!(dynamic.route_label(), "SOCKS5 on 127.0.0.1:8080");
+    }
+
+    #[test]
+    fn endpoint_label_hides_the_default_port_and_an_empty_user() {
+        assert_eq!(
+            endpoint_label(ConnectionKind::Ssh, "deploy", "web", 22),
+            "deploy@web"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Ssh, "deploy", "web", 2222),
+            "deploy@web:2222"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Telnet, "", "switch", 23),
+            "switch"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Telnet, "ops", "switch", 2323),
+            "ops@switch:2323"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Sftp, "deploy", "files", 22),
+            "deploy@files"
+        );
     }
 
     #[test]

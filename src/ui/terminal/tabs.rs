@@ -498,8 +498,41 @@ impl ServerSession {
         self.adopt_terminal(ix);
     }
 
+    /// Replace every shell with `shells`, keeping each tab's name and colour.
+    pub(crate) fn adopt_shells(&mut self, shells: Vec<ShellHandle>, cx: &mut Context<Self>) {
+        let tab_looks: Vec<_> = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                let view = terminal.read(cx);
+                (view.tab_title.clone(), view.tab_color)
+            })
+            .collect();
+        let panes = self.panes.clone();
+        let layout = self.layout.clone();
+        let focused = self.focused_pane;
+        self.terminals.clear();
+        self.terminal_tab_menu = None;
+        for shell in shells {
+            self.add_terminal(shell, cx);
+        }
+        for (terminal, (title, color)) in self.terminals.iter().zip(tab_looks) {
+            terminal.update(cx, |view, _| {
+                view.tab_title = title;
+                view.tab_color = color;
+            });
+        }
+        // A shell the server refused to reopen may have been the active one.
+        self.active_terminal = self
+            .active_terminal
+            .min(self.terminals.len().saturating_sub(1));
+        self.restore_layout(panes, layout, focused);
+        self.is_terminal_focus_pending = true;
+    }
+
     fn can_open_terminal(&self) -> bool {
-        self.browser.is_some()
+        let connected = self.browser.is_some() || self.telnet.is_some();
+        connected
             && self.disconnected.is_none()
             && self.reconnecting.is_none()
             && self.terminals.len() < MAX_TERMINALS
@@ -544,9 +577,11 @@ impl ServerSession {
         if !self.can_open_terminal() {
             return;
         }
-        let Some(conn) = self.connection.clone() else {
+        let telnet = self.telnet.clone();
+        let conn = self.connection.clone();
+        if telnet.is_none() && conn.is_none() {
             return;
-        };
+        }
         let generation = self.connection_generation;
         // Start at the size of the tab it will replace on screen, so the shell
         // does not draw its first prompt for a default 80x24 grid.
@@ -556,7 +591,15 @@ impl ServerSession {
             .unwrap_or((24, 80));
 
         cx.spawn(async move |this, cx| {
-            let result = conn.open_shell(rows, cols).await;
+            let result = if let Some(telnet) = telnet {
+                telnet.open_shell(rows, cols).await
+            } else if let Some(conn) = conn {
+                conn.open_shell(rows, cols)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("connection closed".to_string())
+            };
             this.update(cx, |session, cx| match result {
                 // A reconnect in the meantime replaced every shell. This one
                 // belongs to the old connection, so it is dropped.

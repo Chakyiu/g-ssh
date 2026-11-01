@@ -110,6 +110,8 @@ pub struct ServerPanel {
     /// face, and the two do not share a tab strip.
     showing_agent: bool,
     info: Option<SystemInfo>,
+    /// Telnet has no exec channel, so the overview never waits on one.
+    is_telnet: bool,
     /// The host printed no `/proc/stat`: only the system info shows.
     is_unsupported: bool,
     last_sample: Option<Sample>,
@@ -151,7 +153,12 @@ struct Poll {
 impl EventEmitter<ServerPanelEvent> for ServerPanel {}
 
 impl ServerPanel {
-    pub fn new(host: PanelHost, vault_state: Entity<VaultState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        host: PanelHost,
+        is_telnet: bool,
+        vault_state: Entity<VaultState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // The snippets and the connection rows show what the vault holds.
         cx.observe(&vault_state, |this, vault, cx| {
             // The chat has no button once the agent is turned off, so close it.
@@ -207,7 +214,8 @@ impl ServerPanel {
             tab: Tab::Overview,
             showing_agent: false,
             info: None,
-            is_unsupported: false,
+            is_telnet,
+            is_unsupported: is_telnet,
             last_sample: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
             snippet_editor: None,
@@ -229,6 +237,10 @@ impl ServerPanel {
     fn next_step(&self, cx: &Context<Self>) -> NextStep {
         // Off screen, the next render wakes the loop.
         if !self.is_on_screen() {
+            return NextStep::Wait(TICK);
+        }
+        // Telnet has no exec channel. A host marked unsupported stays that way.
+        if self.is_unsupported && !self.is_local() {
             return NextStep::Wait(TICK);
         }
         if matches!(self.host, PanelHost::Local(_)) {

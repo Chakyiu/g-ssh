@@ -2503,7 +2503,7 @@ async fn connect_hop(
 
 /// The timeout covers the whole proxy handshake too, so a dead proxy can't
 /// stall the SSH thread.
-async fn connect_tcp(
+pub(crate) async fn connect_tcp(
     host: &str,
     port: u16,
     proxy: Option<&ResolvedProxy>,

@@ -391,6 +391,7 @@ mod tests {
                 host: "web-02.internal".to_string(),
                 port: 22,
                 username: "deploy".to_string(),
+                kind: gssh::vault::ConnectionKind::Ssh,
             },
             route: Arc::new(Mutex::new(SshRoute {
                 jumps: Vec::new(),

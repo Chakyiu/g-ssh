@@ -45,8 +45,9 @@ use crate::ui::{dialog_chrome, dialog_form, dialog_narrow, dialog_wide, VaultSta
 use gssh::ssh::connection::Connection;
 use gssh::ssh::route::{self, CredentialIssue};
 use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
-use gssh::ssh::{AuthCredential, ForwardState, SshRoute, TransferOutcome};
-use gssh::vault::{AuthMethod, ServerEntry};
+use gssh::ssh::{AuthCredential, ForwardState, SshHop, SshRoute, TransferOutcome};
+use gssh::telnet::TelnetTarget;
+use gssh::vault::{AuthMethod, ConnectionKind, ServerEntry};
 
 actions!(
     app_view,
@@ -299,6 +300,7 @@ impl AppView {
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
             SidebarEvent::OpenServer(id) => this.open_server_by_id(*id, window, cx),
             SidebarEvent::OpenSftp(id) => this.open_sftp_by_id(*id, window, cx),
+            SidebarEvent::OpenTerminal(id) => this.open_terminal_by_id(*id, window, cx),
             SidebarEvent::CloseServer(id) => this.close_server_by_id(*id, cx),
             SidebarEvent::AddServerRequested => this.show_server_form(FormMode::Add, window, cx),
             SidebarEvent::ShowAllServers => this.show_all_servers(cx),
@@ -1002,6 +1004,9 @@ impl AppView {
         let Some((snippet_id, script)) = startup else {
             return;
         };
+        if session.read(cx).conn_info.kind == ConnectionKind::Telnet {
+            return;
+        }
         let Some(shell) = session.read(cx).shell_handle(cx) else {
             return;
         };
@@ -1145,6 +1150,16 @@ impl AppView {
     /// Open this host's files as their own tab. Connects first when the host
     /// is not already open.
     fn open_sftp_by_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .vault_state
+            .read(cx)
+            .manager()
+            .and_then(|vm| vm.get_entry(id).ok())
+            .is_some_and(|entry| entry.kind == ConnectionKind::Telnet)
+        {
+            self.set_status("Telnet hosts have no files.".to_string(), cx);
+            return;
+        }
         let server_id = id.to_string();
         if let Some(idx) = self.tab_index_for_host(&server_id, cx) {
             self.showing_local = false;
@@ -1166,6 +1181,31 @@ impl AppView {
         self.showing_local = false;
         self.record_open(id, cx);
         self.connect_with_prompt(entry, ConnectIntent::OpenSftp, window, cx);
+    }
+
+    /// Open a terminal for a host whose primary view is the file browser.
+    fn open_terminal_by_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .and_then(|vm| vm.get_entry(id).ok());
+        let Some(entry) = entry else { return };
+        if entry.kind == ConnectionKind::Telnet {
+            self.open_server(entry, window, cx);
+            return;
+        }
+        let server_id = entry.id.to_string();
+        if let Some(idx) = self.tab_index_for_host(&server_id, cx) {
+            self.showing_local = false;
+            let session = self.tabs[idx].clone();
+            self.workspace.update(cx, |workspace, cx| {
+                workspace.open_doc(session, WorkKind::Terminal, cx)
+            });
+            self.change_active_tab(idx, cx);
+            return;
+        }
+        self.connect_with_prompt(entry, ConnectIntent::OpenTab, window, cx);
     }
 
     /// Connect again to every host that was open when g-ssh last closed.
@@ -1465,18 +1505,22 @@ impl AppView {
         // existing tab) so the sidebar's RECENT zone reflects real usage.
         self.record_open(entry.id, cx);
 
-        // The connection stays one. A second click brings its terminal tab
-        // forward instead of opening another session.
+        // The connection stays one. A second click brings its main tab
+        // forward instead of opening another session. SFTP hosts open files.
+        let kind = primary_work(entry.kind);
         if let Some(idx) = self.tab_index_for_host(&server_id, cx) {
             let session = self.tabs[idx].clone();
-            self.workspace.update(cx, |workspace, cx| {
-                workspace.open_doc(session, WorkKind::Terminal, cx)
-            });
+            self.workspace
+                .update(cx, |workspace, cx| workspace.open_doc(session, kind, cx));
             self.change_active_tab(idx, cx);
             return;
         }
 
-        self.connect_with_prompt(entry, ConnectIntent::OpenTab, window, cx);
+        let intent = match entry.kind {
+            ConnectionKind::Sftp => ConnectIntent::OpenSftp,
+            ConnectionKind::Ssh | ConnectionKind::Telnet => ConnectIntent::OpenTab,
+        };
+        self.connect_with_prompt(entry, intent, window, cx);
     }
 
     /// Resolve the host's credential, asking for a key passphrase when one
@@ -1488,6 +1532,14 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if entry.kind == ConnectionKind::Telnet {
+            if self.vault_state.read(cx).manager().is_none() {
+                self.set_status("The vault is locked.".to_string(), cx);
+                return;
+            }
+            self.launch_session(entry, AuthCredential::Agent, WorkKind::Terminal, window, cx);
+            return;
+        }
         let credential = match self.vault_state.read(cx).manager() {
             Some(vm) => route::target_credential(vm, &entry),
             None => {
@@ -1647,13 +1699,31 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let route = match self.build_route(&entry, credential, cx) {
-            Ok(route) => route,
-            Err(message) => {
-                tracing::warn!(host = %entry.label, message, "cannot build the connection route");
-                self.forget_pending_snippet(entry.id);
-                self.set_status(message, cx);
-                return;
+        let is_telnet = entry.kind == ConnectionKind::Telnet;
+        let telnet = if is_telnet {
+            match self.telnet_target(&entry, cx) {
+                Ok(target) => Some(target),
+                Err(message) => {
+                    tracing::warn!(host = %entry.label, message, "cannot build the telnet target");
+                    self.forget_pending_snippet(entry.id);
+                    self.set_status(message, cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let route = if is_telnet {
+            direct_route(&entry)
+        } else {
+            match self.build_route(&entry, credential, cx) {
+                Ok(route) => route,
+                Err(message) => {
+                    tracing::warn!(host = %entry.label, message, "cannot build the connection route");
+                    self.forget_pending_snippet(entry.id);
+                    self.set_status(message, cx);
+                    return;
+                }
             }
         };
 
@@ -1674,6 +1744,7 @@ impl AppView {
             ServerSession::start_connect(
                 conn_info,
                 route,
+                telnet,
                 initial_restore,
                 forwards,
                 file_associations,
@@ -2703,6 +2774,10 @@ impl AppView {
         let Some(session) = self.tabs.get(self.active_tab).cloned() else {
             return;
         };
+        if session.read(cx).conn_info.kind == ConnectionKind::Telnet {
+            self.set_status("Telnet hosts have no files.".to_string(), cx);
+            return;
+        }
         self.workspace.update(cx, |workspace, cx| {
             workspace.open_doc(session, WorkKind::Sftp, cx)
         });
@@ -3100,6 +3175,7 @@ fn quick_connect_entry(
         label: host.clone(),
         host,
         port,
+        kind: gssh::vault::ConnectionKind::Ssh,
         username,
         auth: AuthMethod::Agent,
         notes: None,
@@ -3121,6 +3197,46 @@ fn quick_connect_entry(
     }
 }
 
+/// The tab a host opens into. SFTP hosts open files; the others open a terminal.
+fn primary_work(kind: ConnectionKind) -> WorkKind {
+    match kind {
+        ConnectionKind::Sftp => WorkKind::Sftp,
+        ConnectionKind::Ssh | ConnectionKind::Telnet => WorkKind::Terminal,
+    }
+}
+
+/// A route the session can store for a Telnet host. Nothing dials it: Telnet
+/// has no SSH handshake, and the real target is a [`TelnetTarget`].
+fn direct_route(entry: &ServerEntry) -> SshRoute {
+    SshRoute {
+        jumps: Vec::new(),
+        target: SshHop {
+            entry_id: entry.id.to_string(),
+            label: entry.label.clone(),
+            host: entry.host.clone(),
+            port: entry.port,
+            username: entry.username.clone(),
+            credential: AuthCredential::Agent,
+            expected_host_key: None,
+        },
+        proxy: None,
+    }
+}
+
+impl AppView {
+    fn telnet_target(&self, entry: &ServerEntry, cx: &App) -> Result<TelnetTarget, String> {
+        let vault = self.vault_state.read(cx);
+        let Some(vm) = vault.manager() else {
+            return Err("The vault is locked.".to_string());
+        };
+        Ok(TelnetTarget {
+            host: entry.host.clone(),
+            port: entry.port,
+            proxy: route::resolved_proxy(vm, entry.id),
+        })
+    }
+}
+
 /// What a session shows and logs about the host it is connected to.
 fn connection_info(entry: &ServerEntry) -> Connection {
     Connection {
@@ -3129,6 +3245,7 @@ fn connection_info(entry: &ServerEntry) -> Connection {
         host: entry.host.clone(),
         port: entry.port,
         username: entry.username.clone(),
+        kind: entry.kind,
     }
 }
 
