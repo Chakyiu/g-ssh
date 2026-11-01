@@ -31,11 +31,15 @@ $source = Join-Path $here "..\packaging\windows\Package.wxs"
 $payload = (Resolve-Path -LiteralPath $PayloadDir).Path
 $uiExt = "WixToolset.UI.wixext/5.0.2"
 
+# WiX exits 2 when the cache lists nothing. A fresh machine has no
+# extensions yet, so that code means "not installed", not a broken wix.
 $listed = & $wix extension list -g
-if ($LASTEXITCODE -ne 0) {
-    throw "wix extension list failed with exit code $LASTEXITCODE"
+$listCode = $LASTEXITCODE
+if ($listCode -ne 0 -and $listCode -ne 2) {
+    throw "wix extension list failed with exit code $listCode"
 }
-if (-not (($listed | Out-String) -match "WixToolset\.UI\.wixext\s+5\.0\.2")) {
+$haveUi = ($listCode -eq 0) -and (($listed | Out-String) -match "WixToolset\.UI\.wixext\s+5\.0\.2(?!\s+\(damaged\))")
+if (-not $haveUi) {
     & $wix extension add -g $uiExt
     if ($LASTEXITCODE -ne 0) {
         throw "wix extension add failed with exit code $LASTEXITCODE"
