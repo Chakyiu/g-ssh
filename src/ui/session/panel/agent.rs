@@ -3720,13 +3720,6 @@ impl ServerPanel {
 
     fn transcript(&self, scroll: &ScrollHandle, cx: &Context<Self>) -> impl IntoElement {
         let live = self.agent.as_ref().and_then(|agent| agent.live_reply);
-        let title = self.agent.as_ref().and_then(|agent| {
-            agent
-                .book
-                .open
-                .get(agent.book.active)
-                .map(|chat| chat.title.clone())
-        });
         let bubbles = self.agent.as_ref().map(|agent| &agent.bubbles);
         v_flex()
             .id("agent-transcript")
@@ -3737,14 +3730,6 @@ impl ServerPanel {
             .gap(px(18.))
             .pr(px(2.))
             .pb(px(12.))
-            .when_some(title, |column, title| {
-                column.child(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .child(chat_title_pill(title, cx)),
-                )
-            })
             .children(bubbles.into_iter().flat_map(|bubbles| {
                 bubbles
                     .iter()
@@ -4902,17 +4887,6 @@ fn pace_line(pace: &ReplyPace, cx: &Context<ServerPanel>) -> impl IntoElement {
             "{} tok/s",
             tokens_per_sec(pace.tokens, pace.millis)
         )))
-}
-
-fn chat_title_pill(title: String, cx: &Context<ServerPanel>) -> gpui::Div {
-    div()
-        .px(px(8.))
-        .py(px(2.))
-        .rounded_full()
-        .bg(theme::element())
-        .text_size(px(11.))
-        .text_color(cx.theme().muted_foreground)
-        .child(title)
 }
 
 fn user_text(ix: usize, text: &str) -> AnyElement {
