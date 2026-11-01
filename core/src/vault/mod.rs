@@ -3409,6 +3409,7 @@ mod tests {
             api_key: "sk-test-secret".into(),
             system_prompt: "Be brief.".into(),
             always_allow: vec!["ls".into(), "cd".into()],
+            enabled: true,
         })
         .unwrap();
         vm.lock();

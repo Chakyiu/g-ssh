@@ -50,6 +50,12 @@ pub(super) enum SavedBubble {
         reason: String,
         outcome: SavedOutcome,
     },
+    Answer {
+        question: String,
+        answer: String,
+        #[serde(default)]
+        skipped: bool,
+    },
     Note {
         text: String,
     },
@@ -155,6 +161,8 @@ pub(super) enum SavedPhase {
     Waiting,
     Approval,
     Running,
+    /// A question card is waiting for an answer.
+    Question,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

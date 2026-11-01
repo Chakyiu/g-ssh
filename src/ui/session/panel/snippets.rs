@@ -41,6 +41,9 @@ struct Row {
 
 impl ServerPanel {
     pub(super) fn render_snippets(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        if self.is_local() {
+            return self.render_local_snippets(cx);
+        }
         let Some(server_id) = self.server_id(cx) else {
             return Vec::new();
         };
@@ -112,6 +115,31 @@ impl ServerPanel {
             };
             let is_startup = startup == Some(snippet.id);
             snippet_row(ix, &row, is_startup, false, cx).into_any_element()
+        }));
+        children
+    }
+
+    /// Shared snippets, typed into the terminal on this computer. A host's
+    /// own snippets stay on that host.
+    fn render_local_snippets(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let Some(vault) = self.vault_state.read(cx).manager() else {
+            return vec![note("Unlock the vault to use snippets.").into_any_element()];
+        };
+        let mut children = vec![section_title("Shared").into_any_element()];
+        let mut shared = vault.list_snippets().unwrap_or_default();
+        if shared.is_empty() {
+            children.push(note("No shared snippets yet. Add them in Settings.").into_any_element());
+            return children;
+        }
+        shared.sort_by_key(|snippet| snippet.name.to_lowercase());
+        children.extend(shared.iter().enumerate().map(|(ix, snippet)| {
+            let SnippetBody::Script { content } = &snippet.body;
+            let row = Row {
+                id: snippet.id,
+                name: snippet.name.clone(),
+                script: content.clone(),
+            };
+            snippet_row(ix, &row, false, false, cx).into_any_element()
         }));
         children
     }

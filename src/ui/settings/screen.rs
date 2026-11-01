@@ -461,6 +461,30 @@ impl SettingsView {
         Some((base, api_key))
     }
 
+    fn set_agent_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let saved = self.vault_state.update(cx, |vault, cx| {
+            let manager = vault.manager_mut()?;
+            let mut settings = manager.agent_settings();
+            if settings.enabled == enabled {
+                return Some(Ok(()));
+            }
+            settings.enabled = enabled;
+            let saved = manager.set_agent_settings(settings);
+            cx.notify();
+            Some(saved)
+        });
+        match saved {
+            Some(Ok(())) => self.agent_error = None,
+            Some(Err(error)) => {
+                self.agent_error = Some(format!("Could not save the agent switch: {error}"));
+            }
+            None => {
+                self.agent_error = Some("Unlock the vault to change the agent.".into());
+            }
+        }
+        cx.notify();
+    }
+
     fn save_agent_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let base = match canonical_agent_base(&self.agent_base.read(cx).value()) {
             Ok(base) => base,
@@ -2047,6 +2071,7 @@ impl SettingsView {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let chip_hover = crate::theme::element_hover();
+        let agent_on = self.vault_state.read(cx).agent_enabled();
         v_flex()
             .size_full()
             .min_h_0()
@@ -2059,6 +2084,22 @@ impl SettingsView {
                     .px(px(20.))
                     .py(px(16.))
                     .gap(px(8.))
+                    .child(
+                        Checkbox::new("agent-enabled")
+                            .checked(agent_on)
+                            .label("Enable AI Agent")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_agent_enabled(*checked, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .pl(px(22.))
+                            .max_w(px(520.))
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child("Shows the chat button on a terminal. Turn this off to hide it."),
+                    )
                     .child(group_title("Endpoint", cx))
                     .child(field_label("Base URL", cx))
                     .child(

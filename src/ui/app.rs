@@ -274,10 +274,24 @@ impl AppView {
         let servers_view = cx.new(|cx| ServersView::new(vault_state.clone(), window, cx));
         let sidebar = cx.new(|cx| Sidebar::new(vault_state.clone(), window, cx));
         let workspace = cx.new(|cx| Workspace::new(cx));
-        let local_terminal = cx.new(|_| LocalTerminal::new());
+        let local_terminal = cx.new(|cx| LocalTerminal::new(vault_state.clone(), cx));
+        cx.subscribe_in(
+            &local_terminal,
+            window,
+            |this, _, event, window, cx| match event {
+                crate::ui::local::LocalTerminalEvent::OpenAgentSettings => {
+                    this.open_settings_at(SettingsSection::Agent, window, cx);
+                }
+            },
+        )
+        .detach();
 
-        cx.observe(&vault_state, |this, _, cx| this.follow_renamed_hosts(cx))
-            .detach();
+        cx.observe(&vault_state, |this, _, cx| {
+            this.follow_renamed_hosts(cx);
+            // The chat button reads the agent switch, so it has to redraw with it.
+            cx.notify();
+        })
+        .detach();
         // The title bar shows the update mark.
         cx.observe(&UpdateService::global(cx), |_, _, cx| cx.notify())
             .detach();
@@ -2675,6 +2689,8 @@ impl AppView {
 
     fn toggle_server_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.showing_local {
+            self.local_terminal
+                .update(cx, |local, cx| local.toggle_panel(window, cx));
             return;
         }
         let Some(session) = self.tabs.get(self.active_tab) else {

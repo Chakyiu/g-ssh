@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, App, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, Hsla,
-    KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, Subscription, Task, Window,
+    actions, div, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, Subscription, Task,
+    WeakEntity, Window,
 };
 
 use crate::preferences::Preferences;
@@ -22,6 +23,7 @@ use crate::ui::terminal::link::{self, TerminalLink};
 use crate::ui::terminal::mouse::{encode_mouse_event, MouseButton as ReportButton, MouseEventKind};
 use crate::ui::terminal::search::{self, SearchState};
 use crate::ui::terminal::suggestions::{NavAction, SuggestionState};
+use crate::ui::VaultState;
 use gssh::ssh::shell::{
     GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionSide, SelectionType,
     ShellEvent, ShellHandle, TermSnapshot,
@@ -253,6 +255,8 @@ pub struct TerminalView {
     /// drag and its release go to the same app. A release of anything else
     /// (a click on the sidebar, a press the app never saw) is not reported.
     reported_press: Option<MouseButton>,
+    /// The vault, so the Ask agent item can follow the Enable AI Agent switch.
+    vault: Option<WeakEntity<VaultState>>,
 }
 
 pub enum TerminalEvent {
@@ -354,7 +358,25 @@ impl TerminalView {
             copied_hint_task: None,
             is_link_click: false,
             reported_press: None,
+            vault: None,
         }
+    }
+
+    /// Redraw the menu when the agent switch changes.
+    pub(crate) fn follow_agent_setting(
+        &mut self,
+        vault: Entity<VaultState>,
+        cx: &mut Context<Self>,
+    ) {
+        self.vault = Some(vault.downgrade());
+        cx.observe(&vault, |_, _, cx| cx.notify()).detach();
+    }
+
+    fn agent_enabled(&self, cx: &App) -> bool {
+        self.vault
+            .as_ref()
+            .and_then(|vault| vault.upgrade())
+            .is_none_or(|vault| vault.read(cx).agent_enabled())
     }
 
     /// Wipe the scrollback and the screen, then send Ctrl-L (form feed) so the
@@ -479,14 +501,16 @@ impl TerminalView {
                 }),
             ));
         }
-        items.push(ContextMenuItem::new(
-            "term-ask-agent",
-            "Ask agent",
-            cx.listener(|this, _, _, cx| {
-                this.context_menu = None;
-                this.ask_agent(cx);
-            }),
-        ));
+        if self.agent_enabled(cx) {
+            items.push(ContextMenuItem::new(
+                "term-ask-agent",
+                "Ask agent",
+                cx.listener(|this, _, _, cx| {
+                    this.context_menu = None;
+                    this.ask_agent(cx);
+                }),
+            ));
+        }
         if has_clipboard {
             items.push(ContextMenuItem::new(
                 "term-paste",

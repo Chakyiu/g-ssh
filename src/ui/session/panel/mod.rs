@@ -31,9 +31,17 @@ use gpui_component::{
 use crate::host_stats::{self, Sample, SystemInfo};
 use crate::preferences::Preferences;
 use crate::theme;
+use crate::ui::local::LocalTerminal;
 use crate::ui::session::ServerSession;
 use crate::ui::VaultState;
+use gssh::ssh::shell::ShellHandle;
 use gssh::ssh::SshConnection;
+
+/// Where the panel's shell, chats, and metrics come from.
+pub(crate) enum PanelHost {
+    Remote(WeakEntity<ServerSession>),
+    Local(WeakEntity<LocalTerminal>),
+}
 
 pub const PANEL_WIDTH: f32 = 320.;
 /// The agent review box holds terminal text, so the panel grows while the
@@ -93,7 +101,7 @@ struct Reading {
 }
 
 pub struct ServerPanel {
-    session: WeakEntity<ServerSession>,
+    host: PanelHost,
     vault_state: Entity<VaultState>,
     /// Overview or Snippets. Kept while the agent chat is in front, so the
     /// inspector opens on the same page.
@@ -124,6 +132,11 @@ pub struct ServerPanel {
 
 enum NextStep {
     Read(Poll),
+    /// Stats from this computer, not an SSH exec.
+    ReadLocal {
+        needs_info: bool,
+        needs_sample: bool,
+    },
     Wait(Duration),
 }
 
@@ -136,13 +149,17 @@ struct Poll {
 impl EventEmitter<ServerPanelEvent> for ServerPanel {}
 
 impl ServerPanel {
-    pub fn new(
-        session: WeakEntity<ServerSession>,
-        vault_state: Entity<VaultState>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(host: PanelHost, vault_state: Entity<VaultState>, cx: &mut Context<Self>) -> Self {
         // The snippets and the connection rows show what the vault holds.
-        cx.observe(&vault_state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&vault_state, |this, vault, cx| {
+            // The chat has no button once the agent is turned off, so close it.
+            if !vault.read(cx).agent_enabled() && this.showing_agent {
+                this.showing_agent = false;
+                cx.emit(ServerPanelEvent::WidthChanged);
+            }
+            cx.notify();
+        })
+        .detach();
         let (wake, mut woken) = mpsc::unbounded();
         let poll_task = cx.spawn(async move |this, cx| {
             let mut delay = Duration::ZERO;
@@ -154,15 +171,22 @@ impl ServerPanel {
                 let Ok(step) = this.update(cx, |panel, cx| panel.next_step(cx)) else {
                     break;
                 };
-                let poll = match step {
-                    NextStep::Read(poll) => poll,
+                let executor = cx.background_executor().clone();
+                let (info, sample) = match step {
                     NextStep::Wait(wait) => {
                         delay = wait;
                         continue;
                     }
+                    NextStep::Read(poll) => read_host(&poll, &executor).await,
+                    NextStep::ReadLocal {
+                        needs_info,
+                        needs_sample,
+                    } => {
+                        executor
+                            .spawn(async move { host_stats::read_local(needs_info, needs_sample) })
+                            .await
+                    }
                 };
-                let executor = cx.background_executor().clone();
-                let (info, sample) = read_host(&poll, &executor).await;
                 let Ok(next) = this.update(cx, |panel, cx| {
                     panel.take_output(info, sample, cx);
                     panel.delay_after_poll()
@@ -173,7 +197,7 @@ impl ServerPanel {
             }
         });
         Self {
-            session,
+            host,
             vault_state,
             tab: Tab::Overview,
             showing_agent: false,
@@ -201,9 +225,19 @@ impl ServerPanel {
         if !self.is_on_screen() {
             return NextStep::Wait(TICK);
         }
+        if matches!(self.host, PanelHost::Local(_)) {
+            let needs_info = self.info.is_none();
+            let needs_sample = !self.is_unsupported;
+            if !needs_info && !needs_sample {
+                return NextStep::Wait(TICK);
+            }
+            return NextStep::ReadLocal {
+                needs_info,
+                needs_sample,
+            };
+        }
         let connection = self
-            .session
-            .upgrade()
+            .remote()
             .and_then(|session| session.read(cx).connection.clone());
         let Some(connection) = connection else {
             return NextStep::Wait(CONNECT_RETRY);
@@ -323,11 +357,11 @@ impl ServerPanel {
 
     /// Width for this frame: the saved drag, or the face's default, clamped
     /// so the shell beside the panel keeps room.
-    pub(super) fn laid_out_width(&self, window: &Window, cx: &gpui::App) -> f32 {
+    pub(crate) fn laid_out_width(&self, window: &Window, cx: &gpui::App) -> f32 {
         clamp_panel_width(self.panel_width(cx), window.viewport_size().width.as_f32())
     }
 
-    pub(super) fn resize_to(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn resize_to(&mut self, width: f32, window: &Window, cx: &mut Context<Self>) {
         let width = clamp_panel_width(width, window.viewport_size().width.as_f32());
         if self.panel_width(cx) == width {
             return;
@@ -370,10 +404,81 @@ impl ServerPanel {
             .child(option("server-panel-snippets", Tab::Snippets, "Snippets"))
     }
 
-    /// The vault entry of the session's host.
+    pub(crate) fn vault(&self) -> Entity<VaultState> {
+        self.vault_state.clone()
+    }
+
+    pub(crate) fn agent_enabled(&self, cx: &gpui::App) -> bool {
+        self.vault_state.read(cx).agent_enabled()
+    }
+
+    fn is_local(&self) -> bool {
+        matches!(self.host, PanelHost::Local(_))
+    }
+
+    fn remote(&self) -> Option<Entity<ServerSession>> {
+        match &self.host {
+            PanelHost::Remote(session) => session.upgrade(),
+            PanelHost::Local(_) => None,
+        }
+    }
+
+    /// The vault entry of the session's host. A local terminal has none.
     fn server_id(&self, cx: &gpui::App) -> Option<uuid::Uuid> {
-        let session = self.session.upgrade()?;
+        let session = self.remote()?;
         uuid::Uuid::parse_str(&session.read(cx).server_id).ok()
+    }
+
+    pub(super) fn host_key(&self, cx: &gpui::App) -> String {
+        match &self.host {
+            PanelHost::Remote(session) => session
+                .upgrade()
+                .map(|session| session.read(cx).server_id.clone())
+                .unwrap_or_default(),
+            PanelHost::Local(_) => "local".to_string(),
+        }
+    }
+
+    pub(super) fn host_label(&self, cx: &gpui::App) -> String {
+        match &self.host {
+            PanelHost::Remote(_) => String::new(),
+            PanelHost::Local(local) => local
+                .upgrade()
+                .map(|local| local.read(cx).machine_label())
+                .unwrap_or_else(|| "Local".to_string()),
+        }
+    }
+
+    pub(super) fn active_shell(&self, cx: &gpui::App) -> Option<ShellHandle> {
+        match &self.host {
+            PanelHost::Remote(session) => {
+                let session = session.upgrade()?;
+                let terminal = session.read(cx).active_terminal()?.clone();
+                Some(terminal.read(cx).shell.clone())
+            }
+            PanelHost::Local(local) => local.upgrade()?.read(cx).active_shell(cx),
+        }
+    }
+
+    pub(super) fn show_terminal(&self, cx: &mut Context<Self>) {
+        match &self.host {
+            PanelHost::Remote(session) => {
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
+                session.update(cx, |session, cx| {
+                    session.is_sftp_hidden = true;
+                    session.is_terminal_focus_pending = true;
+                    cx.notify();
+                });
+            }
+            PanelHost::Local(local) => {
+                let Some(local) = local.upgrade() else {
+                    return;
+                };
+                local.update(cx, |local, cx| local.focus_shell(cx));
+            }
+        }
     }
 
     fn scroll_body(&self, content: Vec<gpui::AnyElement>) -> gpui::AnyElement {
@@ -527,7 +632,7 @@ fn info_row(
 
 /// The drag of this panel's left edge. The session hears it anywhere in the
 /// window; the handle only starts it.
-pub(super) struct PanelResize {
+pub(crate) struct PanelResize {
     panel: EntityId,
     /// Set when the drag starts. `None` until then, so the first move can
     /// still lock the origin if the start hook has not run.
@@ -536,7 +641,7 @@ pub(super) struct PanelResize {
 }
 
 impl PanelResize {
-    pub(super) fn is_for(&self, panel: EntityId) -> bool {
+    pub(crate) fn is_for(&self, panel: EntityId) -> bool {
         self.panel == panel
     }
 
@@ -544,7 +649,7 @@ impl PanelResize {
     ///
     /// `x` is a window pixel. The saved width is a designed pixel, the size
     /// at zoom 1, so the drag is divided by the current zoom.
-    pub(super) fn width_at(&self, x: f32) -> f32 {
+    pub(crate) fn width_at(&self, x: f32) -> f32 {
         let start_x = match self.start_x.get() {
             Some(start) => start,
             None => {
@@ -567,7 +672,7 @@ impl Render for PanelResizeGhost {
 
 /// The band on the panel's left edge. It hugs that edge so the parent clip
 /// does not eat the grab.
-pub(super) fn panel_resize_handle(panel: EntityId, start_width: f32) -> impl IntoElement {
+pub(crate) fn panel_resize_handle(panel: EntityId, start_width: f32) -> impl IntoElement {
     let drag = PanelResize {
         panel,
         start_x: Rc::new(Cell::new(None)),

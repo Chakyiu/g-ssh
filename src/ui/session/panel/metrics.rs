@@ -28,8 +28,12 @@ impl ServerPanel {
     fn render_identity(&self, cx: &Context<Self>) -> AnyElement {
         let Some(info) = &self.info else {
             // The same two lines as below, so nothing moves when the info comes.
-            return identity_row(None, "Reading the server\u{2026}".into(), None, cx)
-                .into_any_element();
+            let waiting = if self.is_local() {
+                "Reading this computer\u{2026}"
+            } else {
+                "Reading the server\u{2026}"
+            };
+            return identity_row(None, waiting.into(), None, cx).into_any_element();
         };
         let os_label = info.os_name.clone().unwrap_or_else(|| info.kernel.clone());
         let subtitle = match self.last_sample.as_ref() {
@@ -47,7 +51,12 @@ impl ServerPanel {
     pub(super) fn render_overview(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let mut children = vec![self.render_identity(cx)];
         if self.is_unsupported {
-            children.push(note("Live metrics need a Linux server.").into_any_element());
+            let message = if self.is_local() {
+                "Live metrics are not available on this computer."
+            } else {
+                "Live metrics need a Linux server."
+            };
+            children.push(note(message).into_any_element());
         } else {
             children.extend(self.render_metrics(cx));
         }

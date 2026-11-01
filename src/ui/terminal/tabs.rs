@@ -1,7 +1,8 @@
 //! Terminal tabs: several shells for one host over the same SSH connection,
 //! so a second shell needs no second login. A right-click renames a terminal
-//! tab or colours it. Dragging a tab docks it into a second pane, which keeps
-//! its own tab list. Dropping a tab on an edge splits that cell, so the grid
+//! tab or colours it. A middle-click closes it. Dragging a tab docks it into
+//! a second pane, which keeps its own tab list. Dropping a tab on an edge
+//! splits that cell, so the grid
 //! can grow to four, five, or more. SFTP for a host is its own workspace tab,
 //! opened from the host list.
 //!
@@ -11,8 +12,9 @@
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, relative, Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, Focusable as _,
-    Hsla, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, SharedString, Window,
+    div, relative, Anchor, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity,
+    Focusable as _, Hsla, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, SharedString,
+    Window,
 };
 
 use gpui_component::{
@@ -465,8 +467,10 @@ impl ServerSession {
     /// Wrap a freshly opened shell in a terminal tab at the end of the strip.
     pub(crate) fn add_terminal(&mut self, shell: ShellHandle, cx: &mut Context<Self>) {
         let history = self.shell_history.clone();
+        let vault = self.server_panel.read(cx).vault();
         let terminal = cx.new(|cx| {
             let mut view = TerminalView::new(shell, cx);
+            view.follow_agent_setting(vault, cx);
             if !history.is_empty() {
                 view.set_history(history, cx);
             }
@@ -481,6 +485,9 @@ impl ServerSession {
                     start_line,
                     end_line,
                 } => {
+                    if !this.server_panel.read(cx).agent_enabled(cx) {
+                        return;
+                    }
                     this.open_agent_from_terminal(text.clone(), *start_line, *end_line, cx);
                 }
             },
@@ -1343,6 +1350,12 @@ impl ServerSession {
                 }),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(ix, cx)))
+            .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    this.close_terminal(ix, cx);
+                }
+            }))
             .when(alone, |el| el.child(terminal_icon(mark_color(color))))
             .child(div().max_w(px(140.)).truncate().child(label.clone()))
             .when(self.terminals.len() > 1, |el| el.child(close));
@@ -1417,7 +1430,13 @@ impl ServerSession {
                     this.open_tab_menu(ix, event.position, cx);
                 }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(ix, cx)));
+            .on_click(cx.listener(move |this, _, _, cx| this.activate_terminal(ix, cx)))
+            .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    this.close_terminal(ix, cx);
+                }
+            }));
         self.with_tab_drop(
             self.with_tab_drag(tab, ix, label.into(), mark, cx),
             ix,
@@ -1803,9 +1822,12 @@ impl ServerSession {
             .into_any_element()
     }
 
-    pub(crate) fn render_agent_button(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_agent_button(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.server_panel.read(cx).agent_enabled(cx) {
+            return None;
+        }
         let is_on = self.is_server_panel_shown && self.server_panel.read(cx).shows_agent();
-        toggle_button(
+        let button = toggle_button(
             SharedString::from(format!("agent-{}", self.server_id)),
             is_on,
             cx,
@@ -1814,7 +1836,8 @@ impl ServerSession {
         .child(Icon::empty().path("icons/message-square.svg").size(px(15.)))
         .tooltip(|window, cx| Tooltip::new("Agent").build(window, cx))
         .on_click(cx.listener(|this, _, _, cx| this.toggle_agent_panel(cx)))
-        .into_any_element()
+        .into_any_element();
+        Some(button)
     }
 
     pub(crate) fn render_server_panel_toggle(&self, cx: &Context<Self>) -> AnyElement {

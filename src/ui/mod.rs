@@ -105,6 +105,13 @@ impl VaultState {
         }
     }
 
+    /// The chat button is shown. A locked vault has not said otherwise.
+    pub fn agent_enabled(&self) -> bool {
+        self.manager()
+            .map(|manager| manager.agent_settings().enabled)
+            .unwrap_or(true)
+    }
+
     pub fn manager_mut(&mut self) -> Option<&mut gssh::vault::VaultManager> {
         match self {
             VaultState::Unlocked { manager } => Some(manager),

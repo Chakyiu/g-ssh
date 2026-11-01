@@ -4,16 +4,32 @@
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, AnyElement, Context, Entity, Focusable as _, MouseButton, Window};
+use gpui::{
+    div, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, Focusable as _,
+    MouseButton, StyleRefinement, Window,
+};
 
 use gpui_component::{
     h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon, IconName, WindowExt as _,
 };
+use gssh::ssh::shell::ShellHandle;
+use gssh::vault::SnippetBody;
 
 use crate::theme;
 use crate::ui::hints;
-use crate::ui::terminal::tabs::NEW_TERMINAL_SHORTCUT;
+use crate::ui::session::panel::{
+    panel_resize_handle, PanelHost, PanelResize, SelectionCite, ServerPanel, ServerPanelEvent,
+};
+use crate::ui::terminal::tabs::{NEW_TERMINAL_SHORTCUT, SERVER_PANEL_SHORTCUT};
 use crate::ui::terminal::view::{TerminalEvent, TerminalView};
+use crate::ui::VaultState;
+
+pub enum LocalTerminalEvent {
+    /// Open Settings on the agent endpoint page.
+    OpenAgentSettings,
+}
+
+impl EventEmitter<LocalTerminalEvent> for LocalTerminal {}
 
 /// Shells past this stop fitting the header, same cap as a remote session.
 const MAX_SHELLS: usize = 8;
@@ -29,16 +45,132 @@ pub struct LocalTerminal {
     spawn_error: Option<String>,
     /// The active shell should take the keyboard on the next render.
     focus_pending: bool,
+    vault_state: Entity<VaultState>,
+    panel: Entity<ServerPanel>,
+    /// Overview, snippets, or the agent chat, on the right of the terminal.
+    panel_shown: bool,
+    /// `user@hostname`, for the agent and a snippet's record of where it ran.
+    machine_label: String,
 }
 
 impl LocalTerminal {
-    pub fn new() -> Self {
+    pub fn new(vault_state: Entity<VaultState>, cx: &mut Context<Self>) -> Self {
+        let local = cx.entity().downgrade();
+        let panel = cx.new(|cx| ServerPanel::new(PanelHost::Local(local), vault_state.clone(), cx));
+        cx.subscribe(&panel, |this, _, event, cx| this.on_panel(event, cx))
+            .detach();
         Self {
             shells: Vec::new(),
             active: 0,
             spawn_error: None,
             focus_pending: false,
+            vault_state,
+            panel,
+            panel_shown: false,
+            machine_label: machine_label(),
         }
+    }
+
+    pub(crate) fn machine_label(&self) -> String {
+        self.machine_label.clone()
+    }
+
+    /// The shell in front, when it is still running.
+    pub(crate) fn active_shell(&self, cx: &gpui::App) -> Option<ShellHandle> {
+        let shell = self.shells.get(self.active)?;
+        if shell.exited {
+            return None;
+        }
+        Some(shell.view.read(cx).shell.clone())
+    }
+
+    pub(crate) fn focus_shell(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    fn on_panel(&mut self, event: &ServerPanelEvent, cx: &mut Context<Self>) {
+        match event {
+            ServerPanelEvent::RunSnippet(id) => self.run_snippet(*id, cx),
+            ServerPanelEvent::OpenAgentSettings => cx.emit(LocalTerminalEvent::OpenAgentSettings),
+            ServerPanelEvent::WidthChanged => cx.notify(),
+        }
+    }
+
+    fn run_snippet(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        let script = self.vault_state.read(cx).manager().and_then(|vault| {
+            let SnippetBody::Script { content } = &vault.get_snippet(id).ok()?.body;
+            Some(content.clone())
+        });
+        let Some(script) = script else {
+            return;
+        };
+        let Some(shell) = self.active_shell(cx) else {
+            return;
+        };
+        let mut bytes = script.into_bytes();
+        bytes.push(b'\r');
+        cx.spawn(async move |_, _| {
+            shell.send_input(bytes).await;
+        })
+        .detach();
+        self.focus_shell(cx);
+    }
+
+    fn ask_agent(
+        &mut self,
+        text: &str,
+        start_line: usize,
+        end_line: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.vault_state.read(cx).agent_enabled() {
+            return;
+        }
+        let cite = (!text.trim().is_empty()).then(|| {
+            SelectionCite::new(
+                &self.machine_label,
+                &self.active_label(),
+                start_line,
+                end_line,
+                text,
+            )
+        });
+        self.panel_shown = true;
+        self.panel
+            .update(cx, |panel, cx| panel.request_agent(cite, cx));
+        self.focus_shell(cx);
+    }
+
+    fn active_label(&self) -> String {
+        if self.shells.len() <= 1 {
+            "Local".to_string()
+        } else {
+            (self.active + 1).to_string()
+        }
+    }
+
+    fn toggle_agent(&mut self, cx: &mut Context<Self>) {
+        let showing = self.panel_shown && self.panel.read(cx).shows_agent();
+        if showing {
+            self.panel_shown = false;
+        } else {
+            self.panel_shown = true;
+            self.panel
+                .update(cx, |panel, cx| panel.request_agent(None, cx));
+        }
+        self.focus_shell(cx);
+    }
+
+    pub(crate) fn toggle_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let inspector = self.panel_shown && !self.panel.read(cx).shows_agent();
+        if inspector {
+            self.panel_shown = false;
+        } else {
+            self.panel_shown = true;
+            self.panel.update(cx, |panel, cx| panel.show_inspector(cx));
+        }
+        self.focus_shell(cx);
     }
 
     pub fn shell_count(&self) -> usize {
@@ -114,8 +246,10 @@ impl LocalTerminal {
             }
         };
         self.spawn_error = None;
+        let vault = self.vault_state.clone();
         let view = cx.new(|cx| {
             let mut view = TerminalView::new(shell, cx);
+            view.follow_agent_setting(vault, cx);
             // The view focuses itself the first time it is drawn. A shell opened
             // and then left before that frame would take the keys from whatever
             // is on screen now. Focus is requested below, and only while this
@@ -123,10 +257,13 @@ impl LocalTerminal {
             view.suppress_auto_focus();
             view
         });
-        cx.subscribe(&view, |this, view, event: &TerminalEvent, cx| {
-            if matches!(event, TerminalEvent::Exited) {
-                this.mark_exited(&view, cx);
-            }
+        cx.subscribe(&view, |this, view, event: &TerminalEvent, cx| match event {
+            TerminalEvent::Exited => this.mark_exited(&view, cx),
+            TerminalEvent::AskAgent {
+                text,
+                start_line,
+                end_line,
+            } => this.ask_agent(text, *start_line, *end_line, cx),
         })
         .detach();
         let index = index.min(self.shells.len());
@@ -275,6 +412,12 @@ impl LocalTerminal {
             .child(label)
             .children(close)
             .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
+            .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    this.close_shell(index, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -325,12 +468,80 @@ impl LocalTerminal {
                     .child(err.clone()),
             );
         }
-        strip.into_any_element()
+        strip.child(self.render_tools(cx)).into_any_element()
+    }
+
+    fn render_tools(&self, cx: &mut Context<Self>) -> AnyElement {
+        let agent_on = self.panel_shown && self.panel.read(cx).shows_agent();
+        let inspector_on = self.panel_shown && !self.panel.read(cx).shows_agent();
+        h_flex()
+            .flex_none()
+            .gap(px(2.))
+            .when(self.vault_state.read(cx).agent_enabled(), |row| {
+                row.child(
+                    self.tool_button("local-agent", agent_on, cx)
+                        .child(Icon::empty().path("icons/message-square.svg").size(px(15.)))
+                        .tooltip(|window, cx| Tooltip::new("Agent").build(window, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_agent(cx))),
+                )
+            })
+            .child(
+                self.tool_button("local-panel", inspector_on, cx)
+                    .relative()
+                    .child(Icon::empty().path("icons/panel-right.svg").size(px(15.)))
+                    .when(hints::is_shown(cx), |el| {
+                        el.child(hints::corner_badge(hints::SERVER_PANEL))
+                    })
+                    .tooltip(|window, cx| {
+                        Tooltip::new(format!("Overview ({SERVER_PANEL_SHORTCUT})"))
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_panel(window, cx))),
+            )
+            .into_any_element()
+    }
+
+    fn tool_button(
+        &self,
+        id: &'static str,
+        is_on: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.header_button(id, cx).px(px(5.)).when(is_on, |el| {
+            el.bg(theme::element()).text_color(cx.theme().foreground)
+        })
+    }
+
+    fn render_side_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let width = self.panel.read(cx).laid_out_width(window, cx);
+        let panel_id = self.panel.entity_id();
+        let style = StyleRefinement::default().w(px(width)).flex_none().h_full();
+        div()
+            .id(("local-panel-frame", panel_id.as_u64()))
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .h_full()
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<PanelResize>, window, cx| {
+                    let drag = event.drag(cx);
+                    if !drag.is_for(panel_id) {
+                        return;
+                    }
+                    let width = drag.width_at(event.event.position.x.as_f32());
+                    this.panel
+                        .update(cx, |panel, cx| panel.resize_to(width, window, cx));
+                },
+            ))
+            .child(self.panel.clone().cached(style))
+            .child(panel_resize_handle(panel_id, width))
+            .into_any_element()
     }
 
     fn render_failure(&self, message: &str, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
-            .size_full()
+            .flex_1()
+            .min_h_0()
             .items_center()
             .justify_center()
             .gap(px(8.))
@@ -364,23 +575,68 @@ fn status_dot(color: gpui::Hsla) -> gpui::Div {
     div().size(px(6.)).flex_none().rounded_full().bg(color)
 }
 
+fn machine_label() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let host = machine_name().filter(|host| !host.is_empty());
+    match (user.is_empty(), host) {
+        (false, Some(host)) => format!("{user}@{host}"),
+        (true, Some(host)) => host,
+        (false, None) => user,
+        (true, None) => "Local".to_string(),
+    }
+}
+
+fn machine_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut host = [0u8; 256];
+        let ok = unsafe { libc::gethostname(host.as_mut_ptr().cast(), host.len()) } == 0;
+        if !ok {
+            return None;
+        }
+        let end = host
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(host.len());
+        return Some(String::from_utf8_lossy(&host[..end]).trim().to_string());
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("COMPUTERNAME").ok()
+    }
+}
+
 impl Render for LocalTerminal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.take_focus(window, cx);
-        if self.shells.is_empty() {
+        let body = if self.shells.is_empty() {
             let message = self
                 .spawn_error
                 .clone()
                 .unwrap_or_else(|| "The shell did not start.".to_string());
             self.render_failure(&message, cx)
         } else {
-            let body = self.shells[self.active].view.clone();
-            v_flex()
-                .size_full()
+            let terminal = self.shells[self.active].view.clone();
+            div()
+                .flex_1()
+                .min_h_0()
                 .overflow_hidden()
-                .child(self.render_header(cx))
-                .child(div().flex_1().min_h_0().overflow_hidden().child(body))
+                .child(terminal)
                 .into_any_element()
-        }
+        };
+        let main = v_flex()
+            .size_full()
+            .overflow_hidden()
+            .child(self.render_header(cx))
+            .child(body)
+            .into_any_element();
+        let panel = self.panel_shown.then(|| self.render_side_panel(window, cx));
+        h_flex()
+            .size_full()
+            .overflow_hidden()
+            .child(div().flex_1().min_w_0().h_full().child(main))
+            .children(panel)
     }
 }

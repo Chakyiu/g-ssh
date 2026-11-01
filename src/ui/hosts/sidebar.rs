@@ -18,7 +18,7 @@ use crate::ui::hosts::sharing;
 use crate::ui::menu::{ContextMenu, ContextMenuItem, PopoverMenu};
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
-use gssh::vault::ServerEntrySummary;
+use gssh::vault::{ProxyChoice, ServerEntrySummary};
 
 pub(crate) const SIDEBAR_WIDTH: f32 = 232.;
 const ROW_HEIGHT: f32 = 28.;
@@ -26,6 +26,8 @@ const SIDEBAR_GROUP: &str = "sidebar-host-row";
 /// Cap on how many closed-but-recent hosts the RECENT zone shows. The full
 /// catalog lives behind the "All hosts" button, so this stays a short list.
 const RECENT_LIMIT: usize = 6;
+/// Long enough that moving across the list does not open a card.
+const HOST_DETAIL_DELAY: Duration = Duration::from_millis(500);
 
 /// Live connection state of a host that has an open session. Hosts without an
 /// open session are absent from the list and rendered as [`HostStatus::Offline`].
@@ -309,6 +311,21 @@ impl Sidebar {
                     cx.notify();
                 }),
             );
+        let route = proxy_route(
+            entry.proxy,
+            self.vault_state
+                .read(cx)
+                .manager()
+                .map(|vault| vault.list_proxies())
+                .unwrap_or_default(),
+        );
+        let detail = host_detail(entry, status, route, unix_now());
+        let row = row
+            .tooltip(move |window, cx| {
+                let detail = detail.clone();
+                Tooltip::element(move |_, cx| host_detail_card(&detail, cx)).build(window, cx)
+            })
+            .tooltip_show_delay(HOST_DETAIL_DELAY);
         match reorder_group {
             Some(group_key) => self.with_host_reorder(row, entry_id, group_key, label, cx),
             None => row,
@@ -1397,6 +1414,142 @@ pub(crate) fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// What the hover card says about one host. Empty facts are left out.
+#[derive(Clone)]
+struct HostDetail {
+    name: String,
+    address: String,
+    lines: Vec<(&'static str, String)>,
+}
+
+fn host_address(entry: &ServerEntrySummary) -> String {
+    let host = if entry.port == 22 {
+        entry.host.clone()
+    } else {
+        format!("{}:{}", entry.host, entry.port)
+    };
+    if entry.username.is_empty() {
+        host
+    } else {
+        format!("{}@{host}", entry.username)
+    }
+}
+
+fn status_label(status: HostStatus) -> &'static str {
+    match status {
+        HostStatus::Connected => "Connected",
+        HostStatus::Connecting => "Connecting",
+        HostStatus::Disconnected => "Disconnected",
+        HostStatus::Offline => "Not connected",
+    }
+}
+
+fn proxy_route(choice: ProxyChoice, proxies: Vec<gssh::vault::ProxyDefSummary>) -> Option<String> {
+    match choice {
+        ProxyChoice::Default => None,
+        ProxyChoice::Direct => Some("Direct".into()),
+        ProxyChoice::Use(id) => Some(
+            proxies
+                .into_iter()
+                .find(|proxy| proxy.id == id)
+                .map(|proxy| proxy.name)
+                .unwrap_or_else(|| "Proxy".into()),
+        ),
+    }
+}
+
+fn host_detail(
+    entry: &ServerEntrySummary,
+    status: HostStatus,
+    route: Option<String>,
+    now: i64,
+) -> HostDetail {
+    let name = if entry.label.is_empty() {
+        entry.host.clone()
+    } else {
+        entry.label.clone()
+    };
+    let mut lines = vec![("Status", status_label(status).to_string())];
+    if let Some(os) = entry.os.as_ref().filter(|os| !os.trim().is_empty()) {
+        lines.push(("System", os.clone()));
+    }
+    if let Some(folder) = entry
+        .group_name
+        .as_ref()
+        .filter(|name| !name.trim().is_empty())
+    {
+        lines.push(("Folder", folder.clone()));
+    }
+    if !entry.tag_names.is_empty() {
+        lines.push(("Tags", entry.tag_names.join(", ")));
+    }
+    if let Some(team) = entry
+        .team_name
+        .as_ref()
+        .filter(|name| !name.trim().is_empty())
+    {
+        lines.push(("Shared", team.clone()));
+    }
+    if let Some(opened) = entry.last_opened_at {
+        lines.push(("Opened", relative_time(opened, now)));
+    }
+    if let Some(route) = route {
+        lines.push(("Route", route));
+    }
+    HostDetail {
+        name,
+        address: host_address(entry),
+        lines,
+    }
+}
+
+fn host_detail_card(detail: &HostDetail, cx: &gpui::App) -> impl gpui::IntoElement {
+    let fg = cx.theme().popover_foreground;
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .w(px(220.))
+        .gap(px(8.))
+        .py(px(4.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(fg)
+                .child(detail.name.clone()),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(muted)
+                .child(detail.address.clone()),
+        )
+        .child(
+            v_flex()
+                .gap(px(4.))
+                .children(detail.lines.iter().map(|(label, value)| {
+                    h_flex()
+                        .gap(px(12.))
+                        .items_start()
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(muted)
+                                .child(*label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(12.))
+                                .text_color(fg)
+                                .child(value.clone()),
+                        )
+                })),
+        )
+}
+
 /// Compact relative-time label ("just now", "5m ago", "yesterday", "3d ago").
 pub(crate) fn relative_time(ts: i64, now: i64) -> String {
     let d = (now - ts).max(0);
@@ -1534,6 +1687,35 @@ mod tests {
         // Past an unset host, one rank cannot say "after the unnamed tail".
         let full = orders_after_move(&with_unset, a, c, true).unwrap();
         assert_eq!(full, vec![(b, 1024), (c, 2048), (a, 3072)]);
+    }
+
+    #[test]
+    fn the_hover_card_names_the_address_and_skips_empty_facts() {
+        let mut host = entry("web", Some("Prod"));
+        host.port = 2222;
+        host.os = Some("Ubuntu".into());
+        host.tag_names = vec!["db".into(), "eu".into()];
+        host.last_opened_at = Some(1_000);
+        let detail = host_detail(&host, HostStatus::Connected, Some("Direct".into()), 1_030);
+        assert_eq!(detail.name, "web");
+        assert_eq!(detail.address, "me@example:2222");
+        assert_eq!(
+            detail.lines,
+            vec![
+                ("Status", "Connected".into()),
+                ("System", "Ubuntu".into()),
+                ("Folder", "Prod".into()),
+                ("Tags", "db, eu".into()),
+                ("Opened", "just now".into()),
+                ("Route", "Direct".into()),
+            ]
+        );
+
+        let bare = entry("", None);
+        let detail = host_detail(&bare, HostStatus::Offline, None, 0);
+        assert_eq!(detail.name, "example");
+        assert_eq!(detail.address, "me@example");
+        assert_eq!(detail.lines, vec![("Status", "Not connected".into())]);
     }
 
     #[test]

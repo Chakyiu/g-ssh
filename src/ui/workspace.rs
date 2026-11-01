@@ -1,12 +1,13 @@
 //! Tabs for open connections. Each tab is one host's terminal or its SFTP
-//! browser. Dropping a tab on another tab reorders the strip. Dropping it on
-//! an edge splits that cell, so two different connections can sit side by side.
+//! browser. A middle-click closes the tab. Dropping a tab on another tab
+//! reorders the strip. Dropping it on an edge splits that cell, so two
+//! different connections can sit side by side.
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, relative, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EventEmitter, Hsla,
-    MouseButton, Pixels, Point, SharedString, Window,
+    div, relative, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity,
+    EventEmitter, Hsla, MouseButton, Pixels, Point, SharedString, Window,
 };
 
 use gpui_component::{
@@ -510,7 +511,9 @@ impl Workspace {
                 .items_center()
                 .when_some(session.render_forward_chip(cx), |el, chip| el.child(chip))
                 .when_some(session.render_task_pills(cx), |el, pills| el.child(pills))
-                .child(session.render_agent_button(cx))
+                .when_some(session.render_agent_button(cx), |el, button| {
+                    el.child(button)
+                })
                 .child(session.render_server_panel_toggle(cx))
                 .into_any_element()
         })
@@ -569,6 +572,12 @@ impl Workspace {
                     .child("\u{00D7}"),
             )
             .on_click(cx.listener(move |this, _, _, cx| this.activate_doc(ix, cx)))
+            .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    this.close_doc(ix, true, cx);
+                }
+            }))
             .when(self.docs.len() >= 2, |el| {
                 el.on_drag(DraggedDoc { ix }, move |doc, _, _, cx| {
                     let ix = doc.ix;

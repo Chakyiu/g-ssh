@@ -336,6 +336,349 @@ pub fn cpu_percent(previous: &CpuTimes, current: &CpuTimes) -> f32 {
     (total.saturating_sub(idle) as f32 / total as f32 * 100.0).clamp(0.0, 100.0)
 }
 
+/// What this computer is, and how busy it is, in the same text the remote
+/// probe prints. The panel parses both with [`parse_info`] and [`parse_sample`].
+pub fn read_local(needs_info: bool, needs_sample: bool) -> (Option<String>, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_read(needs_info, needs_sample);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_read(needs_info, needs_sample);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let info = needs_info.then(other_os_info);
+        // One unreadable sample, so the panel stops asking.
+        let sample = needs_sample.then(|| "unsupported".to_string());
+        (info, sample)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_read(needs_info: bool, needs_sample: bool) -> (Option<String>, Option<String>) {
+    match (needs_info, needs_sample) {
+        (true, true) => {
+            let output = run_sh(info_and_sample_command());
+            (output.clone(), output)
+        }
+        (true, false) => (run_sh(info_command()), None),
+        (false, true) => (None, run_sh(sample_command())),
+        (false, false) => (None, None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_sh(command: String) -> Option<String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn other_os_info() -> String {
+    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+    format!("@host\n{host}\n@os\nWindows\n")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_read(needs_info: bool, needs_sample: bool) -> (Option<String>, Option<String>) {
+    let info = needs_info.then(macos_info);
+    let sample = needs_sample.then(macos_sample);
+    (info, sample)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_info() -> String {
+    let host = sysctl_string("kern.hostname").unwrap_or_default();
+    let os = macos_product();
+    let kernel = command_line("uname", &["-sr"]).unwrap_or_default();
+    let arch = command_line("uname", &["-m"]).unwrap_or_default();
+    let cpu = sysctl_string("machdep.cpu.brand_string")
+        .filter(|model| !model.is_empty())
+        .or_else(|| sysctl_string("hw.model"))
+        .unwrap_or_default();
+    let cores = sysctl_string("hw.ncpu").unwrap_or_default();
+    let addresses = local_addresses().join(" ");
+    format!(
+        "@host\n{host}\n@os\n{os}\n@kernel\n{kernel}\n@arch\n{arch}\n@cpu\nmodel name: {cpu}\n@cores\n{cores}\n@ip\n{addresses}\n"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_product() -> String {
+    let name = command_line("sw_vers", &["-productName"]).unwrap_or_default();
+    let version = command_line("sw_vers", &["-productVersion"]).unwrap_or_default();
+    format!("{name} {version}").trim().to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sample() -> String {
+    let ticks = cpu_ticks();
+    let (user, nice, system, idle) = ticks.unwrap_or((0, 0, 0, 0));
+    let cores = sysctl_u64("hw.ncpu").unwrap_or(1).max(1);
+    let mut cpu_lines = String::new();
+    for index in 0..cores {
+        cpu_lines.push_str(&format!("cpu{index} 0 0 0 0\n"));
+    }
+    let (total, available, swap_total, swap_free) = memory_kb();
+    let load = load_average();
+    let uptime = uptime_seconds();
+    let (rx, tx) = net_bytes();
+    let df = command_line("df", &["-kP"]).unwrap_or_default();
+    format!(
+        "@stat\ncpu  {user} {nice} {system} {idle}\n{cpu_lines}@mem\nMemTotal: {total} kB\nMemAvailable: {available} kB\nSwapTotal: {swap_total} kB\nSwapFree: {swap_free} kB\n@load\n{load}\n@uptime\n{uptime:.2}\n@net\n  en0: {rx} 0 0 0 0 0 0 0 {tx}\n@df\n{df}\n"
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn cpu_ticks() -> Option<(u64, u64, u64, u64)> {
+    let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    let status = unsafe {
+        libc::host_statistics(
+            libc::mach_host_self(),
+            libc::HOST_CPU_LOAD_INFO,
+            &mut info as *mut _ as libc::host_info_t,
+            &mut count,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let ticks = info.cpu_ticks;
+    let at = |state: libc::c_int| ticks.get(state as usize).copied().unwrap_or(0) as u64;
+    Some((
+        at(libc::CPU_STATE_USER),
+        at(libc::CPU_STATE_NICE),
+        at(libc::CPU_STATE_SYSTEM),
+        at(libc::CPU_STATE_IDLE),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn memory_kb() -> (u64, u64, u64, u64) {
+    let total = sysctl_u64("hw.memsize").unwrap_or(0) / 1024;
+    let page = unsafe { libc::vm_page_size }.max(4096) as u64;
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let status = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            &mut stats as *mut _ as libc::host_info64_t,
+            &mut count,
+        )
+    };
+    if status != 0 {
+        return (total, 0, 0, 0);
+    }
+    let pages = |count: libc::natural_t| count as u64 * page / 1024;
+    // A packed field is read through a pointer so the compiler does not
+    // assume the page counts are aligned.
+    let free = unsafe { std::ptr::addr_of!(stats.free_count).read_unaligned() };
+    let inactive = unsafe { std::ptr::addr_of!(stats.inactive_count).read_unaligned() };
+    let speculative = unsafe { std::ptr::addr_of!(stats.speculative_count).read_unaligned() };
+    let available = pages(free) + pages(inactive) + pages(speculative);
+    (total, available.min(total), 0, 0)
+}
+
+#[cfg(target_os = "macos")]
+fn load_average() -> String {
+    // `{ 1.23 0.90 0.80 }`
+    let raw = command_line("sysctl", &["-n", "vm.loadavg"]).unwrap_or_default();
+    let numbers: Vec<&str> = raw
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .filter(|part| !part.is_empty())
+        .take(3)
+        .collect();
+    if numbers.len() == 3 {
+        format!("{} {} {}", numbers[0], numbers[1], numbers[2])
+    } else {
+        "0 0 0".to_string()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn uptime_seconds() -> f64 {
+    let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let name = std::ffi::CString::new("kern.boottime").unwrap_or_default();
+    let ok = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut boot as *mut _ as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    if !ok || boot.tv_sec <= 0 {
+        return 0.0;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    (now - boot.tv_sec as i64).max(0) as f64
+}
+
+/// Bytes in and out since boot, every interface except loopback.
+#[cfg(target_os = "macos")]
+fn net_bytes() -> (u64, u64) {
+    let text = command_line("netstat", &["-ib"]).unwrap_or_default();
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Link rows carry the counters. A missing hardware address shifts them.
+        if fields.len() < 10
+            || !fields
+                .get(2)
+                .is_some_and(|network| network.starts_with("<Link"))
+        {
+            continue;
+        }
+        if fields[0].starts_with("lo") {
+            continue;
+        }
+        let has_address = fields.get(3).is_some_and(|field| field.contains(':'));
+        let (in_at, out_at) = if has_address { (6, 9) } else { (5, 8) };
+        rx += fields.get(in_at).and_then(|v| v.parse().ok()).unwrap_or(0);
+        tx += fields.get(out_at).and_then(|v| v.parse().ok()).unwrap_or(0);
+    }
+    (rx, tx)
+}
+
+#[cfg(target_os = "macos")]
+fn local_addresses() -> Vec<String> {
+    let mut addresses = Vec::new();
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            return addresses;
+        }
+        let mut current = head;
+        while !current.is_null() {
+            let iface = &*current;
+            let flags = iface.ifa_flags as libc::c_int;
+            let is_up = flags & libc::IFF_UP != 0;
+            let is_loop = flags & libc::IFF_LOOPBACK != 0;
+            if is_up && !is_loop {
+                if let Some(address) = address_of(iface.ifa_addr) {
+                    addresses.push(address);
+                }
+            }
+            current = iface.ifa_next;
+        }
+        libc::freeifaddrs(head);
+    }
+    addresses.sort_by_key(|address| address.contains(':'));
+    addresses.dedup();
+    addresses
+}
+
+#[cfg(target_os = "macos")]
+fn address_of(addr: *const libc::sockaddr) -> Option<String> {
+    if addr.is_null() {
+        return None;
+    }
+    let family = unsafe { (*addr).sa_family as i32 };
+    let text = match family {
+        libc::AF_INET => {
+            let ip = unsafe { (*addr.cast::<libc::sockaddr_in>()).sin_addr.s_addr };
+            let octets = ip.to_ne_bytes();
+            format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+        }
+        libc::AF_INET6 => {
+            let bytes = unsafe { (*addr.cast::<libc::sockaddr_in6>()).sin6_addr.s6_addr };
+            format_ipv6(&bytes)
+        }
+        _ => return None,
+    };
+    // A link-local address is not how you reach this machine.
+    (!text.starts_with("fe80:") && text != "127.0.0.1" && text != "::1").then_some(text)
+}
+
+#[cfg(target_os = "macos")]
+fn format_ipv6(bytes: &[u8; 16]) -> String {
+    let mut parts = [0u16; 8];
+    for (index, part) in parts.iter_mut().enumerate() {
+        *part = u16::from_be_bytes([bytes[index * 2], bytes[index * 2 + 1]]);
+    }
+    parts.map(|part| format!("{part:x}")).join(":")
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let key = std::ffi::CString::new(name).ok()?;
+    let mut len = 0usize;
+    let failed = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0;
+    if failed || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    let failed = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0;
+    if failed {
+        return None;
+    }
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    Some(String::from_utf8_lossy(&buf[..end]).trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    let key = std::ffi::CString::new(name).ok()?;
+    let mut value = 0u64;
+    let mut len = std::mem::size_of::<u64>();
+    let ok = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr(),
+            &mut value as *mut u64 as *mut _,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    ok.then_some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn command_line(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
 pub fn bytes_per_second(previous: u64, current: u64, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
     if seconds <= 0.0 {
@@ -380,6 +723,17 @@ tmpfs               804064      1764    802300       1% /run
 /dev/sdb1        500000000 100000000 400000000      20% /mnt/data disk
 /dev/sda1         98000000  41000000  52000000      45% /var/lib/docker/bind
 ";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_mac_reports_a_name_and_a_cpu_sample() {
+        let (info, sample) = read_local(true, true);
+        let info = parse_info(&info.expect("info"));
+        assert!(!info.hostname.is_empty(), "{info:?}");
+        let sample = parse_sample(&sample.expect("sample")).expect("parse sample");
+        assert!(sample.cpu.total > 0);
+        assert!(sample.memory.total > 0);
+    }
 
     #[test]
     fn a_linux_sample_is_read_whole() {

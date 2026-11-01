@@ -926,7 +926,13 @@ impl ServerSession {
         let server_id = conn_info.id.clone();
         let stored_conn = conn_info.clone();
         let session = cx.entity().downgrade();
-        let server_panel = cx.new(|cx| ServerPanel::new(session, vault_state, cx));
+        let server_panel = cx.new(|cx| {
+            ServerPanel::new(
+                crate::ui::session::panel::PanelHost::Remote(session),
+                vault_state,
+                cx,
+            )
+        });
         cx.subscribe(&server_panel, Self::on_server_panel_event)
             .detach();
 

@@ -183,7 +183,7 @@ pub struct VaultPayload {
 
 /// Where the assistant sends a question, and what it may run without asking.
 /// Empty strings mean the defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSettings {
     #[serde(default)]
     pub base_url: String,
@@ -197,6 +197,26 @@ pub struct AgentSettings {
     /// Command names that run without a prompt. `ls` allows `ls -la`.
     #[serde(default)]
     pub always_allow: Vec<String>,
+    /// The chat button on a terminal. Missing from an older vault, so it stays on.
+    #[serde(default = "agent_enabled_by_default")]
+    pub enabled: bool,
+}
+
+fn agent_enabled_by_default() -> bool {
+    true
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+            system_prompt: String::new(),
+            always_allow: Vec::new(),
+            enabled: true,
+        }
+    }
 }
 
 /// A host folder, for visual grouping only.
