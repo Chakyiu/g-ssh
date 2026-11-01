@@ -1734,14 +1734,15 @@ enum RestoredWait {
 /// What the next pending tool call is waiting on.
 enum PendingStep {
     Ask { command: String },
-    Question(AskedQuestion),
+    /// The question itself stays on the pending call.
+    Question,
     Refuse(String),
 }
 
 fn pending_step(call: &PendingCall) -> PendingStep {
     if call.stored.name == ASK_QUESTION {
         return match &call.question {
-            Some(question) => PendingStep::Question(question.clone()),
+            Some(_) => PendingStep::Question,
             None => {
                 PendingStep::Refuse("ask_question needs a question and at least one option.".into())
             }
@@ -3163,7 +3164,7 @@ impl ServerPanel {
                     cx.notify();
                     return;
                 }
-                Some(PendingStep::Question(_)) => {
+                Some(PendingStep::Question) => {
                     if let Some(agent) = &mut self.agent {
                         agent.other_open = false;
                         agent.phase = Phase::Question;
@@ -5665,7 +5666,7 @@ mod tests {
                 question: Some(question.clone()),
                 result: None,
             }),
-            PendingStep::Question(got) if got == question
+            PendingStep::Question
         ));
     }
 
