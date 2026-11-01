@@ -550,6 +550,13 @@ impl TerminalView {
         self.last_size
     }
 
+    /// Don't take the keyboard the first time this view is drawn. A shell that
+    /// is created and then left before that frame would otherwise steal the
+    /// keys from whatever is on screen. The caller focuses it while it is shown.
+    pub(crate) fn suppress_auto_focus(&mut self) {
+        self.has_auto_focused = true;
+    }
+
     /// Add the server's shell history to the suggestions popup. Called by the
     /// session once the history has been fetched.
     pub fn set_history(&mut self, commands: Vec<String>, cx: &mut Context<Self>) {

@@ -66,6 +66,8 @@ pub enum SidebarEvent {
     DuplicateServerRequested(Uuid),
     DeleteServerRequested(Uuid),
     SettingsRequested,
+    /// Open a terminal on this computer.
+    OpenLocal,
 }
 
 pub struct Sidebar {
@@ -87,6 +89,9 @@ pub struct Sidebar {
     collapsed_groups: HashSet<String>,
     /// The host being dragged, so its row can dim until the gesture ends.
     dragging_host: Option<Uuid>,
+    /// The local terminal row is the one in front. Mutually exclusive with
+    /// [`Self::active_server_id`].
+    local_selected: bool,
     /// The row under the pointer, and whether the host would land after it.
     drop_slot: Option<HostDropSlot>,
 }
@@ -110,11 +115,20 @@ impl Sidebar {
             collapsed_groups: HashSet::new(),
             dragging_host: None,
             drop_slot: None,
+            local_selected: false,
         }
     }
 
     pub fn set_active_server(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.active_server_id = id;
+        self.local_selected = false;
+        cx.notify();
+    }
+
+    /// The local terminal is in front. Clears the host highlight.
+    pub fn show_local(&mut self, cx: &mut Context<Self>) {
+        self.local_selected = true;
+        self.active_server_id = None;
         cx.notify();
     }
 
@@ -1013,10 +1027,10 @@ impl Sidebar {
         }
     }
 
-    /// The way back to the full list of hosts. Selected while no session is
+    /// The way back to the full list of hosts. Selected while that list is
     /// in front.
     fn all_hosts_row(&self, host_count: usize, cx: &mut Context<Self>) -> AnyElement {
-        let is_active = self.active_server_id.is_none();
+        let is_active = !self.local_selected && self.active_server_id.is_none();
         let text = cx.theme().foreground;
         let icon_color = if is_active {
             theme::accent()
@@ -1057,6 +1071,41 @@ impl Sidebar {
                     .child(host_count.to_string()),
             )
             .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::ShowAllServers)))
+            .into_any_element()
+    }
+
+    /// A terminal on this computer, between the host list and the connections.
+    fn local_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_active = self.local_selected;
+        let text = cx.theme().foreground;
+        let icon_color = if is_active {
+            theme::accent()
+        } else {
+            cx.theme().muted_foreground
+        };
+        h_flex()
+            .id("sidebar-local")
+            .h(px(ROW_HEIGHT))
+            .gap(px(8.))
+            .px(px(8.))
+            .rounded(px(6.))
+            .items_center()
+            .cursor_pointer()
+            .text_size(px(13.))
+            .text_color(text)
+            .when(is_active, |el| el.bg(theme::accent_soft()))
+            .when(!is_active, |el| {
+                el.hover(|style| style.bg(theme::field()))
+                    .active(|style| style.bg(theme::element_active()))
+            })
+            .child(
+                Icon::empty()
+                    .path("icons/laptop.svg")
+                    .size(px(14.))
+                    .text_color(icon_color),
+            )
+            .child(div().flex_1().child("Local"))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(SidebarEvent::OpenLocal)))
             .into_any_element()
     }
 
@@ -1135,7 +1184,8 @@ impl Render for Sidebar {
         recents.sort_by_key(|e| std::cmp::Reverse(e.last_opened_at));
         recents.truncate(RECENT_LIMIT);
 
-        let mut content: Vec<AnyElement> = vec![self.all_hosts_row(entries.len(), cx)];
+        let mut content: Vec<AnyElement> =
+            vec![self.all_hosts_row(entries.len(), cx), self.local_row(cx)];
         let mut ui_idx = 0usize;
 
         // With groups, every host stays in its group, including one that is

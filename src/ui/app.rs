@@ -28,6 +28,7 @@ use crate::ui::hosts::import::{plural, ImportView, ImportViewEvent};
 use crate::ui::hosts::list::{ServersView, ServersViewEvent};
 use crate::ui::hosts::sidebar::{HostStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH};
 use crate::ui::keyboard::bind_chord;
+use crate::ui::local::LocalTerminal;
 use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
 use crate::ui::session::{connect_time_message, ForwardRuntime, ServerSession, ServerSessionEvent};
 use crate::ui::settings::{SettingsSection, SettingsView, SettingsViewEvent};
@@ -252,6 +253,10 @@ pub struct AppView {
     active_tab: usize,
     /// Terminal and SFTP tabs, including splits across connections.
     workspace: Entity<Workspace>,
+    /// A shell on this computer. It stays up when the user switches away.
+    local_terminal: Entity<LocalTerminal>,
+    /// The local terminal is in front of the host list and the open connections.
+    showing_local: bool,
 }
 
 impl Focusable for AppView {
@@ -269,6 +274,7 @@ impl AppView {
         let servers_view = cx.new(|cx| ServersView::new(vault_state.clone(), window, cx));
         let sidebar = cx.new(|cx| Sidebar::new(vault_state.clone(), window, cx));
         let workspace = cx.new(|cx| Workspace::new(cx));
+        let local_terminal = cx.new(|_| LocalTerminal::new());
 
         cx.observe(&vault_state, |this, _, cx| this.follow_renamed_hosts(cx))
             .detach();
@@ -282,6 +288,7 @@ impl AppView {
             SidebarEvent::CloseServer(id) => this.close_server_by_id(*id, cx),
             SidebarEvent::AddServerRequested => this.show_server_form(FormMode::Add, window, cx),
             SidebarEvent::ShowAllServers => this.show_all_servers(cx),
+            SidebarEvent::OpenLocal => this.show_local(window, cx),
             SidebarEvent::EditServerRequested(id) => this.show_edit_form(*id, window, cx),
             SidebarEvent::DuplicateServerRequested(id) => this.duplicate_server(*id, cx),
             SidebarEvent::DeleteServerRequested(id) => this.show_remove_dialog(*id, window, cx),
@@ -295,7 +302,11 @@ impl AppView {
             |this, _, event, window, cx| match event {
                 WorkspaceEvent::Activated(id) => {
                     if let Some(idx) = this.tab_index_for_host(id, cx) {
-                        if this.active_tab != idx {
+                        // A connection coming forward leaves the local terminal,
+                        // including when that connection was already the active tab.
+                        let show_it = this.showing_local || this.active_tab != idx;
+                        this.showing_local = false;
+                        if show_it {
                             this.change_active_tab(idx, cx);
                             this.focus_front_tab(window, cx);
                         }
@@ -415,6 +426,8 @@ impl AppView {
             tabs: vec![],
             active_tab: 0,
             workspace,
+            local_terminal,
+            showing_local: false,
         }
     }
 
@@ -465,6 +478,7 @@ impl AppView {
         self.sessions_owed_reconnect.clear();
         self.picker_owed_after_unlock = None;
         self.tabs_owed_after_unlock = None;
+        self.showing_local = false;
         self.change_active_tab(0, cx);
         tracing::info!(
             closed_sessions,
@@ -711,9 +725,13 @@ impl AppView {
                 crate::ui::settings::set_theme_preference(pref, window, cx)
             }
             PaletteCommand::CloseSession => {
-                self.close_tab(self.active_tab, cx);
-                // The palette had the focus; give it to the tab that is now shown.
-                self.set_active_tab(self.active_tab, window, cx);
+                if self.showing_local {
+                    self.close_local_or_leave(cx);
+                } else {
+                    self.close_tab(self.active_tab, cx);
+                    // The palette had the focus; give it to the tab that is now shown.
+                    self.set_active_tab(self.active_tab, window, cx);
+                }
             }
             PaletteCommand::NewTerminal => self.open_extra_terminal(cx),
             PaletteCommand::ToggleSftpPane => self.toggle_sftp_pane(window, cx),
@@ -967,6 +985,13 @@ impl AppView {
     /// Give the keys to the terminal of the tab in front. `false` when there
     /// is no such terminal.
     fn focus_active_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.showing_local {
+            let Some(handle) = self.local_terminal.read(cx).focus_handle(cx) else {
+                return false;
+            };
+            handle.focus(window, cx);
+            return true;
+        }
         let Some(session) = self.tabs.get(self.active_tab) else {
             return false;
         };
@@ -985,6 +1010,7 @@ impl AppView {
         if idx >= self.tabs.len() {
             return;
         }
+        self.showing_local = false;
         self.change_active_tab(idx, cx);
 
         if let Some(session) = self.tabs.get(idx) {
@@ -1018,6 +1044,14 @@ impl AppView {
     /// in the sidebar, a closed tab, a host opened from the list. A dialog
     /// or an overlay keeps the keys until it closes.
     fn focus_front_tab_if_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_local {
+            let id = self.local_terminal.entity_id();
+            if self.focused_tab == Some(id) || self.is_overlay_open(window, cx) {
+                return;
+            }
+            self.focus_local_terminal(window, cx);
+            return;
+        }
         let front = self
             .tabs
             .get(self.active_tab)
@@ -1026,6 +1060,14 @@ impl AppView {
             return;
         }
         self.focus_front_tab(window, cx);
+    }
+
+    fn focus_local_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focused_tab = Some(self.local_terminal.entity_id());
+        match self.local_terminal.read(cx).focus_handle(cx) {
+            Some(target) => target.focus(window, cx),
+            None => self.focus_handle.focus(window, cx),
+        }
     }
 
     /// Show the shortcut hints once the modifier has been held a moment, and
@@ -1074,6 +1116,7 @@ impl AppView {
     fn open_sftp_by_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let server_id = id.to_string();
         if let Some(idx) = self.tab_index_for_host(&server_id, cx) {
+            self.showing_local = false;
             let session = self.tabs[idx].clone();
             self.workspace.update(cx, |workspace, cx| {
                 workspace.open_doc(session, WorkKind::Sftp, cx)
@@ -1089,6 +1132,7 @@ impl AppView {
         let Some(entry) = entry else {
             return;
         };
+        self.showing_local = false;
         self.record_open(id, cx);
         self.connect_with_prompt(entry, ConnectIntent::OpenSftp, window, cx);
     }
@@ -1186,9 +1230,32 @@ impl AppView {
     }
 
     fn show_all_servers(&mut self, cx: &mut Context<Self>) {
+        self.showing_local = false;
         self.workspace
             .update(cx, |workspace, cx| workspace.show_hosts(cx));
         self.change_active_tab(self.tabs.len(), cx);
+    }
+
+    /// Bring the local terminal forward, starting its shell the first time.
+    fn show_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_local = true;
+        self.local_terminal
+            .update(cx, |local, cx| local.ensure_started(cx));
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.show_local(cx));
+        self.focus_local_terminal(window, cx);
+        cx.notify();
+    }
+
+    /// Close one local shell, or leave the local terminal when it is the last.
+    /// The last shell keeps running for the next visit.
+    fn close_local_or_leave(&mut self, cx: &mut Context<Self>) {
+        if self.local_terminal.read(cx).shell_count() > 1 {
+            self.local_terminal
+                .update(cx, |local, cx| local.close_active(cx));
+        } else {
+            self.show_all_servers(cx);
+        }
     }
 
     /// Put open connections in the order the tab strip just landed on.
@@ -1223,9 +1290,13 @@ impl AppView {
 
     fn change_active_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
         self.active_tab = idx;
-        let active_id = self.tabs.get(idx).map(|s| s.read(cx).server_id.clone());
-        self.sidebar
-            .update(cx, |s, cx| s.set_active_server(active_id, cx));
+        // A host rename or a closed background session refreshes this list
+        // without taking the local terminal off the screen.
+        if !self.showing_local {
+            let active_id = self.tabs.get(idx).map(|s| s.read(cx).server_id.clone());
+            self.sidebar
+                .update(cx, |s, cx| s.set_active_server(active_id, cx));
+        }
         self.sync_session_states(cx);
         self.remember_open_tabs(cx);
         cx.notify();
@@ -1356,6 +1427,7 @@ impl AppView {
     }
 
     fn open_server(&mut self, entry: ServerEntry, window: &mut Window, cx: &mut Context<Self>) {
+        self.showing_local = false;
         let server_id = entry.id.to_string();
 
         // Bump recency (covers both opening fresh and re-activating an
@@ -2519,12 +2591,16 @@ impl AppView {
         if self.is_overlay_open(window, cx) {
             return;
         }
+        if self.showing_local {
+            self.close_local_or_leave(cx);
+            return;
+        }
         let idx = self.active_tab;
         self.close_tab(idx, cx);
     }
 
     fn shortcut_toggle_files_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) {
+        if self.is_overlay_open(window, cx) || self.showing_local {
             return;
         }
         let Some(session) = self.tabs.get(self.active_tab) else {
@@ -2565,7 +2641,13 @@ impl AppView {
     }
 
     /// One more shell in the active session, over the connection it has.
+    /// On the local terminal, one more shell on this computer.
     fn open_extra_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.showing_local {
+            self.local_terminal
+                .update(cx, |local, cx| local.open_shell(cx));
+            return;
+        }
         let Some(session) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -2573,6 +2655,9 @@ impl AppView {
     }
 
     fn toggle_sftp_pane(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_local {
+            return;
+        }
         let Some(session) = self.tabs.get(self.active_tab).cloned() else {
             return;
         };
@@ -2589,6 +2674,9 @@ impl AppView {
     }
 
     fn toggle_server_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.showing_local {
+            return;
+        }
         let Some(session) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -2609,7 +2697,7 @@ impl AppView {
     }
 
     fn shortcut_next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) {
+        if self.is_overlay_open(window, cx) || self.showing_local {
             return;
         }
         let Some(next) = next_tab_index(self.active_tab, self.tabs.len()) else {
@@ -2619,7 +2707,7 @@ impl AppView {
     }
 
     fn shortcut_prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) {
+        if self.is_overlay_open(window, cx) || self.showing_local {
             return;
         }
         let Some(prev) = prev_tab_index(self.active_tab, self.tabs.len()) else {
@@ -2629,7 +2717,7 @@ impl AppView {
     }
 
     fn shortcut_activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) {
+        if self.is_overlay_open(window, cx) || self.showing_local {
             return;
         }
         if idx < self.tabs.len() {
@@ -2751,6 +2839,9 @@ impl AppView {
     }
 
     fn render_active_tab(&self, cx: &App) -> AnyElement {
+        if self.showing_local {
+            return self.local_terminal.clone().into_any_element();
+        }
         if self.workspace.read(cx).is_showing_hosts() {
             self.servers_view
                 .clone()

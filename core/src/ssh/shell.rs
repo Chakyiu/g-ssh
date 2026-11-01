@@ -15,7 +15,7 @@ static IS_WINDOW_VISIBLE: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch
 
 /// Minimum time between screen copies while output streams in: the UI draws one per frame
 /// and drops the rest, and copying a big screen costs more than parsing its output.
-const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(4);
+pub(crate) const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(4);
 
 pub fn is_window_visible() -> bool {
     *IS_WINDOW_VISIBLE.borrow()
@@ -23,6 +23,10 @@ pub fn is_window_visible() -> bool {
 
 pub fn set_window_visible(is_visible: bool) {
     IS_WINDOW_VISIBLE.send_replace(is_visible);
+}
+
+pub(crate) fn subscribe_window_visible() -> watch::Receiver<bool> {
+    IS_WINDOW_VISIBLE.subscribe()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -350,6 +354,98 @@ pub enum SnapshotColor {
     Rgb(u8, u8, u8),
 }
 
+/// What a [`ShellCmd`] asks of the emulator. The bytes and the resize also have
+/// to reach the PTY, so those are handed back. The SSH channel and the local
+/// shell both go through this, so selection, search and scrolling stay in step.
+pub(crate) enum ShellCmdEffect {
+    Write(Vec<u8>),
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    /// The screen changed and a snapshot should go out.
+    Snapshot,
+    /// A reply was sent. The screen did not change.
+    Quiet,
+}
+
+pub(crate) fn apply_shell_cmd(emulator: &mut TermEmulator, cmd: ShellCmd) -> ShellCmdEffect {
+    match cmd {
+        ShellCmd::Input(data) => {
+            emulator.scroll_to_bottom();
+            ShellCmdEffect::Write(data)
+        }
+        ShellCmd::Resize { rows, cols } => ShellCmdEffect::Resize { rows, cols },
+        ShellCmd::SetSelection {
+            ty,
+            anchor,
+            anchor_side,
+            head,
+            head_side,
+            reply,
+        } => {
+            let range = emulator.set_selection(ty, anchor, anchor_side, head, head_side);
+            let _ = reply.send(range);
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::UpdateSelectionHead {
+            head,
+            head_side,
+            reply,
+        } => {
+            let range = emulator.update_selection_head(head, head_side);
+            let _ = reply.send(range);
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::ExtractSelectionText { reply } => {
+            let _ = reply.send(emulator.selection_to_string());
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::ExtractSelectionExcerpt { reply } => {
+            let _ = reply.send(emulator.selection_excerpt());
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::ReadTerminal { reply } => {
+            let _ = reply.send(TerminalRead {
+                text: emulator.buffer_text(),
+                alt_screen: emulator.is_alt_screen(),
+            });
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::SelectAll { reply } => {
+            let range = emulator.select_all();
+            let _ = reply.send(range);
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::SetSearch { query, reply } => {
+            let total = emulator.set_search(query);
+            let _ = reply.send(total);
+            ShellCmdEffect::Snapshot
+        }
+        ShellCmd::StepSearch { forward, reply } => {
+            let progress = emulator.step_search(forward);
+            let _ = reply.send(progress);
+            ShellCmdEffect::Snapshot
+        }
+        ShellCmd::ScrollDelta(lines) => {
+            emulator.scroll_delta(lines);
+            ShellCmdEffect::Snapshot
+        }
+        ShellCmd::ScrollToOffset(offset) => {
+            emulator.scroll_to_offset(offset);
+            ShellCmdEffect::Snapshot
+        }
+        ShellCmd::ScrollTo(target) => {
+            emulator.scroll_to(target);
+            ShellCmdEffect::Snapshot
+        }
+        ShellCmd::ClearScrollback => {
+            emulator.clear_scrollback();
+            ShellCmdEffect::Snapshot
+        }
+    }
+}
+
 pub async fn handle_shell_commands(
     mut channel: Channel<russh::client::Msg>,
     initial_rows: u16,
@@ -375,71 +471,26 @@ pub async fn handle_shell_commands(
         tokio::select! {
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Ok(ShellCmd::Input(data)) => {
-                        emulator.scroll_to_bottom();
-                        if let Err(e) = channel.data(data.as_slice()).await {
-                            let _ = event_tx.send(ShellEvent::Error(format!("send input: {e}"))).await;
-                            break;
+                    Ok(cmd) => match apply_shell_cmd(&mut emulator, cmd) {
+                        ShellCmdEffect::Write(data) => {
+                            if let Err(e) = channel.data(data.as_slice()).await {
+                                let _ = event_tx.send(ShellEvent::Error(format!("send input: {e}"))).await;
+                                break;
+                            }
                         }
-                    }
-                    Ok(ShellCmd::Resize { rows, cols }) => {
-                        if let Err(e) = channel.window_change(cols as u32, rows as u32, 0, 0).await {
-                            let _ = event_tx.send(ShellEvent::Error(format!("resize: {e}"))).await;
-                            break;
+                        ShellCmdEffect::Resize { rows, cols } => {
+                            if let Err(e) = channel.window_change(cols as u32, rows as u32, 0, 0).await {
+                                let _ = event_tx.send(ShellEvent::Error(format!("resize: {e}"))).await;
+                                break;
+                            }
+                            emulator.resize(rows, cols);
+                            let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
                         }
-                        emulator.resize(rows, cols);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::SetSelection { ty, anchor, anchor_side, head, head_side, reply }) => {
-                        let range = emulator.set_selection(ty, anchor, anchor_side, head, head_side);
-                        let _ = reply.send(range);
-                    }
-                    Ok(ShellCmd::UpdateSelectionHead { head, head_side, reply }) => {
-                        let range = emulator.update_selection_head(head, head_side);
-                        let _ = reply.send(range);
-                    }
-                    Ok(ShellCmd::ExtractSelectionText { reply }) => {
-                        let _ = reply.send(emulator.selection_to_string());
-                    }
-                    Ok(ShellCmd::ExtractSelectionExcerpt { reply }) => {
-                        let _ = reply.send(emulator.selection_excerpt());
-                    }
-                    Ok(ShellCmd::ReadTerminal { reply }) => {
-                        let _ = reply.send(TerminalRead {
-                            text: emulator.buffer_text(),
-                            alt_screen: emulator.is_alt_screen(),
-                        });
-                    }
-                    Ok(ShellCmd::SelectAll { reply }) => {
-                        let range = emulator.select_all();
-                        let _ = reply.send(range);
-                    }
-                    Ok(ShellCmd::SetSearch { query, reply }) => {
-                        let total = emulator.set_search(query);
-                        let _ = reply.send(total);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::StepSearch { forward, reply }) => {
-                        let progress = emulator.step_search(forward);
-                        let _ = reply.send(progress);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::ScrollDelta(lines)) => {
-                        emulator.scroll_delta(lines);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::ScrollToOffset(offset)) => {
-                        emulator.scroll_to_offset(offset);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::ScrollTo(target)) => {
-                        emulator.scroll_to(target);
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
-                    Ok(ShellCmd::ClearScrollback) => {
-                        emulator.clear_scrollback();
-                        let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
-                    }
+                        ShellCmdEffect::Snapshot => {
+                            let _ = event_tx.send(ShellEvent::Snapshot(emulator.snapshot())).await;
+                        }
+                        ShellCmdEffect::Quiet => {}
+                    },
                     Err(_) => {
                         // The tab was closed. russh does not close a dropped channel, so the
                         // remote shell would otherwise live on until the connection ends.

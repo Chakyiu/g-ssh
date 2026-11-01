@@ -1,5 +1,6 @@
 pub mod connection;
 pub mod forward;
+pub mod local;
 pub mod route;
 pub mod shell;
 pub mod target;

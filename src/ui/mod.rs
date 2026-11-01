@@ -3,6 +3,7 @@ pub mod chrome;
 pub mod hints;
 pub mod hosts;
 pub mod keyboard;
+pub mod local;
 pub mod menu;
 pub mod palette;
 pub mod root;
