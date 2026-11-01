@@ -98,7 +98,14 @@ jobs:
               "$name/"
             if [ "${{ runner.os }}" = "Windows" ]; then
               archive="${name}.zip"
-              tar -a -cf "$archive" "$name"
+              # Git Bash tar is GNU tar. It cannot write a zip, so -a still
+              # stores a tar archive under the .zip name and Explorer rejects
+              # it. scripts/windows-zip.py writes a zip Explorer can open.
+              if command -v py >/dev/null 2>&1; then
+                py -3 scripts/windows-zip.py "$name" "$archive"
+              else
+                python3 scripts/windows-zip.py "$name" "$archive"
+              fi
             else
               archive="${name}.tar.gz"
               tar -czf "$archive" "$name"
