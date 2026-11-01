@@ -87,7 +87,7 @@ fn platform_for(os: &str, arch: &str, is_sandboxed: bool) -> Option<&'static str
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
-    /// Plain text from the release notes. Never shown as markup.
+    /// Markdown from the release notes, cut to a length the dialog can show.
     pub notes: String,
     pub filename: String,
     pub size_bytes: u64,
@@ -244,7 +244,7 @@ fn release_from_github(text: &str, platform: &str) -> Result<Option<Release>, Up
     }
     Ok(Some(Release {
         version,
-        notes: plain_text(page.body.as_deref().unwrap_or("")),
+        notes: release_notes(page.body.as_deref().unwrap_or("")),
         filename: asset.name.clone(),
         size_bytes: asset.size,
         sha256,
@@ -312,8 +312,9 @@ fn safe_tag(tag: &str) -> Option<&str> {
     is_safe.then_some(tag)
 }
 
-/// Notes of a sane length, without invisible characters.
-fn plain_text(text: &str) -> String {
+/// Release notes kept as Markdown, without invisible characters, and cut to
+/// a length the dialog can show.
+fn release_notes(text: &str) -> String {
     text.trim()
         .chars()
         .filter(|&c| matches!(c, '\n' | '\t') || !(c.is_control() || is_invisible(c)))
@@ -460,11 +461,15 @@ fn download_at(
     // Downloaded before, for example from the dialog an hour ago.
     let target = folder.join(&name);
     if is_file_as_announced(&target, release) {
+        // This zip is the one the update will use. Earlier builds in the
+        // folder are finished with.
+        clear_cached_zips(folder, Some(&target));
         return Ok(target);
     }
 
     std::fs::create_dir_all(folder)?;
     remove_stale_parts(folder, STALE_PART_AGE);
+    clear_cached_zips(folder, None);
     let part = part_path(folder, &name);
     let placed = fetch_to(&url, &part, release, is_cancelled, on_progress).and_then(|()| {
         let path = free_path(folder, &name);
@@ -518,6 +523,32 @@ fn part_path(folder: &Path, name: &str) -> PathBuf {
         "{name}.{}{PART_SUFFIX}",
         uuid::Uuid::new_v4().simple()
     ))
+}
+
+/// Remove downloaded `.zip` builds in `folder`. `keep` is the zip this
+/// update is still using. Part files and the swap log stay.
+fn clear_cached_zips(folder: &Path, keep: Option<&Path>) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.is_some_and(|keep| path == keep) {
+            continue;
+        }
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().ends_with(".zip") {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!(?e, path = %path.display(), "could not remove an old update zip");
+        }
+    }
 }
 
 /// g-ssh was quit or killed in the middle of a download: its part file is
@@ -1529,6 +1560,84 @@ mod tests {
             "{request}"
         );
         assert!(!request.contains("evil.example"), "{request}");
+    }
+
+    #[test]
+    fn older_zips_are_removed_when_a_new_build_is_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("g-ssh-0.1.0-windows-x86_64.zip");
+        let copy = dir.path().join("g-ssh-0.1.0-windows-x86_64 (1).zip");
+        let log = dir.path().join("swap.log");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&copy, b"copy").unwrap();
+        std::fs::write(&log, b"log").unwrap();
+        let (origin, served) = serve_once(file_answer(b"hello"));
+
+        let path = download_at(
+            &download_base(&origin),
+            &hello_release(),
+            dir.path(),
+            &not_cancelled(),
+            |_| {},
+        )
+        .unwrap();
+        served.join().unwrap();
+
+        assert_eq!(path, dir.path().join(HELLO_FILE));
+        assert!(!old.exists());
+        assert!(!copy.exists());
+        assert_eq!(std::fs::read(&log).unwrap(), b"log");
+    }
+
+    #[test]
+    fn a_zip_already_downloaded_is_kept_and_older_zips_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = Release {
+            filename: "g-ssh-0.2.0-windows-x86_64.zip".into(),
+            ..hello_release()
+        };
+        let current = dir.path().join(&release.filename);
+        let old = dir.path().join("g-ssh-0.1.9-windows-x86_64.zip");
+        std::fs::write(&current, b"hello").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+
+        let found = download_at(
+            "http://127.0.0.1:1/Chakyiu/g-ssh/releases/download",
+            &release,
+            dir.path(),
+            &not_cancelled(),
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(found, current);
+        assert_eq!(std::fs::read(&current).unwrap(), b"hello");
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn a_different_zip_of_the_same_name_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = Release {
+            filename: "g-ssh-0.2.0-windows-x86_64.zip".into(),
+            ..hello_release()
+        };
+        std::fs::write(dir.path().join(&release.filename), b"nope!").unwrap();
+        let (origin, served) = serve_once(file_answer(b"hello"));
+
+        let path = download_at(
+            &download_base(&origin),
+            &release,
+            dir.path(),
+            &not_cancelled(),
+            |_| {},
+        )
+        .unwrap();
+        served.join().unwrap();
+
+        assert_eq!(path, dir.path().join(&release.filename));
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert_eq!(files_in(&dir), [release.filename.as_str()]);
     }
 
     #[test]

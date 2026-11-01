@@ -1,6 +1,7 @@
 # Builds g-ssh-<version>-windows-x86_64.msi from a folder that already
 # holds g-ssh.exe and update.exe. WiX is installed with:
 #   dotnet tool install --global wix --version 5.0.2
+#   wix extension add -g WixToolset.UI.wixext/5.0.2
 param(
     [Parameter(Mandatory = $true)][string] $Version,
     [Parameter(Mandatory = $true)][string] $PayloadDir,
@@ -28,8 +29,20 @@ $msiVersion = ($parts[0..3] -join ".")
 $here = Split-Path -Parent $PSCommandPath
 $source = Join-Path $here "..\packaging\windows\Package.wxs"
 $payload = (Resolve-Path -LiteralPath $PayloadDir).Path
+$uiExt = "WixToolset.UI.wixext/5.0.2"
 
-& $wix build $source -d "Version=$msiVersion" -d "PayloadDir=$payload" -o $Output
+$listed = & $wix extension list -g
+if ($LASTEXITCODE -ne 0) {
+    throw "wix extension list failed with exit code $LASTEXITCODE"
+}
+if (-not (($listed | Out-String) -match "WixToolset\.UI\.wixext\s+5\.0\.2")) {
+    & $wix extension add -g $uiExt
+    if ($LASTEXITCODE -ne 0) {
+        throw "wix extension add failed with exit code $LASTEXITCODE"
+    }
+}
+
+& $wix build -ext $uiExt $source -d "Version=$msiVersion" -d "PayloadDir=$payload" -o $Output
 if ($LASTEXITCODE -ne 0) {
     throw "wix build failed with exit code $LASTEXITCODE"
 }

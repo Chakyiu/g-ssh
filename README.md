@@ -111,8 +111,9 @@ alone.
 ## Windows
 
 The release page has an `.msi` and a `.zip`. The installer is the one to
-run. It puts `g-ssh.exe` and `update.exe` in `%LOCALAPPDATA%\g-ssh` and
-adds a Start menu shortcut. No admin prompt.
+run. It asks for a folder, suggests `%LOCALAPPDATA%\g-ssh`, and adds a
+Start menu shortcut. No admin prompt, so choose a folder your account can
+write.
 
 Update still downloads the `.zip`. `update.exe` waits until g-ssh has quit,
 replaces `g-ssh.exe`, and opens the new one. The `.zip` is also what an

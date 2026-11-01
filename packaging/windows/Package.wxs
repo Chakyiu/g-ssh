@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <!--
-    Per-user install. The files land in %LOCALAPPDATA%\g-ssh, which the
-    updater can write without an admin prompt. UpgradeCode stays fixed so
-    a later MSI replaces this one.
+    Per-user install. The wizard asks for a folder and suggests
+    %LOCALAPPDATA%\g-ssh, which this account can write without an admin
+    prompt. The updater replaces the exe it was started from, so a chosen
+    folder still updates. UpgradeCode stays fixed so a later MSI replaces
+    this one.
+
+    WiX assigns a new ProductCode on every build. AllowSameVersionUpgrades
+    makes that rebuild replace an install of the same version. The previous
+    folder is stored in HKCU so the wizard offers it again.
   -->
   <Package
       Name="g-ssh"
@@ -13,7 +20,12 @@
       Scope="perUser"
       Compressed="yes">
     <SummaryInformation Description="SSH and SFTP client" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of g-ssh is already installed." />
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of g-ssh is already installed." />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)license.rtf" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" />
     <MediaTemplate EmbedCab="yes" />
     <Feature Id="Main">
       <ComponentGroupRef Id="InstallFiles" />
@@ -22,10 +34,22 @@
   </Package>
 
   <Fragment>
+    <UIRef Id="WixUI_ErrorProgressText" />
+  </Fragment>
+
+  <Fragment>
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch
+          Id="PreviousInstallFolder"
+          Root="HKCU"
+          Key="Software\g-ssh"
+          Name="InstallFolder"
+          Type="directory" />
+    </Property>
     <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="InstallFolder" Name="g-ssh" />
+      <Directory Id="INSTALLFOLDER" Name="g-ssh" />
     </StandardDirectory>
-    <ComponentGroup Id="InstallFiles" Directory="InstallFolder">
+    <ComponentGroup Id="InstallFiles" Directory="INSTALLFOLDER">
       <Component Id="AppExe" Guid="c3a1e7b4-2d58-4f16-9a0e-7b6d4c8f1e20">
         <File Id="GsshExe" Source="$(var.PayloadDir)\g-ssh.exe" KeyPath="yes" />
       </Component>
@@ -43,8 +67,8 @@
               Id="ApplicationStartMenuShortcut"
               Name="g-ssh"
               Description="SSH and SFTP client"
-              Target="[InstallFolder]g-ssh.exe"
-              WorkingDirectory="InstallFolder" />
+              Target="[INSTALLFOLDER]g-ssh.exe"
+              WorkingDirectory="INSTALLFOLDER" />
           <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
               Root="HKCU"
@@ -53,6 +77,12 @@
               Type="integer"
               Value="1"
               KeyPath="yes" />
+          <RegistryValue
+              Root="HKCU"
+              Key="Software\g-ssh"
+              Name="InstallFolder"
+              Type="string"
+              Value="[INSTALLFOLDER]" />
         </Component>
       </Directory>
     </StandardDirectory>

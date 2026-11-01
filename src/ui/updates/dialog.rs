@@ -3,8 +3,9 @@
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, Context, EventEmitter, Window};
+use gpui::{div, rems, Context, EventEmitter, Window};
 
+use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogHeader, DialogTitle},
@@ -137,16 +138,20 @@ impl Render for UpdateView {
             body.child(
                 div()
                     .id("update-notes")
+                    .w_full()
                     .max_h(px(180.))
                     .overflow_y_scroll()
                     .rounded(px(4.))
                     .border_1()
                     .border_color(border)
                     .p(px(8.))
-                    .text_size(px(12.))
-                    .text_color(fg)
-                    // Plain text: a string child is never read as markup.
-                    .child(notes),
+                    .child(
+                        TextView::markdown("update-notes-body", notes)
+                            .selectable(true)
+                            .text_size(px(12.))
+                            .text_color(fg)
+                            .style(TextViewStyle::default().paragraph_gap(rems(0.35))),
+                    ),
             )
         })
         .child(div().text_size(px(11.)).text_color(muted_fg).child(format!(

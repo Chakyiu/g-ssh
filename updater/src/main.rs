@@ -43,14 +43,54 @@ fn run(args: impl Iterator<Item = OsString>) -> Result<(), String> {
     #[cfg(windows)]
     std::thread::sleep(Duration::from_millis(500));
     let trash = install_payload(&job.dest, &job.source)?;
-    launch(&job.dest.join("g-ssh.exe"))?;
+    let launch_result = launch(&job.dest.join("g-ssh.exe"));
     let mut leftovers = vec![job.source];
-    if let Some(archive) = job.archive {
-        leftovers.push(archive);
+    if let Some(archive) = &job.archive {
+        leftovers.extend(clear_update_zips(archive));
     }
     leftovers.extend(trash);
     schedule_delete(&leftovers);
-    Ok(())
+    launch_result
+}
+
+/// Remove `.zip` builds from the updates folder. The archive just applied is
+/// one of them. A zip that is still locked is returned so the caller can
+/// retry. A zip outside that folder is removed on its own.
+fn clear_update_zips(archive: &Path) -> Vec<PathBuf> {
+    let Some(folder) = archive.parent() else {
+        return locked(archive);
+    };
+    if folder.file_name().and_then(|name| name.to_str()) != Some("updates") {
+        return locked(archive);
+    }
+    let Ok(entries) = fs::read_dir(folder) else {
+        return locked(archive);
+    };
+    let mut pending = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().ends_with(".zip") {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if fs::remove_file(&path).is_err() && path.exists() {
+            pending.push(path);
+        }
+    }
+    pending
+}
+
+fn locked(path: &Path) -> Vec<PathBuf> {
+    if fs::remove_file(path).is_err() && path.exists() {
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
+    }
 }
 
 struct Job {
@@ -388,6 +428,34 @@ mod tests {
         assert_eq!(fs::read(dest.join("g-ssh.exe")).unwrap(), b"new-app");
         assert_eq!(fs::read(dest.join("update.exe")).unwrap(), b"new-update");
         assert_eq!(fs::read(source.join("g-ssh.exe")).unwrap(), b"new-app");
+    }
+
+    #[test]
+    fn zips_in_the_updates_folder_are_removed_after_an_update() {
+        let dir = tempfile_dir();
+        let updates = dir.join("g-ssh").join("updates");
+        fs::create_dir_all(&updates).unwrap();
+        let current = updates.join("g-ssh-0.2.6-windows-x86_64.zip");
+        let old = updates.join("g-ssh-0.2.5-windows-x86_64.zip");
+        let log = updates.join("swap.log");
+        fs::write(&current, b"new").unwrap();
+        fs::write(&old, b"old").unwrap();
+        fs::write(&log, b"log").unwrap();
+
+        let pending = clear_update_zips(&current);
+        assert!(pending.is_empty());
+        assert!(!current.exists());
+        assert!(!old.exists());
+        assert_eq!(fs::read(&log).unwrap(), b"log");
+
+        let other = dir.join("notes.zip");
+        let sibling = dir.join("taxes.zip");
+        fs::write(&other, b"a").unwrap();
+        fs::write(&sibling, b"b").unwrap();
+        let pending = clear_update_zips(&other);
+        assert!(pending.is_empty());
+        assert!(!other.exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"b");
     }
 
     #[test]
