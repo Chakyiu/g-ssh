@@ -1037,6 +1037,7 @@ fn validate_bundle(app: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+#[cfg(any(windows, test))]
 fn find_named_file(root: &Path, name: &str) -> Result<PathBuf, UpdateError> {
     let mut found = Vec::new();
     visit_files(root, name, &mut found)?;
@@ -1046,6 +1047,7 @@ fn find_named_file(root: &Path, name: &str) -> Result<PathBuf, UpdateError> {
     }
 }
 
+#[cfg(any(windows, test))]
 fn visit_files(dir: &Path, name: &str, found: &mut Vec<PathBuf>) -> Result<(), UpdateError> {
     let entries = fs::read_dir(dir).map_err(|_| UpdateError::NotAnApp)?;
     for entry in entries {
