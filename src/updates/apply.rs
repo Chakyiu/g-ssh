@@ -6,6 +6,11 @@
 //! second copy of g-ssh, and the caller quits. That second copy waits until
 //! this process is gone, moves the new app into place, and opens it.
 //!
+//! Windows can rename the running exe aside and copy the new one onto its
+//! path. This process does that itself, then a detached command waits until
+//! it has quit and opens the new exe. A helper is only the fallback for when
+//! the running file cannot be moved.
+//!
 //! macOS publishes a disk image of `g-ssh.app`. Windows publishes a zip of
 //! `g-ssh.exe`. The signature on the Mac build is ad-hoc, so Gatekeeper
 //! would refuse to reopen a quarantined copy. The archive was already
@@ -48,8 +53,45 @@ pub fn finish_if_requested() {
     std::process::exit(code);
 }
 
+/// When this exe was unpacked next to the installed one and then started,
+/// copy it over that install and reopen it.
+///
+/// A build from before this waits for a helper that never moves the file, so
+/// the new exe is left in `.g-ssh-update-<hex>`. Starting that exe finishes
+/// the install.
+pub fn adopt_if_staged() {
+    #[cfg(windows)]
+    if let Err(error) = adopt_staged_exe() {
+        log_line(&error.to_string());
+    }
+}
+
+#[cfg(windows)]
+fn adopt_staged_exe() -> Result<(), UpdateError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| UpdateError::Install(format!("could not find this app: {e}")))?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let Some(dest) = staged_install_target(&exe) else {
+        return Ok(());
+    };
+    if !parent_is_writable(&dest) {
+        return Ok(());
+    }
+    let trash = replace_installed_exe(&dest, &exe)?;
+    let mut leftovers = vec![exe
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(bad_installer_args)?];
+    if let Some(trash) = trash {
+        leftovers.push(trash);
+    }
+    reopen_after_exit(&dest, std::process::id(), &leftovers);
+    std::process::exit(0);
+}
+
 /// Copy `archive` over this app and arm the installer. The caller quits when
-/// this returns. Nothing is replaced while this process is still running.
+/// this returns. On macOS the files stay put until this process has quit.
+/// On Windows the new exe is already in place, and it opens after the quit.
 pub fn install(archive: &Path, is_cancelled: &AtomicBool, token: &str) -> Result<(), UpdateError> {
     if is_cancelled.load(Ordering::Relaxed) {
         return Err(UpdateError::Cancelled);
@@ -155,11 +197,52 @@ fn install_windows(
     let payload = staged.dir.join("g-ssh.exe");
     fs::copy(&exe, &payload)
         .map_err(|e| UpdateError::Install(format!("could not copy the new app: {e}")))?;
+    let updater = match find_optional_file(&unpack, "update.exe")? {
+        Some(src) => {
+            let updater = staged.dir.join("update.exe");
+            fs::copy(&src, &updater)
+                .map_err(|e| UpdateError::Install(format!("could not copy the updater: {e}")))?;
+            Some(updater)
+        }
+        None => None,
+    };
     let _ = fs::remove_dir_all(&unpack);
+    clear_download_mark(&payload);
+    if let Some(updater) = &updater {
+        clear_download_mark(updater);
+    }
     if is_cancelled.load(Ordering::Relaxed) {
         return Err(UpdateError::Cancelled);
     }
 
+    // update.exe is a different file from g-ssh.exe, so it can replace
+    // g-ssh.exe after this process quits and Windows releases the file.
+    if let Some(updater) = updater {
+        launch_update_exe(&updater, &parent, &staged.dir, archive)?;
+        staged.keep();
+        return Ok(());
+    }
+
+    // Rename this running exe aside and copy the new one onto its path.
+    // Windows allows the rename. The process keeps running from the old file
+    // under its new name until it quits.
+    if let Ok(trash) = replace_installed_exe(&dest, &payload) {
+        let stage_path = staged.dir.clone();
+        staged.keep();
+        let _ = fs::remove_dir_all(&stage_path);
+        let mut leftovers = vec![archive.to_path_buf()];
+        if let Some(trash) = trash {
+            leftovers.push(trash);
+        }
+        if stage_path.exists() {
+            leftovers.push(stage_path);
+        }
+        reopen_after_exit(&dest, std::process::id(), &leftovers);
+        return Ok(());
+    }
+
+    // The running file could not be moved. The new exe is not that file, so
+    // it can copy itself into place once this process has quit and released it.
     let request = SwapRequest {
         pid: std::process::id(),
         dest,
@@ -171,6 +254,35 @@ fn install_windows(
     spawn_installer(&request)?;
     staged.keep();
     Ok(())
+}
+
+/// Start the staged `update.exe`. It waits for this process to quit, then
+/// copies the new exe into the install folder and opens it.
+#[cfg(windows)]
+fn launch_update_exe(
+    updater: &Path,
+    dest_dir: &Path,
+    source: &Path,
+    archive: &Path,
+) -> Result<(), UpdateError> {
+    let mut cmd = Command::new(updater);
+    cmd.arg("--pid")
+        .arg(std::process::id().to_string())
+        .arg("--dest")
+        .arg(dest_dir)
+        .arg("--source")
+        .arg(source)
+        .arg("--archive")
+        .arg(archive);
+    if let Some(dir) = super::cache_dir() {
+        cmd.arg("--log").arg(dir.join("swap.log"));
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    spawn_detached(cmd)
+        .map(|_| ())
+        .map_err(|e| UpdateError::Install(format!("could not start the installer: {e}")))
 }
 
 struct SwapRequest {
@@ -237,7 +349,12 @@ fn finish_from_args(mut args: impl Iterator<Item = OsString>) -> Result<(), Upda
         request.dest.display()
     ));
     match wait_for_parent(request.pid, &request.token) {
-        Wait::Quit => {}
+        Wait::Quit => {
+            // The process object can disappear before Windows releases the
+            // image. The replace below retries; this covers the usual gap.
+            #[cfg(windows)]
+            std::thread::sleep(Duration::from_millis(500));
+        }
         Wait::Cancelled => {
             let _ = fs::remove_dir_all(&request.stage_dir);
             if let Some(path) = cancel_path(&request.token) {
@@ -258,7 +375,7 @@ fn finish_from_args(mut args: impl Iterator<Item = OsString>) -> Result<(), Upda
         let _ = fs::remove_dir_all(&request.stage_dir);
         return Err(UpdateError::NotAnApp);
     }
-    let trash = match swap_in(&request.dest, &request.staged) {
+    let trash = match take_places(&request) {
         Ok(trash) => trash,
         Err(error) => {
             let _ = fs::remove_dir_all(&request.stage_dir);
@@ -650,8 +767,9 @@ fn command_error(what: &str, output: &std::process::Output) -> UpdateError {
 
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn spawn_installer(request: &SwapRequest) -> Result<(), UpdateError> {
-    let exe = std::env::current_exe()
-        .map_err(|e| UpdateError::Install(format!("could not find this app: {e}")))?;
+    #[cfg(windows)]
+    clear_download_mark(&request.staged);
+    let exe = installer_program(request)?;
     let (reader, writer) = std::io::pipe()
         .map_err(|e| UpdateError::Install(format!("could not start the installer: {e}")))?;
     let mut cmd = Command::new(exe);
@@ -665,9 +783,7 @@ fn spawn_installer(request: &SwapRequest) -> Result<(), UpdateError> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer))
         .stderr(swap_log());
-    detach(&mut cmd);
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_detached(cmd)
         .map_err(|e| UpdateError::Install(format!("could not start the installer: {e}")))?;
     if !installer_is_ready(reader) {
         let _ = child.kill();
@@ -689,7 +805,26 @@ fn installer_is_ready(reader: std::io::PipeReader) -> bool {
     rx.recv_timeout(READY_WAIT).unwrap_or(false)
 }
 
-fn detach(cmd: &mut Command) {
+/// The program that waits for this process to quit and then swaps the files.
+///
+/// Windows cannot rename `g-ssh.exe` while a process is still running from
+/// that file. The helper is the staged exe, so once this process exits the
+/// installed file is free.
+fn installer_program(request: &SwapRequest) -> Result<PathBuf, UpdateError> {
+    #[cfg(windows)]
+    {
+        Ok(request.staged.clone())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+        std::env::current_exe()
+            .map_err(|e| UpdateError::Install(format!("could not find this app: {e}")))
+    }
+}
+
+/// Start `cmd` so it keeps running after this process exits.
+fn spawn_detached(mut cmd: Command) -> std::io::Result<std::process::Child> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -706,10 +841,119 @@ fn detach(cmd: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        // A job that kills its children on close would take the helper with
+        // this process. Break away when the job allows it, and start inside
+        // the job when it does not.
+        cmd.creation_flags(windows_creation_flags(true));
+        if let Ok(child) = cmd.spawn() {
+            return Ok(child);
+        }
+        cmd.creation_flags(windows_creation_flags(false));
     }
+    cmd.spawn()
+}
+
+#[cfg(windows)]
+fn windows_creation_flags(breakaway: bool) -> u32 {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    if breakaway {
+        flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+    flags
+}
+
+/// Drop the mark Windows puts on a downloaded file, so opening the staged
+/// exe does not stop on SmartScreen.
+#[cfg(windows)]
+fn clear_download_mark(path: &Path) {
+    let mut marked = path.as_os_str().to_os_string();
+    marked.push(":Zone.Identifier");
+    let _ = fs::remove_file(marked);
+}
+
+/// `\\?\` paths confuse PowerShell. The same path without that prefix is
+/// what `Start-Process` and `Remove-Item` expect.
+#[cfg(any(windows, test))]
+fn plain_windows_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path.to_path_buf();
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    PathBuf::from(rest)
+}
+
+/// The installed `g-ssh.exe` when `exe` is `.g-ssh-update-<hex>\g-ssh.exe`.
+#[cfg(any(windows, test))]
+fn staged_install_target(exe: &Path) -> Option<PathBuf> {
+    if exe.file_name() != Some(OsStr::new("g-ssh.exe")) {
+        return None;
+    }
+    let stage = exe.parent()?;
+    let name = stage.file_name().and_then(|name| name.to_str())?;
+    if !is_stage_name(name) {
+        return None;
+    }
+    let dest = stage.parent()?.join("g-ssh.exe");
+    if dest == exe {
+        None
+    } else {
+        Some(dest)
+    }
+}
+
+/// After this process exits, open `dest` and delete `leftovers`.
+#[cfg(windows)]
+fn reopen_after_exit(dest: &Path, pid: u32, leftovers: &[PathBuf]) {
+    if let Err(error) = handoff_windows(dest, pid, leftovers) {
+        log_line(&error.to_string());
+        let _ = spawn_detached(Command::new(plain_windows_path(dest)));
+    }
+}
+
+#[cfg(windows)]
+fn handoff_windows(dest: &Path, pid: u32, leftovers: &[PathBuf]) -> Result<(), UpdateError> {
+    let Some(dir) = super::cache_dir() else {
+        return Err(UpdateError::Install(
+            "could not find a place to store the update".into(),
+        ));
+    };
+    let list_path = dir.join(format!("cleanup-{}", uuid::Uuid::new_v4().simple()));
+    let mut text = String::new();
+    for path in leftovers {
+        let line = plain_windows_path(path);
+        let line = line.to_string_lossy();
+        if line.is_empty() || line.contains('\n') {
+            continue;
+        }
+        text.push_str(&line);
+        text.push('\n');
+    }
+    fs::write(&list_path, text)
+        .map_err(|e| UpdateError::Install(format!("could not reopen g-ssh: {e}")))?;
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        "$deadline = (Get-Date).AddMinutes(2); while ((Get-Process -Id $env:GSSH_PID -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 300 }; for ($i = 0; $i -lt 30; $i++) { try { Start-Process -FilePath $env:GSSH_RELAUNCH -ErrorAction Stop; break } catch { Start-Sleep -Seconds 1 } }; $cleanupDeadline = (Get-Date).AddMinutes(2); do { Start-Sleep -Seconds 1; $paths = @(Get-Content -LiteralPath $env:GSSH_CLEANUP); foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }; $left = $false; foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { $left = $true } } } while ($left -and ((Get-Date) -lt $cleanupDeadline)); Remove-Item -LiteralPath $env:GSSH_CLEANUP -Force -ErrorAction SilentlyContinue",
+    ])
+    .env("GSSH_PID", pid.to_string())
+    .env("GSSH_RELAUNCH", plain_windows_path(dest))
+    .env("GSSH_CLEANUP", &list_path)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    spawn_detached(cmd)
+        .map(|_| ())
+        .map_err(|e| UpdateError::Install(format!("could not reopen g-ssh: {e}")))
 }
 
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
@@ -827,10 +1071,12 @@ fn swap_in(dest: &Path, staged: &Path) -> Result<Option<PathBuf>, UpdateError> {
     };
     let trash = parent.join(format!(".g-ssh-old-{}", uuid::Uuid::new_v4().simple()));
     let had_dest = dest.exists();
-    if had_dest && fs::rename(dest, &trash).is_err() {
-        return Err(UpdateError::Install(
-            "could not move the current app aside".into(),
-        ));
+    if had_dest {
+        if let Err(error) = fs::rename(dest, &trash) {
+            return Err(UpdateError::Install(format!(
+                "could not move the current app aside: {error}"
+            )));
+        }
     }
     if let Err(error) = fs::rename(staged, dest) {
         if had_dest {
@@ -840,6 +1086,75 @@ fn swap_in(dest: &Path, staged: &Path) -> Result<Option<PathBuf>, UpdateError> {
             "could not move the new app into place: {error}"
         )));
     }
+    Ok(had_dest.then_some(trash))
+}
+
+/// Put the staged payload in `dest`'s place. On Windows the helper is running
+/// from the staged exe, so that file is copied rather than renamed: Windows
+/// will not rename an image a process is still running from.
+fn take_places(request: &SwapRequest) -> Result<Option<PathBuf>, UpdateError> {
+    #[cfg(windows)]
+    {
+        replace_installed_exe(&request.dest, &request.staged)
+    }
+    #[cfg(not(windows))]
+    {
+        swap_in(&request.dest, &request.staged)
+    }
+}
+
+/// How many times to try the replace after the old process has quit.
+/// OneDrive and the image map both hold the exe for a moment.
+#[cfg(windows)]
+fn replace_installed_exe(dest: &Path, staged: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    const ATTEMPTS: u32 = 40;
+    let mut last = UpdateError::Install("could not move the new app into place".into());
+    for attempt in 0..ATTEMPTS {
+        match replace_installed_exe_once(dest, staged) {
+            Ok(trash) => return Ok(trash),
+            Err(error) => {
+                log_line(&error.to_string());
+                last = error;
+                if attempt + 1 != ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Move the installed exe aside and copy the staged exe onto its path.
+/// The staged file stays, because the helper is running from it.
+#[cfg(any(windows, test))]
+fn replace_installed_exe_once(dest: &Path, staged: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    if dest == staged {
+        return Err(UpdateError::Install(
+            "could not move the new app into place".into(),
+        ));
+    }
+    let Some(parent) = dest.parent() else {
+        return Err(UpdateError::NotWritable);
+    };
+    let trash = parent.join(format!(".g-ssh-old-{}", uuid::Uuid::new_v4().simple()));
+    let had_dest = dest.exists();
+    if had_dest {
+        if let Err(error) = fs::rename(dest, &trash) {
+            return Err(UpdateError::Install(format!(
+                "could not move the current app aside: {error}"
+            )));
+        }
+    }
+    if let Err(error) = fs::copy(staged, dest) {
+        if had_dest {
+            let _ = fs::rename(&trash, dest);
+        }
+        return Err(UpdateError::Install(format!(
+            "could not move the new app into place: {error}"
+        )));
+    }
+    #[cfg(windows)]
+    clear_download_mark(dest);
     Ok(had_dest.then_some(trash))
 }
 
@@ -857,12 +1172,8 @@ fn relaunch(dest: &Path) -> Result<(), UpdateError> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        return Command::new(dest)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn()
+        clear_download_mark(dest);
+        return spawn_detached(Command::new(dest))
             .map(|_| ())
             .map_err(|e| UpdateError::Install(format!("could not reopen g-ssh: {e}")));
     }
@@ -888,8 +1199,8 @@ fn remove_leftovers(paths: &[PathBuf]) {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // The installer is still running from the old copy, so that folder
-    // cannot be deleted yet. A second process deletes it after we exit.
+    // The helper is still running from the staged copy, so that folder cannot
+    // be deleted yet. A second process deletes it after we exit.
     schedule_cleanup(&pending);
 }
 
@@ -909,8 +1220,7 @@ fn schedule_cleanup(paths: &[PathBuf]) {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        detach(&mut cmd);
-        let _ = cmd.spawn();
+        let _ = spawn_detached(cmd);
     }
     #[cfg(windows)]
     {
@@ -937,14 +1247,13 @@ fn schedule_cleanup(paths: &[PathBuf]) {
             "-WindowStyle",
             "Hidden",
             "-Command",
-            "Start-Sleep -Seconds 1; Get-Content -LiteralPath $env:GSSH_CLEANUP | ForEach-Object { if ($_) { Remove-Item -LiteralPath $_ -Recurse -Force -ErrorAction SilentlyContinue } }; Remove-Item -LiteralPath $env:GSSH_CLEANUP -Force -ErrorAction SilentlyContinue",
+            "$deadline = (Get-Date).AddMinutes(2); do { Start-Sleep -Seconds 1; $paths = @(Get-Content -LiteralPath $env:GSSH_CLEANUP); foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }; $left = $false; foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { $left = $true } } } while ($left -and (Get-Date) -lt $deadline); Remove-Item -LiteralPath $env:GSSH_CLEANUP -Force -ErrorAction SilentlyContinue",
         ])
         .env("GSSH_CLEANUP", &list_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-        detach(&mut cmd);
-        let _ = cmd.spawn();
+        let _ = spawn_detached(cmd);
     }
 }
 
@@ -1001,17 +1310,25 @@ fn process_exists(pid: u32) -> bool {
         extern "system" {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
             fn CloseHandle(handle: isize) -> i32;
+            fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
             fn GetLastError() -> u32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const ERROR_ACCESS_DENIED: u32 = 5;
+        /// `GetExitCodeProcess` reports this until the process has actually exited.
+        const STILL_ACTIVE: u32 = 259;
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle != 0 {
-                CloseHandle(handle);
+            if handle == 0 {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            if ok == 0 {
                 return true;
             }
-            GetLastError() == ERROR_ACCESS_DENIED
+            code == STILL_ACTIVE
         }
     }
 }
@@ -1106,10 +1423,19 @@ fn validate_bundle(app: &Path) -> Result<(), UpdateError> {
 
 #[cfg(any(windows, test))]
 fn find_named_file(root: &Path, name: &str) -> Result<PathBuf, UpdateError> {
+    match find_optional_file(root, name)? {
+        Some(path) => Ok(path),
+        None => Err(UpdateError::NotAnApp),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn find_optional_file(root: &Path, name: &str) -> Result<Option<PathBuf>, UpdateError> {
     let mut found = Vec::new();
     visit_files(root, name, &mut found)?;
     match found.len() {
-        1 => Ok(found.remove(0)),
+        0 => Ok(None),
+        1 => Ok(Some(found.remove(0))),
         _ => Err(UpdateError::NotAnApp),
     }
 }
@@ -1496,6 +1822,16 @@ mod tests {
             find_named_file(dir.path(), "g-ssh.exe").unwrap(),
             nested.join("g-ssh.exe")
         );
+        assert!(find_optional_file(dir.path(), "update.exe")
+            .unwrap()
+            .is_none());
+        fs::write(nested.join("update.exe"), b"update").unwrap();
+        assert_eq!(
+            find_optional_file(dir.path(), "update.exe")
+                .unwrap()
+                .unwrap(),
+            nested.join("update.exe")
+        );
 
         fs::write(dir.path().join("g-ssh.exe"), b"second").unwrap();
         assert!(matches!(
@@ -1547,6 +1883,71 @@ mod tests {
 
         assert!(matches!(error, UpdateError::Install(_)), "{error}");
         assert_eq!(fs::read_to_string(dest.join("old")).unwrap(), "old");
+    }
+
+    #[test]
+    fn the_new_exe_is_copied_over_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("g-ssh.exe");
+        fs::write(&dest, b"old").unwrap();
+        let stage = dir.path().join(".g-ssh-update-abc");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join("g-ssh.exe");
+        fs::write(&staged, b"new").unwrap();
+
+        let trash = replace_installed_exe_once(&dest, &staged).unwrap().unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert_eq!(fs::read(&staged).unwrap(), b"new");
+        assert_eq!(fs::read(&trash).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_failed_exe_replace_puts_the_old_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("g-ssh.exe");
+        fs::write(&dest, b"old").unwrap();
+        let staged = dir.path().join("missing.exe");
+
+        let error = replace_installed_exe_once(&dest, &staged).unwrap_err();
+
+        assert!(matches!(error, UpdateError::Install(_)), "{error}");
+        assert_eq!(fs::read(&dest).unwrap(), b"old");
+        assert!(!dir.path().read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".g-ssh-old-")));
+    }
+
+    #[test]
+    fn a_staged_exe_points_at_the_installed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join(".g-ssh-update-abc").join("g-ssh.exe");
+        assert_eq!(
+            staged_install_target(&exe).as_deref(),
+            Some(dir.path().join("g-ssh.exe").as_path())
+        );
+        assert!(staged_install_target(&dir.path().join("g-ssh.exe")).is_none());
+        assert!(
+            staged_install_target(&dir.path().join(".g-ssh-update-").join("g-ssh.exe")).is_none()
+        );
+    }
+
+    #[test]
+    fn a_verbatim_windows_path_loses_the_prefix() {
+        assert_eq!(
+            plain_windows_path(Path::new(r"\\?\C:\Users\a\g-ssh.exe")),
+            PathBuf::from(r"C:\Users\a\g-ssh.exe")
+        );
+        assert_eq!(
+            plain_windows_path(Path::new(r"\\?\UNC\server\share\g-ssh.exe")),
+            PathBuf::from(r"\\server\share\g-ssh.exe")
+        );
+        assert_eq!(
+            plain_windows_path(Path::new(r"C:\g-ssh.exe")),
+            PathBuf::from(r"C:\g-ssh.exe")
+        );
     }
 
     #[test]

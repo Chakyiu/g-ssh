@@ -1,0 +1,14 @@
+[package]
+name = "g-ssh-update"
+version = "0.2.5"
+edition = "2021"
+description = "Replaces g-ssh.exe after the app quits"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "update"
+path = "src/main.rs"
+
+[lints]
+workspace = true

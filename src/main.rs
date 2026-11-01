@@ -29,6 +29,9 @@ use ui::root::RootView;
 fn main() {
     // A second copy of this binary, started to swap in an update after quit.
     updates::apply::finish_if_requested();
+    // Started from `.g-ssh-update-…\g-ssh.exe`: copy onto the installed exe
+    // and reopen that. An older build unpacks the new exe and stops there.
+    updates::apply::adopt_if_staged();
 
     gssh::app::set_version(version::CURRENT);
     if let Some(dir) = dirs::home_dir() {

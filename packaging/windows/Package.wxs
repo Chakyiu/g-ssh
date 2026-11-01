@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <!--
+    Per-user install. The files land in %LOCALAPPDATA%\g-ssh, which the
+    updater can write without an admin prompt. UpgradeCode stays fixed so
+    a later MSI replaces this one.
+  -->
+  <Package
+      Name="g-ssh"
+      Manufacturer="g-ssh"
+      Version="$(var.Version)"
+      UpgradeCode="8f3c2a91-6e14-4b7d-9c05-1a6d8e2f47b3"
+      Scope="perUser"
+      Compressed="yes">
+    <SummaryInformation Description="SSH and SFTP client" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of g-ssh is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="Main">
+      <ComponentGroupRef Id="InstallFiles" />
+      <ComponentRef Id="StartMenu" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="InstallFolder" Name="g-ssh" />
+    </StandardDirectory>
+    <ComponentGroup Id="InstallFiles" Directory="InstallFolder">
+      <Component Id="AppExe" Guid="c3a1e7b4-2d58-4f16-9a0e-7b6d4c8f1e20">
+        <File Id="GsshExe" Source="$(var.PayloadDir)\g-ssh.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="UpdateExe" Guid="d4b2f8c5-3e69-4071-8b1f-8c7e5d902f31">
+        <File Id="UpdateExeFile" Source="$(var.PayloadDir)\update.exe" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="g-ssh">
+        <Component Id="StartMenu" Guid="e5c309d6-4f7a-4182-9c20-9d8f6ea13042">
+          <Shortcut
+              Id="ApplicationStartMenuShortcut"
+              Name="g-ssh"
+              Description="SSH and SFTP client"
+              Target="[InstallFolder]g-ssh.exe"
+              WorkingDirectory="InstallFolder" />
+          <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue
+              Root="HKCU"
+              Key="Software\g-ssh"
+              Name="installed"
+              Type="integer"
+              Value="1"
+              KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Fragment>
+</Wix>

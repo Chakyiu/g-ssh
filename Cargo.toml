@@ -1,6 +1,6 @@
 [package]
 name = "g-ssh"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "SSH and SFTP client"
 license = "MIT"
@@ -115,7 +115,7 @@ flate2 = { version = "1.1", default-features = false, features = [
 ] }
 
 [workspace]
-members = [".", "core"]
+members = [".", "core", "updater"]
 
 # Style lints that the UI code trips on purpose: gpui handlers take many
 # arguments, and events carry whole entries.

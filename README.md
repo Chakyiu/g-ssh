@@ -108,6 +108,16 @@ xattr -dr com.apple.quarantine /Applications/g-ssh.app
 A binary from `cargo build` has no download mark, so Gatekeeper leaves it
 alone.
 
+## Windows
+
+The release page has an `.msi` and a `.zip`. The installer is the one to
+run. It puts `g-ssh.exe` and `update.exe` in `%LOCALAPPDATA%\g-ssh` and
+adds a Start menu shortcut. No admin prompt.
+
+Update still downloads the `.zip`. `update.exe` waits until g-ssh has quit,
+replaces `g-ssh.exe`, and opens the new one. The `.zip` is also what an
+already installed copy looks for, so the release keeps both files.
+
 ## Updates
 
 macOS (Apple silicon) and Windows x86_64 can ask GitHub for a newer
@@ -123,16 +133,18 @@ Store build updates from the store. Linux builds have no update check.
 itself.
 
 ```sh
-cargo build --release
+cargo build --release --workspace
 ```
 
-The binary is `target/release/g-ssh`, or `g-ssh.exe` on Windows.
+The app is `target/release/g-ssh`, or `g-ssh.exe` on Windows. The same
+build writes `update.exe` next to it. That program applies a Windows update.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 Linux, macOS arm64, and Windows x86_64. Pushing a `v*` tag
 starts it and publishes the builds on the GitHub release for that tag,
 which is what the update check downloads. macOS is a `.dmg` containing
-`g-ssh.app`. Windows is a `.zip` and Linux is a `.tar.gz`. It can still
+`g-ssh.app`. Windows is a `.zip` for the update and an `.msi` that installs
+`g-ssh.exe` and `update.exe`. Linux is a `.tar.gz`. It can still
 be started by hand, and that run only keeps the builds as artifacts.
 The macOS app is ad-hoc signed so it can launch, and not notarized. See
 [First launch on a Mac](#first-launch-on-a-mac).

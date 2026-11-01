@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "g-ssh"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2456,6 +2456,10 @@ dependencies = [
  "zeroize",
  "zip",
 ]
+
+[[package]]
+name = "g-ssh-update"
+version = "0.2.5"
 
 [[package]]
 name = "generic-array"

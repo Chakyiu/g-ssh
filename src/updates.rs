@@ -1692,6 +1692,24 @@ mod tests {
     }
 
     #[test]
+    fn an_msi_next_to_the_zip_is_not_a_second_windows_archive() {
+        let assets = vec![
+            GithubAsset {
+                name: "g-ssh-0.2.5-windows-x86_64.msi".into(),
+                size: 1,
+                digest: None,
+            },
+            GithubAsset {
+                name: "g-ssh-0.2.5-windows-x86_64.zip".into(),
+                size: 2,
+                digest: None,
+            },
+        ];
+        let chosen = matching_asset(&assets, "windows-x86_64").unwrap().unwrap();
+        assert_eq!(chosen.name, "g-ssh-0.2.5-windows-x86_64.zip");
+    }
+
+    #[test]
     fn a_build_that_is_too_large_or_badly_named_is_refused_without_a_request() {
         let dir = tempfile::tempdir().unwrap();
         let nowhere = "http://127.0.0.1:1/Chakyiu/g-ssh/releases/download";

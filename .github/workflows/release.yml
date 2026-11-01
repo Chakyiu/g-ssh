@@ -7,8 +7,9 @@
 #   gh workflow run release.yml
 # A tag publishes the builds on that GitHub release. The app downloads them
 # from the release page. A hand start only keeps the builds as artifacts.
-# macOS is a .dmg of g-ssh.app. Windows is a .zip, Linux a .tar.gz.
-# The macOS app is ad-hoc signed so it can launch, and not notarized.
+# macOS is a .dmg of g-ssh.app. Windows publishes a .zip for the in-app
+# update and a .msi that installs g-ssh.exe and update.exe. Linux is a
+# .tar.gz. The macOS app is ad-hoc signed so it can launch, and not notarized.
 name: release
 
 on:
@@ -72,8 +73,13 @@ jobs:
           workspaces: .
           shared-key: ${{ matrix.artifact }}
 
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --workspace
 
       - name: Package
         shell: bash
@@ -89,6 +95,7 @@ jobs:
             mkdir "$name"
             if [ "${{ runner.os }}" = "Windows" ]; then
               cp target/release/g-ssh.exe "$name/"
+              cp target/release/update.exe "$name/"
             else
               cp target/release/g-ssh "$name/"
             fi
@@ -112,11 +119,26 @@ jobs:
             fi
           fi
           echo "archive=$archive" >> "$GITHUB_ENV"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            msi="${name}.msi"
+            payload=$(cygpath -w "$PWD/$name")
+            output=$(cygpath -w "$PWD/$msi")
+            powershell.exe -NoProfile -File scripts/windows-msi.ps1 \
+              -Version "$version" -PayloadDir "$payload" -Output "$output"
+            echo "msi=$msi" >> "$GITHUB_ENV"
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ env.archive }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: windows-msi
+          path: ${{ env.msi }}
           if-no-files-found: error
 
   publish:
@@ -137,7 +159,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          files=(dist/*.tar.gz dist/*.zip dist/*.dmg)
+          files=(dist/*.tar.gz dist/*.zip dist/*.dmg dist/*.msi)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no release archives were built" >&2
             exit 1
