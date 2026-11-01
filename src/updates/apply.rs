@@ -525,14 +525,49 @@ fn verify_signature(app: &Path) -> Result<(), UpdateError> {
     }
 }
 
+/// Windows' own bsdtar. A `tar` earlier on `PATH` is often Git's GNU tar,
+/// which cannot read the zip a release publishes.
+#[cfg(windows)]
+fn tar_program() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let system = root.join("System32").join("tar.exe");
+    if system.is_file() {
+        system
+    } else {
+        PathBuf::from("tar")
+    }
+}
+
+/// Drop the `\\?\` prefix before handing a path to `tar`.
+///
+/// `canonicalize` adds that prefix, and the unpack folder is built from the
+/// canonical app path. Windows `tar` then fails with
+/// `could not chdir to '\\?\...'`: its `chdir` calls the ANSI API, which
+/// rejects the prefix.
+#[cfg(any(windows, test))]
+fn path_for_tar(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    let stripped = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{rest}"))
+    } else {
+        text.strip_prefix(r"\\?\").map(str::to_string)
+    };
+    match stripped {
+        Some(rest) if !rest.is_empty() => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
 #[cfg(windows)]
 fn unpack_zip(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
     archive_listing_is_safe(archive)?;
-    let output = Command::new("tar")
+    let output = Command::new(tar_program())
         .arg("-xf")
-        .arg(archive)
+        .arg(path_for_tar(archive))
         .arg("-C")
-        .arg(dest)
+        .arg(path_for_tar(dest))
         .output()
         .map_err(|e| UpdateError::Install(format!("could not unpack the build: {e}")))?;
     if !output.status.success() {
@@ -548,9 +583,9 @@ fn unpack_zip(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
 /// Refuse a listing that could write outside the unpack folder.
 #[cfg(windows)]
 fn archive_listing_is_safe(archive: &Path) -> Result<(), UpdateError> {
-    let output = Command::new("tar")
+    let output = Command::new(tar_program())
         .arg("-tf")
-        .arg(archive)
+        .arg(path_for_tar(archive))
         .output()
         .map_err(|e| UpdateError::Install(format!("could not unpack the build: {e}")))?;
     if !output.status.success() {
@@ -1287,6 +1322,24 @@ mod tests {
         fs::remove_file(&exe).unwrap();
         std::os::unix::fs::symlink("/tmp/other", &exe).unwrap();
         assert!(matches!(validate_bundle(&app), Err(UpdateError::NotAnApp)));
+    }
+
+    #[test]
+    fn tar_is_not_given_a_verbatim_path() {
+        assert_eq!(
+            path_for_tar(Path::new(
+                r"\\?\C:\Program Files\g-ssh\.g-ssh-update-abc\unpack"
+            )),
+            Path::new(r"C:\Program Files\g-ssh\.g-ssh-update-abc\unpack")
+        );
+        assert_eq!(
+            path_for_tar(Path::new(r"\\?\UNC\server\share\unpack")),
+            Path::new(r"\\server\share\unpack")
+        );
+        assert_eq!(
+            path_for_tar(Path::new(r"C:\g-ssh\unpack")),
+            Path::new(r"C:\g-ssh\unpack")
+        );
     }
 
     #[test]
