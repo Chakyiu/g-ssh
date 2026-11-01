@@ -1,5 +1,5 @@
 //! The dialog behind the title bar's update mark: what is new, and the
-//! download of it. It only shows what `UpdateService` knows.
+//! install of it. It only shows what `UpdateService` knows.
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
@@ -15,12 +15,6 @@ use crate::ui::sftp::pane::fmt_size;
 use crate::ui::updates::service::{Download, UpdateService};
 use crate::updates::Release;
 use crate::version;
-
-const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
-    "Show in Finder"
-} else {
-    "Show in folder"
-};
 
 pub enum UpdateViewEvent {
     Closed,
@@ -45,13 +39,13 @@ impl UpdateView {
             .on_click(cx.listener(|_, _, _, cx| cx.emit(UpdateViewEvent::Closed)))
     }
 
-    fn download_button() -> Button {
-        Button::new("update-download")
+    fn update_button() -> Button {
+        Button::new("update-install")
             .small()
             .primary()
-            .child("Download")
+            .child("Update and reopen")
             .on_click(|_, _, cx| {
-                UpdateService::global(cx).update(cx, |service, cx| service.start_download(cx));
+                UpdateService::global(cx).update(cx, |service, cx| service.start_update(cx));
             })
     }
 
@@ -60,8 +54,8 @@ impl UpdateView {
         match download {
             Download::Idle | Download::Failed(_) => buttons
                 .child(Self::close_button("Later", cx))
-                .child(Self::download_button()),
-            Download::Running { .. } => buttons.child(
+                .child(Self::update_button()),
+            Download::Running { .. } | Download::Installing => buttons.child(
                 Button::new("update-cancel")
                     .small()
                     .ghost()
@@ -69,16 +63,6 @@ impl UpdateView {
                     .on_click(|_, _, cx| {
                         UpdateService::global(cx)
                             .update(cx, |service, cx| service.cancel_download(cx));
-                    }),
-            ),
-            Download::Done(_) => buttons.child(Self::close_button("Close", cx)).child(
-                Button::new("update-reveal")
-                    .small()
-                    .primary()
-                    .child(REVEAL_LABEL)
-                    .on_click(|_, _, cx| {
-                        UpdateService::global(cx)
-                            .update(cx, |service, cx| service.reveal_download(cx));
                     }),
             ),
         }
@@ -98,7 +82,7 @@ fn progress_line(download: &Download) -> Option<String> {
     match download {
         Download::Idle => None,
         Download::Running { percent } => Some(format!("Downloading\u{2026} {percent}%")),
-        Download::Done(path) => Some(format!("Saved to {}", path.display())),
+        Download::Installing => Some("Installing\u{2026} g-ssh will reopen.".into()),
         Download::Failed(problem) => Some(problem.clone()),
     }
 }
@@ -208,8 +192,8 @@ mod tests {
             Some("Downloading\u{2026} 42%")
         );
         assert_eq!(
-            progress_line(&Download::Done("/home/me/Downloads/g-ssh-0.2.0.dmg".into())).as_deref(),
-            Some("Saved to /home/me/Downloads/g-ssh-0.2.0.dmg")
+            progress_line(&Download::Installing).as_deref(),
+            Some("Installing\u{2026} g-ssh will reopen.")
         );
         assert_eq!(
             progress_line(&Download::Failed("Could not download: x.".into())).as_deref(),

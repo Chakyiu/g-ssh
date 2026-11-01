@@ -27,6 +27,9 @@ use preferences::{Preferences, ThemePreference};
 use ui::root::RootView;
 
 fn main() {
+    // A second copy of this binary, started to swap in an update after quit.
+    updates::apply::finish_if_requested();
+
     gssh::app::set_version(version::CURRENT);
     if let Some(dir) = dirs::home_dir() {
         gssh::app::set_data_dir(dir.join(".g-ssh"));

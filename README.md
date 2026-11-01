@@ -82,7 +82,7 @@ team or kept personal.
 
 ## First launch on a Mac
 
-A download from the release page or the update check is ad-hoc signed and
+A download from the release page is ad-hoc signed and
 not notarized, so Gatekeeper says Apple could not verify "g-ssh" is free of
 malware. Allow the app once.
 
@@ -109,9 +109,10 @@ alone.
 
 macOS (Apple silicon) and Windows x86_64 can ask GitHub for a newer
 build at startup and every six hours after that. The check reads the latest
-[release](https://github.com/Chakyiu/g-ssh/releases) and downloads the archive
-for this computer from that page. The sandboxed Mac App Store build updates
-from the store. Linux builds have no update check.
+[release](https://github.com/Chakyiu/g-ssh/releases). Update downloads the
+archive for this computer, checks it against the checksum on that release,
+replaces the app you are running, and reopens it. The sandboxed Mac App
+Store build updates from the store. Linux builds have no update check.
 
 ## Building
 

@@ -1,8 +1,9 @@
-//! The update check and the download of a newer build.
+//! The update check, the download of a newer build, and installing it.
 //!
 //! Both use the GitHub release page of this repository. [`latest_release`]
 //! reads the latest release, and [`download`] fetches the archive for this
-//! computer from that release. [`newer_release`] and [`download_offer`] are
+//! computer from that release. [`apply`] replaces the running app with that
+//! archive and reopens it. [`newer_release`] and [`download_offer`] are
 //! built from these two. The check sends no account, no version, and no
 //! device. Blocking: call them from a worker thread.
 
@@ -14,6 +15,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+
+pub mod apply;
 
 /// A build above this size is not what a release would ever publish.
 pub const MAX_DOWNLOAD_BYTES: u64 = 300 * 1024 * 1024;
@@ -41,6 +44,19 @@ fn github_latest_url() -> String {
 /// `https://github.com/Chakyiu/g-ssh/releases/download/<tag>/<file>`.
 fn github_download_base() -> String {
     format!("https://github.com/{GITHUB_REPOSITORY}/releases/download")
+}
+
+/// Where a downloaded build is kept until it replaces the app.
+/// `~/Library/Caches/g-ssh/updates` on a Mac.
+pub fn cache_dir() -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("g-ssh").join("updates");
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
 }
 
 /// The archive name GitHub is asked for. `None` where there are no builds to
@@ -99,6 +115,14 @@ pub enum UpdateError {
     Withdrawn,
     #[error("the download was sent somewhere other than GitHub, so it was not kept")]
     OffSite,
+    #[error("this copy of g-ssh is not the installed app, so it cannot replace itself")]
+    NotInstalled,
+    #[error("g-ssh is not allowed to replace itself in this folder")]
+    NotWritable,
+    #[error("the downloaded build does not contain the g-ssh app")]
+    NotAnApp,
+    #[error("{0}")]
+    Install(String),
     #[error("cancelled")]
     Cancelled,
     #[error("could not save the file: {0}")]
@@ -785,9 +809,13 @@ fn is_allowed_download_url(origin_host: &str, next: &str) -> bool {
 }
 
 fn is_github_asset_host(host: &str) -> bool {
+    // The release page currently sends the file to
+    // release-assets.githubusercontent.com. The other names are hosts it
+    // has used for the same files.
     matches!(
         host,
-        "release-assets.github.com"
+        "release-assets.githubusercontent.com"
+            | "release-assets.github.com"
             | "objects.githubusercontent.com"
             | "github-releases.githubusercontent.com"
     )
@@ -1169,6 +1197,10 @@ mod tests {
         assert!(is_allowed_download_url(&origin, start));
         assert!(is_allowed_download_url(
             &origin,
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1?sp=r"
+        ));
+        assert!(is_allowed_download_url(
+            &origin,
             "https://release-assets.github.com/github-production-release-asset/1?token=abc"
         ));
         assert!(is_allowed_download_url(
@@ -1190,6 +1222,10 @@ mod tests {
         assert!(!is_allowed_download_url(
             &origin,
             "https://user.github.com/a"
+        ));
+        assert!(!is_allowed_download_url(
+            &origin,
+            "https://raw.githubusercontent.com/Chakyiu/g-ssh/main/Cargo.toml"
         ));
         assert!(!is_allowed_download_url(
             "127.0.0.1",

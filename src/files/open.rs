@@ -214,42 +214,6 @@ fn shell_open(path: &Path) -> Result<(), OpenError> {
     ))))
 }
 
-/// Show `path` selected in Finder or Explorer. Opens nothing.
-pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(path)
-            .status()
-            .map(drop)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt as _;
-        // Explorer reads its own command line: the path needs quotes of its
-        // own after the comma, which the usual argument quoting does not give.
-        // Its exit code says nothing, it is 1 even when the folder opened.
-        std::process::Command::new("explorer")
-            .raw_arg(format!(
-                "/select,\"{}\"",
-                without_verbatim_prefix(path).display()
-            ))
-            .status()
-            .map(drop)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "platform not supported",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{association_key, has_binary_extension};

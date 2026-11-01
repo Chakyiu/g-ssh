@@ -5,7 +5,6 @@
 //! they are made: never on an OS without builds, on a timer only when the
 //! user chose checks on start, and otherwise only when Check now is pressed.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -26,8 +25,11 @@ const DUE_LOOK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 #[derive(Clone)]
 pub enum Download {
     Idle,
-    Running { percent: u8 },
-    Done(PathBuf),
+    Running {
+        percent: u8,
+    },
+    /// The archive is in place and the app is about to quit so it can be replaced.
+    Installing,
     Failed(String),
 }
 
@@ -43,6 +45,8 @@ pub struct UpdateService {
     /// Counts cancels and resets, so an answer to work nobody waits for any
     /// more is ignored.
     generation: u64,
+    /// Names the cancel file for the installer that is running, if one is.
+    install_token: Option<String>,
     /// The "Check for updates?" question was put this run. Asked once per
     /// run at most, even when it was closed without an answer.
     is_question_asked: bool,
@@ -54,9 +58,10 @@ impl Global for GlobalUpdateService {}
 
 enum DownloadEvent {
     Progress(u8),
-    /// The build that was saved, which is the current GitHub release, and
-    /// where it is.
-    Finished(Result<(Release, PathBuf), UpdateError>),
+    Installing,
+    /// The release that was staged. `Ok` means this process should quit so
+    /// the installer can replace it and reopen.
+    Finished(Result<Release, UpdateError>),
 }
 
 impl UpdateService {
@@ -91,6 +96,7 @@ impl UpdateService {
             download: Download::Idle,
             is_cancelled: Arc::new(AtomicBool::new(false)),
             generation: 0,
+            install_token: None,
             is_question_asked: false,
         }
     }
@@ -170,8 +176,7 @@ impl UpdateService {
 
     fn take_offer(&mut self, offered: Option<Release>) {
         // The download on screen belongs to the release on screen.
-        let is_downloading = matches!(self.download, Download::Running { .. });
-        if is_downloading || self.release == offered {
+        if self.is_busy() || self.release == offered {
             return;
         }
         if let Some(release) = &offered {
@@ -191,24 +196,27 @@ impl UpdateService {
         cx.notify();
     }
 
-    /// Fetch the offered build into the Downloads folder.
-    pub fn start_download(&mut self, cx: &mut Context<Self>) {
+    /// Download the offered build and replace this app with it. The app quits
+    /// when the new copy is ready, and the installer reopens it.
+    pub fn start_update(&mut self, cx: &mut Context<Self>) {
         let Some(platform) = updates::platform() else {
             return;
         };
         let Some(release) = self.release.clone() else {
             return;
         };
-        if matches!(self.download, Download::Running { .. }) {
+        if self.is_busy() {
             return;
         }
-        let Some(folder) = dirs::download_dir().or_else(dirs::home_dir) else {
-            self.download = Download::Failed("Could not find your Downloads folder.".into());
+        let Some(folder) = updates::cache_dir() else {
+            self.download = Download::Failed("Could not find a place to store the update.".into());
             cx.notify();
             return;
         };
         self.download = Download::Running { percent: 0 };
         self.is_cancelled = Arc::new(AtomicBool::new(false));
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        self.install_token = Some(token.clone());
         cx.notify();
         tracing::info!(version = %release.version, folder = %folder.display(), "update download started");
 
@@ -232,6 +240,17 @@ impl UpdateService {
                 &is_cancelled,
                 on_progress,
             );
+            let done = match done {
+                Ok((release, path)) if is_cancelled.load(Ordering::Relaxed) => {
+                    let _ = (release, path);
+                    Err(UpdateError::Cancelled)
+                }
+                Ok((release, path)) => {
+                    let _ = tx.try_send(DownloadEvent::Installing);
+                    updates::apply::install(&path, &is_cancelled, &token).map(|()| release)
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.try_send(DownloadEvent::Finished(done));
         });
 
@@ -239,9 +258,13 @@ impl UpdateService {
         cx.spawn(async move |this, cx| {
             while let Ok(event) = rx.recv().await {
                 let handled = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.take_download_event(event);
-                        cx.notify();
+                    if this.generation != generation {
+                        return;
+                    }
+                    let quit = this.take_download_event(event);
+                    cx.notify();
+                    if quit {
+                        cx.quit();
                     }
                 });
                 if handled.is_err() {
@@ -253,7 +276,10 @@ impl UpdateService {
     }
 
     pub fn cancel_download(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.download, Download::Running { .. }) {
+        if !matches!(
+            self.download,
+            Download::Running { .. } | Download::Installing
+        ) {
             return;
         }
         self.stop_work();
@@ -263,64 +289,58 @@ impl UpdateService {
     /// The worker thread sees the flag, deletes its part file and ends.
     fn stop_work(&mut self) {
         self.is_cancelled.store(true, Ordering::Relaxed);
+        if let Some(token) = self.install_token.take() {
+            updates::apply::cancel_installer(&token);
+        }
         self.generation += 1;
         self.is_checking = false;
         self.download = Download::Idle;
     }
 
-    fn take_download_event(&mut self, event: DownloadEvent) {
-        self.download = match event {
-            DownloadEvent::Progress(percent) => Download::Running { percent },
-            DownloadEvent::Finished(Ok((release, path))) => {
-                tracing::info!(version = %release.version, path = %path.display(), "update downloaded");
+    /// `true` when the new app is staged and this process should quit.
+    fn take_download_event(&mut self, event: DownloadEvent) -> bool {
+        match event {
+            DownloadEvent::Progress(percent) => {
+                self.download = Download::Running { percent };
+                false
+            }
+            DownloadEvent::Installing => {
+                self.download = Download::Installing;
+                false
+            }
+            DownloadEvent::Finished(Ok(release)) => {
+                tracing::info!(version = %release.version, "update staged, reopening");
                 // Not always the build that was offered: the GitHub release may
                 // have been replaced since the check.
                 self.release = Some(release);
-                Download::Done(path)
+                self.download = Download::Installing;
+                true
             }
             // Only a cancel the service did not ask for ends up here.
-            DownloadEvent::Finished(Err(UpdateError::Cancelled)) => Download::Idle,
+            DownloadEvent::Finished(Err(UpdateError::Cancelled)) => {
+                self.download = Download::Idle;
+                false
+            }
             // The server has nothing newer any more, so there is no offer.
             DownloadEvent::Finished(Err(UpdateError::Withdrawn)) => {
                 tracing::info!("the offered build is no longer on the GitHub release");
                 self.release = None;
-                Download::Idle
+                self.download = Download::Idle;
+                false
             }
-            DownloadEvent::Finished(Err(e)) => {
-                tracing::warn!(error = %e, "update download failed");
-                Download::Failed(format!("Could not download: {e}."))
+            DownloadEvent::Finished(Err(error)) => {
+                tracing::warn!(error = %error, "update failed");
+                self.download = Download::Failed(failure_message(&error));
+                false
             }
-        };
+        }
     }
 
-    /// Show the downloaded build in Finder or Explorer.
-    pub fn reveal_download(&mut self, cx: &mut Context<Self>) {
-        if self.forget_missing_download() {
-            cx.notify();
-            return;
-        }
-        let Download::Done(path) = &self.download else {
-            return;
-        };
-        let path = path.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = crate::files::open::reveal_in_file_manager(&path) {
-                tracing::warn!(?e, path = %path.display(), "could not show the downloaded build");
-            }
-        });
-    }
-
-    /// The user moved or deleted the downloaded build: say so, which also
-    /// brings the Download button back. Returns whether that happened.
-    fn forget_missing_download(&mut self) -> bool {
-        let Download::Done(path) = &self.download else {
-            return false;
-        };
-        if path.exists() {
-            return false;
-        }
-        self.download = Download::Failed(format!("{} is no longer there.", path.display()));
-        true
+    fn is_busy(&self) -> bool {
+        matches!(
+            self.download,
+            Download::Running { .. } | Download::Installing
+        )
     }
 
     /// Label for the About page's update button. `None` when there is no
@@ -331,7 +351,8 @@ impl UpdateService {
         }
         Some(match self.download {
             Download::Running { percent } => format!("Downloading {percent}%"),
-            _ => "Update".into(),
+            Download::Installing => "Installing\u{2026}".into(),
+            Download::Idle | Download::Failed(_) => "Update".into(),
         })
     }
 
@@ -358,6 +379,25 @@ fn is_check_due(last_check: &Option<Result<SystemTime, String>>, now: SystemTime
     // A clock that was set back gives no age: check then.
     !now.duration_since(*checked_at)
         .is_ok_and(|age| age < CHECK_INTERVAL)
+}
+
+fn failure_message(error: &UpdateError) -> String {
+    let kind = if is_install_error(error) {
+        "update"
+    } else {
+        "download"
+    };
+    format!("Could not {kind}: {error}.")
+}
+
+fn is_install_error(error: &UpdateError) -> bool {
+    matches!(
+        error,
+        UpdateError::NotInstalled
+            | UpdateError::NotWritable
+            | UpdateError::NotAnApp
+            | UpdateError::Install(_)
+    )
 }
 
 fn percent_of(received: u64, total: u64) -> u8 {
@@ -390,6 +430,7 @@ mod tests {
             download: Download::Idle,
             is_cancelled: Arc::new(AtomicBool::new(false)),
             generation: 0,
+            install_token: None,
             is_question_asked: false,
         }
     }
@@ -448,19 +489,22 @@ mod tests {
             Some("Downloading 42%")
         );
 
-        service.download = Download::Done("/tmp/g-ssh-0.2.0.dmg".into());
-        assert_eq!(service.update_action_label().as_deref(), Some("Update"));
+        service.download = Download::Installing;
+        assert_eq!(
+            service.update_action_label().as_deref(),
+            Some("Installing\u{2026}")
+        );
     }
 
     #[test]
     fn a_new_offer_replaces_the_old_one_and_its_download() {
         let mut service = service();
         service.take_offer(Some(release("0.2.0")));
-        service.download = Download::Done("/tmp/g-ssh-0.2.0.dmg".into());
+        service.download = Download::Failed("Could not update: x.".into());
 
-        // The same offer again keeps the finished download.
+        // The same offer again keeps the failure on screen.
         service.take_offer(Some(release("0.2.0")));
-        assert!(matches!(service.download, Download::Done(_)));
+        assert!(matches!(service.download, Download::Failed(_)));
 
         service.take_offer(Some(release("0.3.0")));
         assert_eq!(service.release, Some(release("0.3.0")));
@@ -490,13 +534,15 @@ mod tests {
         let mut service = service();
         service.release = Some(release("0.2.0"));
 
-        service.take_download_event(DownloadEvent::Progress(7));
+        assert!(!service.take_download_event(DownloadEvent::Progress(7)));
         assert!(matches!(service.download, Download::Running { percent: 7 }));
 
-        service.take_download_event(DownloadEvent::Finished(Err(UpdateError::Cancelled)));
+        assert!(!service.take_download_event(DownloadEvent::Finished(Err(UpdateError::Cancelled))));
         assert!(matches!(service.download, Download::Idle));
 
-        service.take_download_event(DownloadEvent::Finished(Err(UpdateError::WrongChecksum)));
+        assert!(
+            !service.take_download_event(DownloadEvent::Finished(Err(UpdateError::WrongChecksum)))
+        );
         let Download::Failed(problem) = &service.download else {
             panic!("a wrong checksum must fail the download");
         };
@@ -509,17 +555,34 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_download_shows_the_build_that_was_saved() {
+    fn a_staged_update_keeps_the_build_and_asks_the_app_to_quit() {
         let mut service = service();
         service.release = Some(release("0.2.0"));
 
         // GitHub had 0.3.0 by the time of the download.
-        let saved = (release("0.3.0"), PathBuf::from("/tmp/g-ssh-0.3.0.dmg"));
-        service.take_download_event(DownloadEvent::Finished(Ok(saved)));
+        let quit = service.take_download_event(DownloadEvent::Finished(Ok(release("0.3.0"))));
 
+        assert!(quit);
         assert_eq!(service.release, Some(release("0.3.0")));
+        assert!(matches!(service.download, Download::Installing));
+    }
+
+    #[test]
+    fn an_install_problem_is_not_called_a_download_problem() {
+        let mut service = service();
+        service.release = Some(release("0.2.0"));
+
         assert!(
-            matches!(&service.download, Download::Done(path) if path.ends_with("g-ssh-0.3.0.dmg"))
+            !service.take_download_event(DownloadEvent::Finished(Err(UpdateError::NotInstalled)))
+        );
+
+        let Download::Failed(problem) = &service.download else {
+            panic!("a copy that is not the installed app must fail");
+        };
+        assert_eq!(
+            problem,
+            "Could not update: this copy of g-ssh is not the installed app, so it cannot replace \
+             itself."
         );
     }
 
@@ -529,7 +592,7 @@ mod tests {
         service.release = Some(release("0.2.0"));
         service.download = Download::Running { percent: 3 };
 
-        service.take_download_event(DownloadEvent::Finished(Err(UpdateError::Withdrawn)));
+        assert!(!service.take_download_event(DownloadEvent::Finished(Err(UpdateError::Withdrawn))));
 
         assert_eq!(service.release, None);
         assert!(matches!(service.download, Download::Idle));
@@ -547,28 +610,6 @@ mod tests {
         assert!(is_check_due(&ago(6 * 60 * 60), now));
         // The clock was set back after the check.
         assert!(is_check_due(&Some(Ok(now + Duration::from_secs(60))), now));
-    }
-
-    #[test]
-    fn a_downloaded_build_that_is_gone_can_be_downloaded_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("g-ssh-0.2.0.dmg");
-        std::fs::write(&path, "build").unwrap();
-        let mut service = service();
-        service.download = Download::Done(path.clone());
-
-        assert!(!service.forget_missing_download());
-        assert!(matches!(service.download, Download::Done(_)));
-
-        std::fs::remove_file(&path).unwrap();
-        assert!(service.forget_missing_download());
-        let Download::Failed(problem) = &service.download else {
-            panic!("a missing file must bring the Download button back");
-        };
-        assert!(
-            problem.ends_with("g-ssh-0.2.0.dmg is no longer there."),
-            "{problem}"
-        );
     }
 
     #[test]

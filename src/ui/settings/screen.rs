@@ -1913,7 +1913,7 @@ impl SettingsView {
             })
     }
 
-    /// The notes and the download. The title bar's chip opens the same
+    /// The notes and the install. The title bar's chip opens the same
     /// dialog, and Settings sits on top of that chip.
     fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.new(UpdateView::new);
@@ -2349,7 +2349,8 @@ impl SettingsView {
                     .child(
                         "When on, g-ssh asks GitHub for the newest version when it starts \
                      and every six hours after. When off, it asks only when you press Check now. \
-                     The build is the one on this repository's release page.",
+                     Update replaces this app with the build on this repository's release page \
+                     and reopens it.",
                     ),
             )
             .child(

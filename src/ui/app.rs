@@ -2333,7 +2333,8 @@ impl AppView {
         let version = &service.release.as_ref()?.version;
         let text = match service.download {
             Download::Running { percent } => format!("Downloading {percent}%"),
-            _ => format!("Update {version}"),
+            Download::Installing => "Installing\u{2026}".into(),
+            Download::Idle | Download::Failed(_) => format!("Update {version}"),
         };
         let theme = cx.theme();
         let (bg, fg, hover_bg, active_bg) = (

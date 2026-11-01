@@ -52,7 +52,8 @@ impl Render for UpdateConsentView {
             .child(DialogHeader::new().child(DialogTitle::new().child("Check for updates?")))
             .child(div().text_size(px(12.)).text_color(fg).child(
                 "g-ssh can ask GitHub for the newest version when it starts and every six \
-                 hours while it runs. The build is downloaded from this repository's release page.",
+                 hours while it runs. Update replaces this app with the build from this \
+                 repository's release page and reopens it.",
             ))
             .child(
                 div()
