@@ -158,6 +158,10 @@ pub struct SettingsView {
     font_menu_open: bool,
     /// Scroll state for that menu, so the current face stays in view.
     font_menu_scroll: ScrollHandle,
+    /// Whether the colour scheme menu is open.
+    scheme_menu_open: bool,
+    /// Scroll state for that menu, so the current scheme stays in view.
+    scheme_menu_scroll: ScrollHandle,
     agent_base: Entity<InputState>,
     agent_key: Entity<InputState>,
     agent_prompt: Entity<TextareaState>,
@@ -354,6 +358,8 @@ impl SettingsView {
             editor_command,
             font_menu_open: false,
             font_menu_scroll: ScrollHandle::new(),
+            scheme_menu_open: false,
+            scheme_menu_scroll: ScrollHandle::new(),
             agent_base,
             agent_key,
             agent_prompt,
@@ -376,6 +382,7 @@ impl SettingsView {
         self.add_error = None;
         self.edit_error = None;
         self.font_menu_open = false;
+        self.scheme_menu_open = false;
         cx.notify();
         if section == SettingsSection::Agent {
             self.schedule_model_lookup(cx);
@@ -1844,53 +1851,19 @@ impl SettingsView {
 
     fn render_terminal_schemes(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = Preferences::terminal_scheme(cx);
-        let border = cx.theme().title_bar_border;
+        let open = self.scheme_menu_open;
+        let anchor = Rc::new(Cell::new(Point::default()));
+        let trigger = Rc::new(Cell::new(Bounds::default()));
+        let scroll = self.scheme_menu_scroll.clone();
 
-        v_flex()
-            .gap(px(4.))
-            .children(
-                TerminalScheme::ALL
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, scheme)| {
-                        let (swatch_bg, dots) = TerminalColors::swatch(scheme);
-                        h_flex()
-                            .gap(px(8.))
-                            .items_center()
-                            .child(
-                                radio_row(
-                                    ("terminal-scheme", ix),
-                                    scheme.label(),
-                                    scheme == current,
-                                    cx,
-                                )
-                                .w(px(150.))
-                                .on_click(cx.listener(
-                                    move |_, _, _, cx| {
-                                        Preferences::update(cx, |prefs| {
-                                            prefs.terminal_scheme = scheme
-                                        });
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .child(
-                                h_flex()
-                                    .h(px(14.))
-                                    .px(px(5.))
-                                    .gap(px(3.))
-                                    .items_center()
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(swatch_bg)
-                                    .children(
-                                        dots.into_iter()
-                                            .map(|dot| div().size(px(6.)).rounded_full().bg(dot)),
-                                    ),
-                            )
-                    }),
-            )
+        div()
+            .w(px(SCHEME_MENU_WIDTH))
+            .flex_none()
+            .self_start()
+            .child(scheme_menu_button(current, open, &anchor, &trigger, cx))
+            .when(open, |el| {
+                el.child(scheme_menu_panel(current, &scroll, &anchor, &trigger, cx))
+            })
     }
 
     fn render_terminal_typing(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3875,8 +3848,9 @@ impl Render for SettingsView {
             .key_context("Settings")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &CloseSettings, _, cx| {
-                if this.font_menu_open {
+                if this.font_menu_open || this.scheme_menu_open {
                     this.font_menu_open = false;
+                    this.scheme_menu_open = false;
                     cx.notify();
                     return;
                 }
@@ -4483,6 +4457,10 @@ fn split_variables(s: &str) -> Vec<(bool, String)> {
 /// Width of the terminal font menu. Long enough for a Nerd Font Mono name.
 const FONT_MENU_WIDTH: f32 = 320.;
 
+/// Width of the colour scheme menu. The longest name is "Match app theme",
+/// plus the swatch and the caret.
+const SCHEME_MENU_WIDTH: f32 = 280.;
+
 /// Stacks with gpui-component popups: above dialogs, below tooltips.
 const FONT_MENU_PRIORITY: usize = 100;
 
@@ -4532,6 +4510,7 @@ fn font_menu_button(
             cx.listener(|this, _: &MouseDownEvent, _, cx| {
                 this.font_menu_open = !this.font_menu_open;
                 if this.font_menu_open {
+                    this.scheme_menu_open = false;
                     let current = Preferences::terminal_font(cx);
                     let fonts = installed_terminal_fonts(cx);
                     if let Some(ix) = fonts.iter().position(|font| *font == current) {
@@ -4642,6 +4621,179 @@ fn font_menu_panel(
         }))
         .track_scroll(scroll)
         .w(px(FONT_MENU_WIDTH))
+        .max_h(px(280.))
+        .overflow_y_scroll()
+        .p(px(4.))
+        .bg(crate::theme::pop_surface())
+        .border_1()
+        .border_color(crate::theme::float_border())
+        .rounded(px(9.))
+        .shadow(crate::ui::modal_shadow())
+        .children(items);
+
+    deferred(AnchoredToTrigger {
+        anchor: Anchor::TopLeft,
+        anchor_point: anchor.clone(),
+        margin: px(8.),
+        child: panel.into_any_element(),
+    })
+    .with_priority(FONT_MENU_PRIORITY)
+}
+
+/// Six ANSI colours on the scheme's own background, so the schemes stay
+/// distinct in the list.
+fn scheme_swatch(scheme: TerminalScheme, border: Hsla) -> impl IntoElement {
+    let (bg, dots) = TerminalColors::swatch(scheme);
+    h_flex()
+        .flex_none()
+        .h(px(14.))
+        .px(px(5.))
+        .gap(px(3.))
+        .items_center()
+        .rounded(px(3.))
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .children(
+            dots.into_iter()
+                .map(|dot| div().size(px(6.)).rounded_full().bg(dot)),
+        )
+}
+
+/// The button that opens the scheme menu: the current name, its colours,
+/// and a caret.
+fn scheme_menu_button(
+    current: TerminalScheme,
+    open: bool,
+    anchor: &Rc<Cell<Point<Pixels>>>,
+    trigger: &Rc<Cell<Bounds<Pixels>>>,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let muted_fg = theme.muted_foreground;
+    let border = theme.title_bar_border;
+
+    div()
+        .id("terminal-scheme-menu")
+        .relative()
+        .w_full()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .px(px(10.))
+        .rounded(px(7.))
+        .border_1()
+        .border_color(if open {
+            crate::theme::accent()
+        } else {
+            crate::theme::border()
+        })
+        .bg(crate::theme::field())
+        .cursor_pointer()
+        .hover(|s| s.bg(crate::theme::element_hover()))
+        .text_size(px(13.))
+        .text_color(theme.foreground)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.scheme_menu_open = !this.scheme_menu_open;
+                if this.scheme_menu_open {
+                    this.font_menu_open = false;
+                    let current = Preferences::terminal_scheme(cx);
+                    if let Some(ix) = TerminalScheme::ALL
+                        .iter()
+                        .position(|scheme| *scheme == current)
+                    {
+                        this.scheme_menu_scroll.scroll_to_item(ix);
+                    }
+                }
+                cx.notify();
+            }),
+        )
+        .child(menu_anchor_probe(anchor.clone(), trigger.clone()))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .gap(px(8.))
+                .child(div().min_w_0().flex_1().truncate().child(current.label()))
+                .child(scheme_swatch(current, border))
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .size(px(14.))
+                        .text_color(muted_fg),
+                ),
+        )
+}
+
+/// The list a scheme button opens. Same stacking as the font menu, so the
+/// scrolling settings page does not clip it.
+fn scheme_menu_panel(
+    current: TerminalScheme,
+    scroll: &ScrollHandle,
+    anchor: &Rc<Cell<Point<Pixels>>>,
+    trigger: &Rc<Cell<Bounds<Pixels>>>,
+    cx: &mut Context<SettingsView>,
+) -> impl IntoElement {
+    let trigger = trigger.clone();
+    let fg = cx.theme().foreground;
+    let border = cx.theme().title_bar_border;
+    let items: Vec<AnyElement> = TerminalScheme::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(ix, scheme)| {
+            let selected = scheme == current;
+            div()
+                .id(("terminal-scheme-option", ix))
+                .h(px(30.))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .px(px(8.))
+                .rounded(px(6.))
+                .text_size(px(13.))
+                .text_color(fg)
+                .cursor_pointer()
+                .when(selected, |el| {
+                    el.bg(crate::theme::accent_soft())
+                        .hover(|s| s.bg(crate::theme::accent_soft_press()))
+                })
+                .when(!selected, |el| {
+                    el.hover(|s| s.bg(crate::theme::field()))
+                        .active(|s| s.bg(crate::theme::element_active()))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    Preferences::update(cx, |prefs| prefs.terminal_scheme = scheme);
+                    this.scheme_menu_open = false;
+                    cx.notify();
+                }))
+                .child(div().min_w_0().flex_1().truncate().child(scheme.label()))
+                .child(scheme_swatch(scheme, border))
+                .child(div().w(px(12.)).flex_none().when(selected, |el| {
+                    el.child(
+                        Icon::new(IconName::Check)
+                            .size(px(12.))
+                            .text_color(crate::theme::accent()),
+                    )
+                }))
+                .into_any_element()
+        })
+        .collect();
+
+    let panel = div()
+        .id("terminal-scheme-menu-popup")
+        .occlude()
+        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            if trigger.get().contains(&event.position) {
+                return;
+            }
+            this.scheme_menu_open = false;
+            cx.notify();
+        }))
+        .track_scroll(scroll)
+        .w(px(SCHEME_MENU_WIDTH))
         .max_h(px(280.))
         .overflow_y_scroll()
         .p(px(4.))

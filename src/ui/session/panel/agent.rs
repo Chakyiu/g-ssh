@@ -1733,7 +1733,9 @@ enum RestoredWait {
 
 /// What the next pending tool call is waiting on.
 enum PendingStep {
-    Ask { command: String },
+    Ask {
+        command: String,
+    },
     /// The question itself stays on the pending call.
     Question,
     Refuse(String),
