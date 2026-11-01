@@ -31,7 +31,6 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Enter, Textarea, TextareaState},
-    spinner::Spinner,
     tooltip::Tooltip,
     v_flex, ActiveTheme as _, Icon, Sizable as _,
 };
@@ -1714,8 +1713,10 @@ impl Agent {
     fn new(window: &mut Window, cx: &mut Context<ServerPanel>) -> Self {
         let question = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .rows(3)
-                .placeholder("Ask a question")
+                // One line until the text wraps, then one more per line, up to
+                // seven. Past that the field keeps that height and scrolls.
+                .auto_grow(1, 7)
+                .placeholder("Ask anything")
         });
         Self {
             question,
@@ -2146,11 +2147,7 @@ impl ServerPanel {
     ) {
         let question = self.agent.as_ref().map(|agent| agent.question.clone());
         let draft = chat.draft.clone();
-        let placeholder = if chat.bubbles.is_empty() {
-            "Ask a question"
-        } else {
-            "Add a follow-up"
-        };
+        let placeholder = "Ask anything";
         self.install_body();
         if let Some(question) = question {
             question.update(cx, |state, cx| {
@@ -3133,6 +3130,13 @@ impl ServerPanel {
 
     fn transcript(&self, scroll: &ScrollHandle, cx: &Context<Self>) -> impl IntoElement {
         let live = self.agent.as_ref().and_then(|agent| agent.live_reply);
+        let title = self.agent.as_ref().and_then(|agent| {
+            agent
+                .book
+                .open
+                .get(agent.book.active)
+                .map(|chat| chat.title.clone())
+        });
         let bubbles = self.agent.as_ref().map(|agent| &agent.bubbles);
         v_flex()
             .id("agent-transcript")
@@ -3140,9 +3144,17 @@ impl ServerPanel {
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(scroll)
-            .gap(px(16.))
+            .gap(px(18.))
             .pr(px(2.))
-            .pb(px(20.))
+            .pb(px(12.))
+            .when_some(title, |column, title| {
+                column.child(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .child(chat_title_pill(title, cx)),
+                )
+            })
             .children(bubbles.into_iter().flat_map(|bubbles| {
                 bubbles
                     .iter()
@@ -3241,29 +3253,26 @@ impl ServerPanel {
             })
             .unwrap_or((0, 0));
         let muted = cx.theme().muted_foreground;
-        let label = if tokens == 0 {
-            "Working".to_string()
-        } else {
-            format!("{} tok/s", tokens_per_sec(tokens, elapsed.max(1)))
-        };
+        let seconds = format!("{}s", elapsed / 1000);
         h_flex()
             .items_center()
             .gap(px(8.))
             .px(px(2.))
-            .child(Spinner::new().xsmall().color(muted))
             .child(
                 div()
-                    .text_size(chat_text())
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_size(px(12.))
                     .text_color(cx.theme().foreground)
-                    .child(label),
+                    .child("Working"),
             )
-            .child(
-                div()
-                    .text_size(chat_text())
-                    .text_color(muted)
-                    .child(format!("{}s", elapsed / 1000)),
-            )
+            .child(div().text_size(px(12.)).text_color(muted).child(seconds))
+            .when(tokens > 0, |row| {
+                row.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child(format!("{} tok/s", tokens_per_sec(tokens, elapsed.max(1)))),
+                )
+            })
     }
 
     fn command_dock(
@@ -3356,7 +3365,13 @@ impl ServerPanel {
         let Some(agent) = &self.agent else {
             return h_flex().into_any_element();
         };
-        let tabs: Vec<(usize, String, String, bool)> = agent
+        let title = agent
+            .book
+            .open
+            .get(agent.book.active)
+            .map(|chat| chat.title.clone())
+            .unwrap_or_else(|| "New chat".into());
+        let open: Vec<(usize, String, String, bool)> = agent
             .book
             .open
             .iter()
@@ -3376,39 +3391,7 @@ impl ServerPanel {
             .iter()
             .map(|chat| (chat.id.clone(), chat.title.clone()))
             .collect();
-        let history_open = agent.history_open;
-        v_flex()
-            .flex_none()
-            .gap(px(4.))
-            .pb(px(6.))
-            .border_b_1()
-            .border_color(theme::border())
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(4.))
-                    .child(
-                        h_flex()
-                            .id("agent-tabs")
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .gap(px(2.))
-                            .children(tabs.into_iter().map(|(ix, id, title, active)| {
-                                chat_tab(ix, id, title, active, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("agent-new-chat")
-                            .xsmall()
-                            .ghost()
-                            .icon(Icon::empty().path("icons/plus.svg"))
-                            .tooltip("New chat")
-                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-                    )
-                    .child(history_menu(history, history_open, cx)),
-            )
-            .into_any_element()
+        chat_switcher(title, open, history, agent.history_open, cx).into_any_element()
     }
 
     fn queue_list(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -3454,7 +3437,7 @@ impl ServerPanel {
         };
         v_flex()
             .flex_none()
-            .rounded(px(12.))
+            .rounded(px(16.))
             .border_1()
             .border_color(theme::border())
             .bg(theme::field())
@@ -3484,54 +3467,53 @@ impl ServerPanel {
                 )
             })
             .child(
-                Textarea::new(question)
-                    .appearance(false)
-                    .bordered(false)
-                    .text_size(chat_text())
-                    .px(px(4.))
-                    .h(px(72.))
-                    .w_full()
-                    .on_paste(move |item, _, cx| {
-                        let images = match pasted_images(item) {
-                            Ok(images) if images.is_empty() => return false,
-                            Ok(images) => images,
-                            Err(reason) => {
-                                panel
-                                    .update(cx, |this, cx| {
-                                        this.set_error(reason);
-                                        cx.notify();
-                                    })
-                                    .ok();
-                                return true;
-                            }
-                        };
-                        let keep_text = clipboard_has_text(item);
-                        panel
-                            .update(cx, |this, cx| this.attach_images(images, cx))
-                            .is_ok()
-                            && !keep_text
-                    }),
-            )
-            .child(
                 h_flex()
-                    .px(px(6.))
-                    .pb(px(6.))
-                    .items_center()
-                    .justify_between()
+                    .items_end()
+                    .gap(px(4.))
+                    .pl(px(12.))
+                    .pr(px(6.))
+                    .py(px(4.))
                     .child(
-                        h_flex().gap(px(2.)).child(
-                            Button::new("agent-open-settings")
-                                .xsmall()
-                                .ghost()
-                                .icon(Icon::empty().path("icons/settings.svg"))
-                                .tooltip("Settings")
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(ServerPanelEvent::OpenAgentSettings);
-                                })),
-                        ),
+                        Textarea::new(question)
+                            .appearance(false)
+                            .bordered(false)
+                            .text_size(chat_text())
+                            .px(px(2.))
+                            .flex_1()
+                            .on_paste(move |item, _, cx| {
+                                let images = match pasted_images(item) {
+                                    Ok(images) if images.is_empty() => return false,
+                                    Ok(images) => images,
+                                    Err(reason) => {
+                                        panel
+                                            .update(cx, |this, cx| {
+                                                this.set_error(reason);
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        return true;
+                                    }
+                                };
+                                let keep_text = clipboard_has_text(item);
+                                panel
+                                    .update(cx, |this, cx| this.attach_images(images, cx))
+                                    .is_ok()
+                                    && !keep_text
+                            }),
+                    )
+                    .child(
+                        Button::new("agent-open-settings")
+                            .xsmall()
+                            .ghost()
+                            .icon(Icon::empty().path("icons/settings.svg"))
+                            .tooltip("Settings")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(ServerPanelEvent::OpenAgentSettings);
+                            })),
                     )
                     .child(
                         h_flex()
+                            .flex_none()
                             .gap(px(4.))
                             .when(!can_send && has_draft, |row| {
                                 row.child(
@@ -3569,143 +3551,101 @@ impl ServerPanel {
     }
 }
 
-fn chat_tab(
-    ix: usize,
-    id: String,
+fn chat_switcher(
     title: String,
-    active: bool,
-    cx: &Context<ServerPanel>,
-) -> gpui::Stateful<gpui::Div> {
-    let title_color = if active {
-        cx.theme().foreground
-    } else {
-        cx.theme().muted_foreground
-    };
-    h_flex()
-        .id(("agent-tab", ix))
-        .h(px(26.))
-        .max_w(px(180.))
-        .pl(px(8.))
-        .pr(px(4.))
-        .gap(px(6.))
-        .items_center()
-        .flex_none()
-        .rounded(px(6.))
-        .when(active, |el| el.bg(theme::element()))
-        .when(!active, |el| {
-            el.hover(|style| style.bg(theme::element_hover()))
-        })
-        .cursor_pointer()
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.activate_chat(ix, window, cx);
-        }))
-        .child(if active {
-            Icon::empty()
-                .path("icons/message-square.svg")
-                .size(px(13.))
-                .text_color(theme::accent())
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.))
-                .flex_none()
-                .rounded_full()
-                .bg(theme::accent())
-                .into_any_element()
-        })
-        .child(
-            div()
-                .max_w(px(120.))
-                .truncate()
-                .text_size(px(12.))
-                .text_color(title_color)
-                .child(title),
-        )
-        .child(
-            div()
-                .id(("agent-tab-close", ix))
-                .flex_none()
-                .size(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::element_hover()))
-                .child(
-                    Icon::empty()
-                        .path("icons/x.svg")
-                        .size(px(11.))
-                        .text_color(cx.theme().muted_foreground),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.close_chat(id.clone(), window, cx);
-                })),
-        )
-}
-
-fn history_menu(
+    open_chats: Vec<(usize, String, String, bool)>,
     history: Vec<(String, String)>,
-    open: bool,
+    menu_open: bool,
     cx: &Context<ServerPanel>,
 ) -> impl IntoElement {
     let anchor_point = Rc::new(Cell::new(Point::default()));
     let trigger_bounds = Rc::new(Cell::new(Bounds::default()));
     let probe_anchor = anchor_point.clone();
     let probe_bounds = trigger_bounds.clone();
-    div()
-        .id("agent-history-menu")
-        .relative()
-        .flex_none()
+    h_flex()
+        .items_center()
+        .gap(px(2.))
         .child(
-            Button::new("agent-history")
+            div()
+                .id("agent-history-menu")
+                .relative()
+                .flex_none()
+                .child(
+                    h_flex()
+                        .id("agent-chat-title")
+                        .h(px(28.))
+                        .max_w(px(240.))
+                        .gap(px(4.))
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(14.))
+                                .text_color(cx.theme().foreground)
+                                .child(title),
+                        )
+                        .child(
+                            Icon::empty()
+                                .path("icons/chevron-down.svg")
+                                .size(px(14.))
+                                .text_color(cx.theme().muted_foreground),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(agent) = &mut this.agent {
+                                agent.history_open = !agent.history_open;
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            let corner = bounds.corner(Anchor::BottomLeft);
+                            probe_anchor.set(point(corner.x, corner.y + px(4.)));
+                            probe_bounds.set(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+                .when(menu_open, |el| {
+                    el.child(
+                        deferred(AnchoredToTrigger {
+                            anchor: Anchor::TopLeft,
+                            anchor_point,
+                            margin: px(8.),
+                            child: chat_menu(open_chats, history, trigger_bounds, cx)
+                                .into_any_element(),
+                        })
+                        .with_priority(100),
+                    )
+                }),
+        )
+        .child(
+            Button::new("agent-new-chat")
                 .xsmall()
                 .ghost()
-                .icon(Icon::empty().path("icons/clock.svg"))
-                .tooltip("History")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if let Some(agent) = &mut this.agent {
-                        agent.history_open = !agent.history_open;
-                    }
-                    cx.notify();
-                })),
+                .icon(Icon::empty().path("icons/plus.svg"))
+                .tooltip("New chat")
+                .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
         )
-        .child(
-            canvas(
-                move |bounds, _, _| {
-                    let corner = bounds.corner(Anchor::BottomRight);
-                    probe_anchor.set(point(corner.x, corner.y + px(4.)));
-                    probe_bounds.set(bounds);
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_full(),
-        )
-        .when(open, |el| {
-            el.child(
-                deferred(AnchoredToTrigger {
-                    anchor: Anchor::TopRight,
-                    anchor_point,
-                    margin: px(8.),
-                    child: history_list(history, trigger_bounds, cx).into_any_element(),
-                })
-                .with_priority(100),
-            )
-        })
 }
 
-fn history_list(
+fn chat_menu(
+    open_chats: Vec<(usize, String, String, bool)>,
     history: Vec<(String, String)>,
     trigger: Rc<Cell<Bounds<Pixels>>>,
     cx: &Context<ServerPanel>,
 ) -> impl IntoElement {
+    let no_history = history.is_empty();
     v_flex()
         .id("agent-history-list")
         .occlude()
         .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-            // A click on the clock is the toggle. Closing here would reopen it.
+            // A click on the title is the toggle. Closing here would reopen it.
             if trigger.get().contains(&event.position) {
                 return;
             }
@@ -3714,8 +3654,8 @@ fn history_list(
             }
             cx.notify();
         }))
-        .w(px(220.))
-        .max_h(px(220.))
+        .w(px(240.))
+        .max_h(px(280.))
         .overflow_y_scroll()
         .py(px(4.))
         .rounded(px(8.))
@@ -3723,30 +3663,41 @@ fn history_list(
         .border_color(theme::border())
         .bg(theme::pop_surface())
         .shadow_md()
-        .when(history.is_empty(), |el| {
-            el.child(
-                div()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("No earlier chats"),
-            )
-        })
-        .children(history.into_iter().enumerate().map(|(ix, (id, title))| {
-            let restore_id = id.clone();
-            let remove_id = id.clone();
+        .child(
+            div()
+                .id("agent-new-chat")
+                .w_full()
+                .px(px(10.))
+                .py(px(4.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .text_color(cx.theme().foreground)
+                .hover(|style| style.bg(theme::element_hover()))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.new_chat(window, cx);
+                    if let Some(agent) = &mut this.agent {
+                        agent.history_open = false;
+                    }
+                }))
+                .child("New chat"),
+        )
+        .children(open_chats.into_iter().map(|(ix, id, title, active)| {
+            let close_id = id.clone();
             h_flex()
-                .id(("agent-history-row", ix))
+                .id(("agent-open-row", ix))
                 .w_full()
                 .px(px(10.))
                 .py(px(4.))
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
+                .when(active, |row| row.bg(theme::element()))
                 .hover(|style| style.bg(theme::element_hover()))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.restore_chat(restore_id.clone(), window, cx);
+                    this.activate_chat(ix, window, cx);
+                    if let Some(agent) = &mut this.agent {
+                        agent.history_open = false;
+                    }
                 }))
                 .child(
                     div()
@@ -3754,11 +3705,16 @@ fn history_list(
                         .min_w_0()
                         .truncate()
                         .text_size(px(12.))
+                        .text_color(if active {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        })
                         .child(title),
                 )
                 .child(
                     div()
-                        .id(("agent-history-remove", ix))
+                        .id(("agent-open-close", ix))
                         .flex_none()
                         .size(px(16.))
                         .flex()
@@ -3775,10 +3731,60 @@ fn history_list(
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.forget_chat(remove_id.clone(), window, cx);
+                            this.close_chat(close_id.clone(), window, cx);
                         })),
                 )
         }))
+        .when(!no_history, |menu| {
+            menu.child(div().my(px(4.)).h(px(1.)).bg(theme::border()))
+                .children(history.into_iter().enumerate().map(|(ix, (id, title))| {
+                    let restore_id = id.clone();
+                    let remove_id = id;
+                    h_flex()
+                        .id(("agent-history-row", ix))
+                        .w_full()
+                        .px(px(10.))
+                        .py(px(4.))
+                        .gap(px(6.))
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::element_hover()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.restore_chat(restore_id.clone(), window, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .id(("agent-history-remove", ix))
+                                .flex_none()
+                                .size(px(16.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::element_active()))
+                                .child(
+                                    Icon::empty()
+                                        .path("icons/x.svg")
+                                        .size(px(11.))
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.forget_chat(remove_id.clone(), window, cx);
+                                })),
+                        )
+                }))
+        })
 }
 
 fn save_queued(message: &QueuedMessage) -> SavedQueued {
@@ -4163,15 +4169,56 @@ fn format_gen_time(millis: u64) -> String {
     }
 }
 
-fn pace_line(pace: &ReplyPace, cx: &Context<ServerPanel>) -> gpui::Div {
+fn pace_line(pace: &ReplyPace, cx: &Context<ServerPanel>) -> impl IntoElement {
+    let muted = cx.theme().muted_foreground;
+    let time = if pace.millis >= 1000 {
+        format!("{}s", pace.millis / 1000)
+    } else {
+        format_gen_time(pace.millis)
+    };
+    h_flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            Icon::empty()
+                .path("icons/check.svg")
+                .size(px(13.))
+                .text_color(gpui::hsla(0.40, 0.50, 0.46, 1.)),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(cx.theme().foreground)
+                .child("Done"),
+        )
+        .child(div().text_size(px(12.)).text_color(muted).child(time))
+        .child(div().text_size(px(12.)).text_color(muted).child(format!(
+            "{} tok/s",
+            tokens_per_sec(pace.tokens, pace.millis)
+        )))
+}
+
+fn chat_title_pill(title: String, cx: &Context<ServerPanel>) -> gpui::Div {
     div()
-        .text_size(chat_text())
+        .px(px(8.))
+        .py(px(2.))
+        .rounded_full()
+        .bg(theme::element())
+        .text_size(px(11.))
         .text_color(cx.theme().muted_foreground)
-        .child(format!(
-            "{} tok/s · {}",
-            tokens_per_sec(pace.tokens, pace.millis),
-            format_gen_time(pace.millis)
-        ))
+        .child(title)
+}
+
+fn user_text(ix: usize, text: &str) -> AnyElement {
+    let plain = !text.contains(['\n', '`', '#', '[', '*']);
+    if plain {
+        return div()
+            .text_size(chat_text())
+            .line_height(relative(1.35))
+            .child(text.to_string())
+            .into_any_element();
+    }
+    markdown_text(("agent-user", ix), ix, text.to_string(), false).into_any_element()
 }
 
 fn danger_text(text: String, cx: &Context<ServerPanel>) -> gpui::Div {
@@ -4388,57 +4435,65 @@ fn chat_image(format: ImageFormat, bytes: Arc<Vec<u8>>, fit: ObjectFit) -> gpui:
 }
 
 fn queued_view(ix: usize, item: &QueuedMessage, cx: &Context<ServerPanel>) -> AnyElement {
-    v_flex()
+    h_flex()
         .w_full()
-        .gap(px(6.))
-        .px(px(10.))
-        .py(px(8.))
-        .rounded(px(10.))
-        .bg(theme::element())
+        .justify_end()
         .child(
-            h_flex()
-                .items_center()
-                .justify_between()
+            v_flex()
+                .max_w(relative(0.84))
+                .flex_none()
+                .gap(px(6.))
+                .px(px(12.))
+                .py(px(8.))
+                .rounded(px(16.))
+                .bg(theme::element())
                 .child(
-                    div()
-                        .text_size(chat_text())
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Queued"),
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(chat_text())
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Queued"),
+                        )
+                        .child(
+                            Button::new(("agent-queue-remove", ix))
+                                .xsmall()
+                                .ghost()
+                                .icon(Icon::empty().path("icons/x.svg"))
+                                .tooltip("Remove")
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| this.remove_queued(ix, cx)),
+                                ),
+                        ),
                 )
-                .child(
-                    Button::new(("agent-queue-remove", ix))
-                        .xsmall()
-                        .ghost()
-                        .icon(Icon::empty().path("icons/x.svg"))
-                        .tooltip("Remove")
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_queued(ix, cx))),
-                ),
+                .children(item.cite.as_ref().map(|cite| {
+                    selection_chip(
+                        ("agent-queue-cite", ix),
+                        SharedString::from(format!("agent-queue-cite-{ix}")),
+                        cite,
+                        false,
+                        cx,
+                    )
+                }))
+                .when(!item.images.is_empty(), |el| {
+                    el.child(image_row(
+                        &format!("agent-queue-img-{ix}"),
+                        &item.images,
+                        px(240.),
+                        px(120.),
+                    ))
+                })
+                .when(!item.text.is_empty(), |el| {
+                    el.child(markdown_text(
+                        ("agent-queue", ix),
+                        ix,
+                        item.text.clone(),
+                        false,
+                    ))
+                }),
         )
-        .children(item.cite.as_ref().map(|cite| {
-            selection_chip(
-                ("agent-queue-cite", ix),
-                SharedString::from(format!("agent-queue-cite-{ix}")),
-                cite,
-                false,
-                cx,
-            )
-        }))
-        .when(!item.images.is_empty(), |el| {
-            el.child(image_row(
-                &format!("agent-queue-img-{ix}"),
-                &item.images,
-                px(240.),
-                px(120.),
-            ))
-        })
-        .when(!item.text.is_empty(), |el| {
-            el.child(markdown_text(
-                ("agent-queue", ix),
-                ix,
-                item.text.clone(),
-                false,
-            ))
-        })
         .into_any_element()
 }
 
@@ -4449,33 +4504,37 @@ fn bubble_view(
     cx: &Context<ServerPanel>,
 ) -> AnyElement {
     match bubble {
-        Bubble::User { text, cite, images } => v_flex()
+        Bubble::User { text, cite, images } => h_flex()
             .w_full()
-            .gap(px(6.))
-            .px(px(10.))
-            .py(px(8.))
-            .rounded(px(10.))
-            .bg(theme::element())
-            .children(cite.as_ref().map(|cite| {
-                selection_chip(
-                    ("agent-cite", ix),
-                    SharedString::from(format!("agent-cite-{ix}")),
-                    cite,
-                    false,
-                    cx,
-                )
-            }))
-            .when(!images.is_empty(), |el| {
-                el.child(image_row(
-                    &format!("agent-bubble-img-{ix}"),
-                    images,
-                    px(240.),
-                    px(120.),
-                ))
-            })
-            .when(!text.is_empty(), |el| {
-                el.child(markdown_text(("agent-user", ix), ix, text.clone(), false))
-            })
+            .justify_end()
+            .child(
+                v_flex()
+                    .max_w(relative(0.84))
+                    .flex_none()
+                    .gap(px(6.))
+                    .px(px(12.))
+                    .py(px(7.))
+                    .rounded(px(16.))
+                    .bg(theme::element())
+                    .children(cite.as_ref().map(|cite| {
+                        selection_chip(
+                            ("agent-cite", ix),
+                            SharedString::from(format!("agent-cite-{ix}")),
+                            cite,
+                            false,
+                            cx,
+                        )
+                    }))
+                    .when(!images.is_empty(), |el| {
+                        el.child(image_row(
+                            &format!("agent-bubble-img-{ix}"),
+                            images,
+                            px(240.),
+                            px(120.),
+                        ))
+                    })
+                    .when(!text.is_empty(), |el| el.child(user_text(ix, text))),
+            )
             .into_any_element(),
         Bubble::Agent { text, pace } => v_flex()
             .w_full()
