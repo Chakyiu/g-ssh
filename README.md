@@ -74,7 +74,10 @@ stay in `vault.json`.
 
 The password is stretched with Argon2id. Vault contents are encrypted with
 XChaCha20-Poly1305. The data key stays locked in memory, and core dumps are
-disabled while the app runs.
+disabled while the app runs. Agent chats are not in the vault. Each file
+under `agent-chats/` is sealed with a key derived from that data key, so
+the master password opens them and changing the password does not rewrite
+them.
 
 Signing in with GitHub attaches the vault to an account. The vault password
 becomes the account password, and changes sync. A host can be shared with a
@@ -147,7 +150,7 @@ The app writes under `~/.g-ssh`:
 | --- | --- |
 | `vault.json` | The encrypted vault: keys, snippets, groups, account sync, and the agent endpoint |
 | `connections/` | One JSON file per host. The password in the file is sealed |
-| `agent-chats/` | Agent chats, one JSON file per host. This computer only |
+| `agent-chats/` | Agent chats, one sealed file per host. This computer only. An older plaintext file is sealed the next time it is read |
 | `preferences.json` | Theme, terminal, and other settings read before unlock |
 | `file_associations.json` | Which local app opens a given file type |
 | `open_tabs.json` | Hosts that were open, so the next start opens them again. This computer only |

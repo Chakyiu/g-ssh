@@ -8,7 +8,7 @@ reports that the compressed folder is invalid.
 This writes a deflate zip with the CRC and sizes in each local header, so
 general-purpose bit 3 stays clear. Explorer rejects archives that set that
 bit. Entry names use '/', which is what the zip format requires. The updater
-unpacks this file with Windows tar.
+reads this zip itself.
 """
 
 import sys

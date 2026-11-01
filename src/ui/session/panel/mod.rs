@@ -128,6 +128,8 @@ pub struct ServerPanel {
     /// Last seen generation of saved agent chats. Settings bumps it when a
     /// record is removed, and the next frame drops that chat here too.
     chat_epoch: u64,
+    /// A save ran while the vault was locked. Seal the file once it unlocks.
+    chats_need_seal: bool,
 }
 
 enum NextStep {
@@ -156,6 +158,9 @@ impl ServerPanel {
             if !vault.read(cx).agent_enabled() && this.showing_agent {
                 this.showing_agent = false;
                 cx.emit(ServerPanelEvent::WidthChanged);
+            }
+            if this.chats_need_seal && vault.read(cx).manager().is_some() {
+                this.persist_chats(cx);
             }
             cx.notify();
         })
@@ -212,6 +217,7 @@ impl ServerPanel {
             wake,
             _poll_task: poll_task,
             chat_epoch: agent_store::chat_record_epoch(),
+            chats_need_seal: false,
         }
     }
 

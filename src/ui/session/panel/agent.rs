@@ -2202,8 +2202,11 @@ impl ServerPanel {
         if self.agent.is_some() {
             return;
         }
+        let Some(key) = self.chat_key(cx) else {
+            return;
+        };
         let host = self.host_key(cx);
-        let book = ChatBook::load(&host);
+        let book = ChatBook::load(&host, &key);
         let mut agent = Agent::new(window, cx);
         agent.book = book;
         self.agent = Some(agent);
@@ -2216,12 +2219,21 @@ impl ServerPanel {
         if now == self.chat_epoch {
             return;
         }
-        self.chat_epoch = now;
         if self.agent.is_none() {
+            self.chat_epoch = now;
             return;
         }
+        // Locked: try again after unlock, so a deletion is not missed.
+        let Some(key) = self.chat_key(cx) else {
+            return;
+        };
         let host = self.host_key(cx);
-        let disk = super::agent_store::ChatBook::load(&host);
+        let disk = super::agent_store::ChatBook::load(&host, &key);
+        if !disk.can_save() {
+            self.chat_epoch = now;
+            return;
+        }
+        self.chat_epoch = now;
         let mut keep = Vec::new();
         for chat in disk.open.iter().chain(&disk.closed) {
             if !chat.is_blank() {
@@ -2321,15 +2333,30 @@ impl ServerPanel {
         chat.wait_started_ms = wait_started_ms;
     }
 
-    fn persist_chats(&mut self, cx: &App) {
+    fn chat_key(&self, cx: &App) -> Option<gssh::vault::AgentChatKey> {
+        self.vault_state
+            .read(cx)
+            .manager()
+            .map(|manager| manager.agent_chat_key())
+    }
+
+    pub(super) fn persist_chats(&mut self, cx: &App) {
         let host = self.host_key(cx);
         self.sync_active(cx);
         let Some(book) = self.agent.as_ref().map(|agent| agent.book.clone()) else {
+            self.chats_need_seal = false;
             return;
         };
+        let Some(key) = self.chat_key(cx) else {
+            // The reply can finish while the vault is locked. The transcript
+            // stays in memory and is sealed once the vault opens again.
+            self.chats_need_seal = true;
+            return;
+        };
+        self.chats_need_seal = false;
         cx.background_executor()
             .spawn(async move {
-                book.save(&host);
+                book.save(&host, &key);
             })
             .detach();
     }

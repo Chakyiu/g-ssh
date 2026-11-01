@@ -525,87 +525,119 @@ fn verify_signature(app: &Path) -> Result<(), UpdateError> {
     }
 }
 
-/// Windows' own bsdtar. A `tar` earlier on `PATH` is often Git's GNU tar,
-/// which cannot read the zip a release publishes.
-#[cfg(windows)]
-fn tar_program() -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let system = root.join("System32").join("tar.exe");
-    if system.is_file() {
-        system
-    } else {
-        PathBuf::from("tar")
-    }
-}
-
-/// Drop the `\\?\` prefix before handing a path to `tar`.
+/// Unpack `archive` into `dest`.
 ///
-/// `canonicalize` adds that prefix, and the unpack folder is built from the
-/// canonical app path. Windows `tar` then fails with
-/// `could not chdir to '\\?\...'`: its `chdir` calls the ANSI API, which
-/// rejects the prefix.
+/// Windows `tar.exe` is bsdtar. Its `-C` calls the ANSI `chdir`, and the
+/// unpack folder is built from the canonical app path, so it also carries a
+/// `\\?\` prefix. A directory whose name is outside the active code page
+/// fails with `could not chdir to '...\??\...'`. A OneDrive folder with a
+/// Chinese name is enough. The wide file APIs accept that path as written.
 #[cfg(any(windows, test))]
-fn path_for_tar(path: &Path) -> PathBuf {
-    let text = path.as_os_str().to_string_lossy();
-    let stripped = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        Some(format!(r"\\{rest}"))
-    } else {
-        text.strip_prefix(r"\\?\").map(str::to_string)
-    };
-    match stripped {
-        Some(rest) if !rest.is_empty() => PathBuf::from(rest),
-        _ => path.to_path_buf(),
-    }
-}
-
-#[cfg(windows)]
 fn unpack_zip(archive: &Path, dest: &Path) -> Result<(), UpdateError> {
-    archive_listing_is_safe(archive)?;
-    let output = Command::new(tar_program())
-        .arg("-xf")
-        .arg(path_for_tar(archive))
-        .arg("-C")
-        .arg(path_for_tar(dest))
-        .output()
-        .map_err(|e| UpdateError::Install(format!("could not unpack the build: {e}")))?;
-    if !output.status.success() {
-        return Err(command_error("could not unpack the build", &output));
-    }
-    if tree_stays_inside(dest).is_err() {
-        let _ = fs::remove_dir_all(dest);
-        return Err(UpdateError::NotAnApp);
-    }
-    Ok(())
+    unpack_limited(archive, dest, super::MAX_DOWNLOAD_BYTES)
 }
 
-/// Refuse a listing that could write outside the unpack folder.
-#[cfg(windows)]
-fn archive_listing_is_safe(archive: &Path) -> Result<(), UpdateError> {
-    let output = Command::new(tar_program())
-        .arg("-tf")
-        .arg(path_for_tar(archive))
-        .output()
-        .map_err(|e| UpdateError::Install(format!("could not unpack the build: {e}")))?;
-    if !output.status.success() {
-        return Err(command_error("could not unpack the build", &output));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let path = Path::new(line.trim());
-        let escapes = path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir));
-        if escapes {
-            return Err(UpdateError::NotAnApp);
+#[cfg(any(windows, test))]
+fn unpack_limited(archive: &Path, dest: &Path, limit: u64) -> Result<(), UpdateError> {
+    use std::io::Read as _;
+
+    let file = fs::File::open(archive).map_err(unpack_message)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(unpack_message)?;
+    let mut written = 0u64;
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index).map_err(unpack_message)?;
+        if entry.is_symlink() || entry.encrypted() {
+            return Err(discard_unpack(dest));
+        }
+        let rel = {
+            let name = entry.name().map_err(|_| discard_unpack(dest))?;
+            entry_path(&name).ok_or_else(|| discard_unpack(dest))?
+        };
+        let out = dest.join(&rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&out).map_err(unpack_message)?;
+            continue;
+        }
+        if !entry.is_file() {
+            return Err(discard_unpack(dest));
+        }
+        let size = entry.size();
+        if size > limit || written.saturating_add(size) > limit {
+            let _ = fs::remove_dir_all(dest);
+            return Err(UpdateError::TooLarge);
+        }
+        written += size;
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(unpack_message)?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&out)
+            .map_err(|error| match error.kind() {
+                // The archive names a path that was already written.
+                std::io::ErrorKind::AlreadyExists => discard_unpack(dest),
+                _ => unpack_message(error),
+            })?;
+        let copied = std::io::copy(&mut entry.take(size), &mut file).map_err(unpack_message)?;
+        if copied != size {
+            return Err(discard_unpack(dest));
         }
     }
+    #[cfg(windows)]
+    if tree_stays_inside(dest).is_err() {
+        return Err(discard_unpack(dest));
+    }
     Ok(())
 }
 
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+/// A zip entry that stays inside the unpack folder.
+///
+/// Absolute paths, drive prefixes, and any `..` are refused. `foo/../bar`
+/// is refused too: a directory symlink in between would make it land outside.
+#[cfg(any(windows, test))]
+fn entry_path(name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains('\0') || name.starts_with(['/', '\\']) {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return None;
+    }
+    let mut path = PathBuf::new();
+    for component in name.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." || component.contains(':') {
+            return None;
+        }
+        path.push(component);
+    }
+    let ordinary = path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    if path.components().next().is_some() && ordinary {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(windows, test))]
+fn discard_unpack(dest: &Path) -> UpdateError {
+    let _ = fs::remove_dir_all(dest);
+    UpdateError::NotAnApp
+}
+
+#[cfg(any(windows, test))]
+fn unpack_message(error: impl std::fmt::Display) -> UpdateError {
+    let detail = error.to_string();
+    let detail: String = detail.chars().take(200).collect();
+    UpdateError::Install(format!("could not unpack the build: {detail}"))
+}
+
+#[cfg(target_os = "macos")]
 fn command_error(what: &str, output: &std::process::Output) -> UpdateError {
     let detail = String::from_utf8_lossy(&output.stderr);
     let detail = detail.trim();
@@ -1212,6 +1244,8 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1324,22 +1358,131 @@ mod tests {
         assert!(matches!(validate_bundle(&app), Err(UpdateError::NotAnApp)));
     }
 
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, bytes) in files {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
     #[test]
-    fn tar_is_not_given_a_verbatim_path() {
+    fn zip_entry_paths_that_leave_the_folder_are_refused() {
         assert_eq!(
-            path_for_tar(Path::new(
-                r"\\?\C:\Program Files\g-ssh\.g-ssh-update-abc\unpack"
-            )),
-            Path::new(r"C:\Program Files\g-ssh\.g-ssh-update-abc\unpack")
+            entry_path("g-ssh-0.2.2-windows-x86_64/g-ssh.exe"),
+            Some(PathBuf::from("g-ssh-0.2.2-windows-x86_64").join("g-ssh.exe"))
         );
         assert_eq!(
-            path_for_tar(Path::new(r"\\?\UNC\server\share\unpack")),
-            Path::new(r"\\server\share\unpack")
+            entry_path(r"g-ssh-0.2.2-windows-x86_64\g-ssh.exe"),
+            Some(PathBuf::from("g-ssh-0.2.2-windows-x86_64").join("g-ssh.exe"))
         );
+        for name in [
+            "../g-ssh.exe",
+            "foo/../../g-ssh.exe",
+            "/g-ssh.exe",
+            r"\g-ssh.exe",
+            r"C:\g-ssh.exe",
+            "C:g-ssh.exe",
+            r"\\server\share\g-ssh.exe",
+            "",
+            "foo/../bar",
+        ] {
+            assert!(entry_path(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_verbatim_prefix_stays_on_the_unpack_path() {
+        let rel = entry_path("g-ssh-0.2.2-windows-x86_64/g-ssh.exe").unwrap();
+        let dest = Path::new(r"\\?\C:\Users\lcyha\OneDrive\文档\.g-ssh-update-abc\unpack");
+        let out = dest.join(rel);
+        assert!(out.starts_with(dest), "{}", out.display());
+        assert_eq!(out.file_name(), Some(OsStr::new("g-ssh.exe")));
+    }
+
+    #[test]
+    fn a_release_zip_unpacks_into_a_folder_outside_the_ansi_code_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("文档");
+        fs::create_dir(&folder).unwrap();
+        let archive = folder.join("g-ssh-0.2.2-windows-x86_64.zip");
+        write_zip(
+            &archive,
+            &[
+                ("g-ssh-0.2.2-windows-x86_64/g-ssh.exe", b"exe"),
+                ("g-ssh-0.2.2-windows-x86_64/LICENSE.txt", b"license"),
+            ],
+        );
+        let unpack = folder.join("unpack");
+        fs::create_dir(&unpack).unwrap();
+
+        unpack_zip(&archive, &unpack).unwrap();
+
+        let exe = find_named_file(&unpack, "g-ssh.exe").unwrap();
+        assert_eq!(fs::read(exe).unwrap(), b"exe");
         assert_eq!(
-            path_for_tar(Path::new(r"C:\g-ssh\unpack")),
-            Path::new(r"C:\g-ssh\unpack")
+            fs::read(
+                unpack
+                    .join("g-ssh-0.2.2-windows-x86_64")
+                    .join("LICENSE.txt")
+            )
+            .unwrap(),
+            b"license"
         );
+    }
+
+    #[test]
+    fn a_zip_that_steps_out_of_the_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("bad.zip");
+        write_zip(&archive, &[("../g-ssh.exe", b"exe")]);
+        let unpack = dir.path().join("unpack");
+        fs::create_dir(&unpack).unwrap();
+
+        let error = unpack_zip(&archive, &unpack).unwrap_err();
+
+        assert!(matches!(error, UpdateError::NotAnApp), "{error}");
+        assert!(!dir.path().join("g-ssh.exe").exists());
+    }
+
+    #[test]
+    fn a_symlink_in_the_zip_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("link.zip");
+        let file = fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_symlink(
+            "g-ssh.exe",
+            "/tmp/other",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        let unpack = dir.path().join("unpack");
+        fs::create_dir(&unpack).unwrap();
+
+        let error = unpack_zip(&archive, &unpack).unwrap_err();
+
+        assert!(matches!(error, UpdateError::NotAnApp), "{error}");
+        assert!(!unpack.join("g-ssh.exe").exists());
+    }
+
+    #[test]
+    fn a_zip_bigger_than_the_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("big.zip");
+        write_zip(&archive, &[("g-ssh.exe", b"abcde")]);
+        let unpack = dir.path().join("unpack");
+        fs::create_dir(&unpack).unwrap();
+
+        let error = unpack_limited(&archive, &unpack, 4).unwrap_err();
+
+        assert!(matches!(error, UpdateError::TooLarge), "{error}");
+        assert!(!unpack.join("g-ssh.exe").exists());
     }
 
     #[test]

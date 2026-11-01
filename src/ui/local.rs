@@ -144,7 +144,7 @@ impl LocalTerminal {
 
     fn active_label(&self) -> String {
         if self.shells.len() <= 1 {
-            "Local".to_string()
+            "Terminal".to_string()
         } else {
             (self.active + 1).to_string()
         }
@@ -374,7 +374,7 @@ impl LocalTerminal {
         let is_active = index == self.active;
         let exited = self.shells.get(index).is_some_and(|shell| shell.exited);
         let label = if self.shells.len() == 1 {
-            "Local".to_string()
+            "Terminal".to_string()
         } else {
             (index + 1).to_string()
         };
@@ -468,10 +468,12 @@ impl LocalTerminal {
                     .child(err.clone()),
             );
         }
-        strip.child(self.render_tools(cx)).into_any_element()
+        strip.into_any_element()
     }
 
-    fn render_tools(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Agent and overview, drawn on the workspace tab row. The shell tabs
+    /// stay on the row under that, the same place a connection puts them.
+    pub(crate) fn render_tools(&self, cx: &mut Context<Self>) -> AnyElement {
         let agent_on = self.panel_shown && self.panel.read(cx).shows_agent();
         let inspector_on = self.panel_shown && !self.panel.read(cx).shows_agent();
         h_flex()

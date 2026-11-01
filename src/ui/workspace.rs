@@ -1,7 +1,8 @@
-//! Tabs for open connections. Each tab is one host's terminal or its SFTP
-//! browser. A middle-click closes the tab. Dropping a tab on another tab
-//! reorders the strip. Dropping it on an edge splits that cell, so two
-//! different connections can sit side by side.
+//! Tabs for open connections and the shell on this computer. Each tab is one
+//! host's terminal, its SFTP browser, or the local shell. A middle-click
+//! closes the tab. Dropping a tab on another tab reorders the strip. Dropping
+//! it on an edge splits that cell, so two different connections can sit side
+//! by side.
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
@@ -17,6 +18,7 @@ use gpui_component::{
 };
 
 use crate::theme;
+use crate::ui::local::LocalTerminal;
 use crate::ui::session::{DockEdge, LayoutNode, ServerSession, TermPane};
 use crate::ui::terminal::tabs::{
     bounds_contain, collapse_layout, dock_edge_at, first_pane, layout_contains, replace_leaf,
@@ -29,19 +31,47 @@ pub(crate) enum WorkKind {
     Sftp,
 }
 
+/// The tab the workspace just brought to the front.
+pub(crate) enum FrontTab {
+    Host(String),
+    Local,
+}
+
 pub(crate) enum WorkspaceEvent {
-    /// The tab in front belongs to this host.
-    Activated(String),
+    /// A tab came to the front.
+    Activated(FrontTab),
     /// The last tab for this connection was closed.
     SessionUnused(Entity<ServerSession>),
+    /// The local tab was closed and no other tab is in front.
+    LocalDismissed,
     /// Connections in visual tab order, left to right across the grid.
     OrderChanged(Vec<Entity<ServerSession>>),
 }
 
+enum WorkBody {
+    Session {
+        session: Entity<ServerSession>,
+        kind: WorkKind,
+        surface: Entity<SurfaceView>,
+    },
+    Local(Entity<LocalTerminal>),
+}
+
 struct WorkDoc {
-    session: Entity<ServerSession>,
-    kind: WorkKind,
-    surface: Entity<SurfaceView>,
+    body: WorkBody,
+}
+
+impl WorkDoc {
+    fn session(&self) -> Option<&Entity<ServerSession>> {
+        match &self.body {
+            WorkBody::Session { session, .. } => Some(session),
+            WorkBody::Local(_) => None,
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        matches!(self.body, WorkBody::Local(_))
+    }
 }
 
 /// Draws one connection as either its terminal or its file browser.
@@ -105,7 +135,15 @@ impl Workspace {
     /// The host of the tab in front, when a connection is on screen.
     pub(crate) fn focused_host(&self, cx: &App) -> Option<String> {
         let ix = self.shown(self.current_pane())?;
-        Some(self.docs.get(ix)?.session.read(cx).server_id.clone())
+        let session = self.docs.get(ix)?.session()?;
+        Some(session.read(cx).server_id.clone())
+    }
+
+    /// The local shell's tab is the one in front.
+    pub(crate) fn focused_is_local(&self) -> bool {
+        self.shown(self.current_pane())
+            .and_then(|ix| self.docs.get(ix))
+            .is_some_and(|doc| doc.is_local())
     }
 
     pub(crate) fn show_hosts(&mut self, cx: &mut Context<Self>) {
@@ -130,9 +168,11 @@ impl Workspace {
         let surface = cx.new(|cx| SurfaceView::new(session.clone(), files, cx));
         let ix = self.docs.len();
         self.docs.push(WorkDoc {
-            session: session.clone(),
-            kind,
-            surface,
+            body: WorkBody::Session {
+                session: session.clone(),
+                kind,
+                surface,
+            },
         });
         let pane = self.current_pane();
         if let Some(slot) = self.panes.get_mut(pane) {
@@ -144,6 +184,72 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Open the local shell as a tab beside the connections. A second request
+    /// brings the existing tab forward. Closing it leaves the shell running.
+    pub(crate) fn open_local(&mut self, local: Entity<LocalTerminal>, cx: &mut Context<Self>) {
+        self.show_hosts = false;
+        if let Some(ix) = self.docs.iter().position(|doc| doc.is_local()) {
+            self.activate_doc(ix, cx);
+            return;
+        }
+        let ix = self.docs.len();
+        self.docs.push(WorkDoc {
+            body: WorkBody::Local(local),
+        });
+        let pane = self.current_pane();
+        if let Some(slot) = self.panes.get_mut(pane) {
+            slot.tabs.push(ix);
+            slot.active = ix;
+        }
+        self.focused_pane = pane;
+        self.emit_activated(ix, cx);
+        cx.notify();
+    }
+
+    /// Take the local tab out of the strip. The shell itself stays up.
+    pub(crate) fn close_local(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.docs.iter().position(|doc| doc.is_local()) {
+            self.close_doc(ix, true, cx);
+        }
+    }
+
+    /// Take the local tab out without telling the app. Used when the view is
+    /// being cleared.
+    pub(crate) fn dismiss_local(&mut self, cx: &mut Context<Self>) {
+        if let Some(ix) = self.docs.iter().position(|doc| doc.is_local()) {
+            self.close_doc(ix, false, cx);
+        }
+    }
+
+    /// Bring a connection's tab forward. The file browser stays in front when
+    /// that is what this cell is already showing.
+    pub(crate) fn show_session(&mut self, session: &Entity<ServerSession>, cx: &mut Context<Self>) {
+        if let Some(ix) = self.shown(self.current_pane()) {
+            if self.docs.get(ix).and_then(WorkDoc::session) == Some(session) {
+                self.show_hosts = false;
+                cx.notify();
+                return;
+            }
+        }
+        let terminal = self.docs.iter().position(|doc| {
+            matches!(
+                &doc.body,
+                WorkBody::Session {
+                    session: found,
+                    kind: WorkKind::Terminal,
+                    ..
+                } if found == session
+            )
+        });
+        let any = self
+            .docs
+            .iter()
+            .position(|doc| doc.session() == Some(session));
+        if let Some(ix) = terminal.or(any) {
+            self.activate_doc(ix, cx);
+        }
+    }
+
     pub(crate) fn remove_session(
         &mut self,
         session: &Entity<ServerSession>,
@@ -153,7 +259,7 @@ impl Workspace {
             .docs
             .iter()
             .enumerate()
-            .filter(|(_, doc)| &doc.session == session)
+            .filter(|(_, doc)| doc.session() == Some(session))
             .map(|(ix, _)| ix)
             .collect();
         for ix in indexes.into_iter().rev() {
@@ -162,9 +268,16 @@ impl Workspace {
     }
 
     fn find_doc(&self, session: &Entity<ServerSession>, kind: WorkKind) -> Option<usize> {
-        self.docs
-            .iter()
-            .position(|doc| &doc.session == session && doc.kind == kind)
+        self.docs.iter().position(|doc| {
+            matches!(
+                &doc.body,
+                WorkBody::Session {
+                    session: found,
+                    kind: found_kind,
+                    ..
+                } if found == session && *found_kind == kind
+            )
+        })
     }
 
     fn current_pane(&self) -> usize {
@@ -205,22 +318,46 @@ impl Workspace {
         let Some(doc) = self.docs.get(ix) else {
             return;
         };
-        let id = doc.session.read(cx).server_id.clone();
-        cx.emit(WorkspaceEvent::Activated(id));
+        let front = match &doc.body {
+            WorkBody::Local(_) => FrontTab::Local,
+            WorkBody::Session { session, .. } => FrontTab::Host(session.read(cx).server_id.clone()),
+        };
+        cx.emit(WorkspaceEvent::Activated(front));
+    }
+
+    /// Tell the app which tab is in front after the local one was closed.
+    fn emit_front(&mut self, cx: &mut Context<Self>) {
+        if self.show_hosts || self.docs.is_empty() {
+            cx.emit(WorkspaceEvent::LocalDismissed);
+            return;
+        }
+        let Some(ix) = self.shown(self.current_pane()) else {
+            cx.emit(WorkspaceEvent::LocalDismissed);
+            return;
+        };
+        self.emit_activated(ix, cx);
     }
 
     fn close_doc(&mut self, ix: usize, tell_app: bool, cx: &mut Context<Self>) {
         if ix >= self.docs.len() {
             return;
         }
-        let session = self.docs[ix].session.clone();
+        let closing_local = self.docs[ix].is_local();
+        let session = self.docs[ix].session().cloned();
         self.forget_doc_index(ix);
         self.docs.remove(ix);
         if self.docs.is_empty() {
             self.show_hosts = true;
         }
-        if tell_app && !self.docs.iter().any(|doc| doc.session == session) {
-            cx.emit(WorkspaceEvent::SessionUnused(session));
+        if tell_app {
+            if let Some(session) = session {
+                if !self.docs.iter().any(|doc| doc.session() == Some(&session)) {
+                    cx.emit(WorkspaceEvent::SessionUnused(session));
+                }
+            }
+            if closing_local {
+                self.emit_front(cx);
+            }
         }
         cx.notify();
     }
@@ -328,7 +465,7 @@ impl Workspace {
         walk_docs(&self.layout, &self.panes, &mut docs);
         let mut sessions = Vec::new();
         for ix in docs {
-            let Some(session) = self.docs.get(ix).map(|doc| doc.session.clone()) else {
+            let Some(session) = self.docs.get(ix).and_then(|doc| doc.session().cloned()) else {
                 continue;
             };
             if !sessions.contains(&session) {
@@ -401,13 +538,16 @@ impl Workspace {
     }
 
     fn doc_label(&self, ix: usize, cx: &App) -> String {
-        let Some(doc) = self.docs.get(ix) else {
-            return String::new();
-        };
-        let name = doc.session.read(cx).conn_info.display_name().to_string();
-        match doc.kind {
-            WorkKind::Terminal => name,
-            WorkKind::Sftp => format!("{name} SFTP"),
+        match self.docs.get(ix).map(|doc| &doc.body) {
+            Some(WorkBody::Local(_)) => "Local".to_string(),
+            Some(WorkBody::Session { session, kind, .. }) => {
+                let name = session.read(cx).conn_info.display_name().to_string();
+                match kind {
+                    WorkKind::Terminal => name,
+                    WorkKind::Sftp => format!("{name} SFTP"),
+                }
+            }
+            None => String::new(),
         }
     }
 }
@@ -497,33 +637,54 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Transfers, forwards, and the inspector, on the tab row of the
-    /// connection in front. The host name already lives on the tab.
+    /// Transfers, forwards, and the inspector, on the tab row of whatever is
+    /// in front. The name already lives on the tab.
     fn render_pane_controls(&self, pane: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(doc) = self.shown(pane).and_then(|ix| self.docs.get(ix)) else {
+        let Some(ix) = self.shown(pane) else {
             return div().into_any_element();
         };
-        doc.session.update(cx, |session, cx| {
-            h_flex()
-                .flex_none()
-                .gap(px(4.))
-                .pr(px(8.))
-                .items_center()
-                .when_some(session.render_forward_chip(cx), |el, chip| el.child(chip))
-                .when_some(session.render_task_pills(cx), |el, pills| el.child(pills))
-                .when_some(session.render_agent_button(cx), |el, button| {
-                    el.child(button)
+        let Some(doc) = self.docs.get(ix) else {
+            return div().into_any_element();
+        };
+        match &doc.body {
+            WorkBody::Local(local) => {
+                let local = local.clone();
+                let tools = local.update(cx, |local, cx| local.render_tools(cx));
+                h_flex()
+                    .flex_none()
+                    .pr(px(8.))
+                    .items_center()
+                    .child(tools)
+                    .into_any_element()
+            }
+            WorkBody::Session { session, .. } => {
+                let session = session.clone();
+                session.update(cx, |session, cx| {
+                    h_flex()
+                        .flex_none()
+                        .gap(px(4.))
+                        .pr(px(8.))
+                        .items_center()
+                        .when_some(session.render_forward_chip(cx), |el, chip| el.child(chip))
+                        .when_some(session.render_task_pills(cx), |el, pills| el.child(pills))
+                        .when_some(session.render_agent_button(cx), |el, button| {
+                            el.child(button)
+                        })
+                        .child(session.render_server_panel_toggle(cx))
+                        .into_any_element()
                 })
-                .child(session.render_server_panel_toggle(cx))
-                .into_any_element()
-        })
+            }
+        }
     }
 
     fn render_tab(&self, ix: usize, pane: usize, active: bool, cx: &Context<Self>) -> AnyElement {
         let label = self.doc_label(ix, cx);
-        let kind = self.docs.get(ix).map(|doc| doc.kind);
-        let icon = match kind {
-            Some(WorkKind::Sftp) => "icons/folder-open.svg",
+        let icon = match self.docs.get(ix).map(|doc| &doc.body) {
+            Some(WorkBody::Local(_)) => "icons/laptop.svg",
+            Some(WorkBody::Session {
+                kind: WorkKind::Sftp,
+                ..
+            }) => "icons/folder-open.svg",
             _ => "icons/square-terminal.svg",
         };
         let ghost = SharedString::from(label.clone());
@@ -669,7 +830,10 @@ impl Workspace {
         let doc = self
             .shown(pane)
             .and_then(|ix| self.docs.get(ix))
-            .map(|doc| doc.surface.clone());
+            .map(|doc| match &doc.body {
+                WorkBody::Session { surface, .. } => surface.clone().into_any_element(),
+                WorkBody::Local(local) => local.clone().into_any_element(),
+            });
         v_flex()
             .size_full()
             .overflow_hidden()

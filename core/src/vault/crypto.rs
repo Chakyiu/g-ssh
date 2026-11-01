@@ -1,3 +1,5 @@
+use std::fmt;
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -114,6 +116,67 @@ pub(crate) fn open(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// File header for an agent chat sealed with [`AgentChatKey`].
+const AGENT_CHAT_MAGIC: &[u8] = b"gsshchat";
+const AGENT_CHAT_VERSION: u8 = 1;
+/// Kept stable: changing it orphans every chat file already on disk.
+const AGENT_CHAT_PURPOSE: &str = "g-ssh.agent-chats.v1";
+
+/// Key for the agent chat files on this computer. Derived from the vault's
+/// data key, so the master password and the recovery phrase both open the
+/// files. A new password wraps that same data key and does not rewrite them.
+pub struct AgentChatKey(Zeroizing<[u8; 32]>);
+
+impl AgentChatKey {
+    pub(crate) fn from_dek(dek: &[u8; 32]) -> Self {
+        Self(derive_subkey(dek, AGENT_CHAT_PURPOSE))
+    }
+
+    /// Seal `plaintext` so only this key and `host_id` open it again.
+    /// `host_id` is not stored; it is the file's own name.
+    pub fn seal_file(&self, host_id: &str, plaintext: &[u8]) -> Vec<u8> {
+        let blob = seal(&self.0, host_id.as_bytes(), plaintext);
+        let mut out = Vec::with_capacity(AGENT_CHAT_MAGIC.len() + 1 + 24 + blob.ciphertext.len());
+        out.extend_from_slice(AGENT_CHAT_MAGIC);
+        out.push(AGENT_CHAT_VERSION);
+        out.extend_from_slice(&blob.nonce);
+        out.extend_from_slice(&blob.ciphertext);
+        out
+    }
+
+    /// `None` when the file is not ours, the host id does not match, or the
+    /// bytes were changed.
+    pub fn open_file(&self, host_id: &str, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+        let rest = sealed.strip_prefix(AGENT_CHAT_MAGIC)?;
+        let (&version, rest) = rest.split_first()?;
+        if version != AGENT_CHAT_VERSION {
+            return None;
+        }
+        let (nonce, ciphertext) = rest.split_first_chunk::<24>()?;
+        let blob = AeadBlob {
+            nonce: *nonce,
+            ciphertext: ciphertext.to_vec(),
+        };
+        open(&self.0, host_id.as_bytes(), &blob).ok()
+    }
+
+    pub fn is_sealed(bytes: &[u8]) -> bool {
+        bytes.starts_with(AGENT_CHAT_MAGIC)
+    }
+}
+
+impl Clone for AgentChatKey {
+    fn clone(&self) -> Self {
+        Self(Zeroizing::new(*self.0))
+    }
+}
+
+impl fmt::Debug for AgentChatKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AgentChatKey([redacted])")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +289,21 @@ mod tests {
         let s1 = generate_salt();
         let s2 = generate_salt();
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn an_agent_chat_opens_only_for_its_host_and_key() {
+        let key = AgentChatKey::from_dek(&[7; 32]);
+        let other = AgentChatKey::from_dek(&[8; 32]);
+        let sealed = key.seal_file("host-1", b"private transcript");
+        assert!(AgentChatKey::is_sealed(&sealed));
+        assert!(!sealed.windows(b"private".len()).any(|w| w == b"private"));
+        assert_eq!(
+            key.open_file("host-1", &sealed).unwrap().as_slice(),
+            b"private transcript"
+        );
+        assert!(key.open_file("host-2", &sealed).is_none());
+        assert!(other.open_file("host-1", &sealed).is_none());
+        assert!(!AgentChatKey::is_sealed(b"{\"open\":[]}"));
     }
 }

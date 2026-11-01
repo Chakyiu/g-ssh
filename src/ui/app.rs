@@ -40,7 +40,7 @@ use crate::ui::updates::consent::{UpdateConsentEvent, UpdateConsentView};
 use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
 use crate::ui::updates::service::{Download, UpdateService};
 use crate::ui::vault::passphrase::{PassphrasePromptEvent, PassphrasePromptView};
-use crate::ui::workspace::{WorkKind, Workspace, WorkspaceEvent};
+use crate::ui::workspace::{FrontTab, WorkKind, Workspace, WorkspaceEvent};
 use crate::ui::{dialog_chrome, dialog_form, dialog_narrow, dialog_wide, VaultState};
 use gssh::ssh::connection::Connection;
 use gssh::ssh::route::{self, CredentialIssue};
@@ -255,7 +255,7 @@ pub struct AppView {
     workspace: Entity<Workspace>,
     /// A shell on this computer. It stays up when the user switches away.
     local_terminal: Entity<LocalTerminal>,
-    /// The local terminal is in front of the host list and the open connections.
+    /// The local tab is the one in front of the workspace strip.
     showing_local: bool,
 }
 
@@ -314,17 +314,30 @@ impl AppView {
             &workspace,
             window,
             |this, _, event, window, cx| match event {
-                WorkspaceEvent::Activated(id) => {
-                    if let Some(idx) = this.tab_index_for_host(id, cx) {
-                        // A connection coming forward leaves the local terminal,
-                        // including when that connection was already the active tab.
-                        let show_it = this.showing_local || this.active_tab != idx;
-                        this.showing_local = false;
-                        if show_it {
-                            this.change_active_tab(idx, cx);
-                            this.focus_front_tab(window, cx);
+                WorkspaceEvent::Activated(front) => match front {
+                    FrontTab::Host(id) => {
+                        if let Some(idx) = this.tab_index_for_host(id, cx) {
+                            // A connection coming forward leaves the local tab,
+                            // including when that connection was already active.
+                            let show_it = this.showing_local || this.active_tab != idx;
+                            this.showing_local = false;
+                            if show_it {
+                                this.change_active_tab(idx, cx);
+                                this.focus_front_tab(window, cx);
+                            }
                         }
                     }
+                    FrontTab::Local => {
+                        this.showing_local = true;
+                        this.sidebar
+                            .update(cx, |sidebar, cx| sidebar.show_local(cx));
+                        this.focus_local_terminal(window, cx);
+                        cx.notify();
+                    }
+                },
+                WorkspaceEvent::LocalDismissed => {
+                    this.showing_local = false;
+                    this.show_all_servers(cx);
                 }
                 WorkspaceEvent::SessionUnused(session) => {
                     if let Some(idx) = this.tabs.iter().position(|tab| tab == session) {
@@ -493,6 +506,8 @@ impl AppView {
         self.picker_owed_after_unlock = None;
         self.tabs_owed_after_unlock = None;
         self.showing_local = false;
+        self.workspace
+            .update(cx, |workspace, cx| workspace.dismiss_local(cx));
         self.change_active_tab(0, cx);
         tracing::info!(
             closed_sessions,
@@ -1029,6 +1044,8 @@ impl AppView {
 
         if let Some(session) = self.tabs.get(idx) {
             let session = session.clone();
+            self.workspace
+                .update(cx, |workspace, cx| workspace.show_session(&session, cx));
             self.focus_front_tab(window, cx);
             if session.read(cx).pending_conflict.is_some() {
                 self.open_conflict_dialog(session.clone(), cx);
@@ -1250,25 +1267,25 @@ impl AppView {
         self.change_active_tab(self.tabs.len(), cx);
     }
 
-    /// Bring the local terminal forward, starting its shell the first time.
-    fn show_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.showing_local = true;
+    /// Open the local shell as a tab, starting it the first time. A later
+    /// click brings that same tab forward.
+    fn show_local(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.local_terminal
             .update(cx, |local, cx| local.ensure_started(cx));
-        self.sidebar
-            .update(cx, |sidebar, cx| sidebar.show_local(cx));
-        self.focus_local_terminal(window, cx);
-        cx.notify();
+        let local = self.local_terminal.clone();
+        self.workspace
+            .update(cx, |workspace, cx| workspace.open_local(local, cx));
     }
 
-    /// Close one local shell, or leave the local terminal when it is the last.
-    /// The last shell keeps running for the next visit.
+    /// Close one local shell, or the local tab when it is the last. The last
+    /// shell keeps running for the next visit.
     fn close_local_or_leave(&mut self, cx: &mut Context<Self>) {
         if self.local_terminal.read(cx).shell_count() > 1 {
             self.local_terminal
                 .update(cx, |local, cx| local.close_active(cx));
         } else {
-            self.show_all_servers(cx);
+            self.workspace
+                .update(cx, |workspace, cx| workspace.close_local(cx));
         }
     }
 
@@ -1956,6 +1973,17 @@ impl AppView {
         self.workspace
             .update(cx, |workspace, cx| workspace.remove_session(&session, cx));
         session.update(cx, |s, cx| s.cleanup_before_close(cx));
+        // Closing the connection that was in front can reveal the local tab.
+        if self.workspace.read(cx).focused_is_local() {
+            self.showing_local = true;
+            self.active_tab = new_active.min(self.tabs.len().saturating_sub(1));
+            self.sidebar
+                .update(cx, |sidebar, cx| sidebar.show_local(cx));
+            self.sync_session_states(cx);
+            self.remember_open_tabs(cx);
+            cx.notify();
+            return;
+        }
         if let Some(id) = self.workspace.read(cx).focused_host(cx) {
             if let Some(i) = self.tab_index_for_host(&id, cx) {
                 self.change_active_tab(i, cx);
@@ -2713,7 +2741,7 @@ impl AppView {
     }
 
     fn shortcut_next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) || self.showing_local {
+        if self.is_overlay_open(window, cx) {
             return;
         }
         let Some(next) = next_tab_index(self.active_tab, self.tabs.len()) else {
@@ -2723,7 +2751,7 @@ impl AppView {
     }
 
     fn shortcut_prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) || self.showing_local {
+        if self.is_overlay_open(window, cx) {
             return;
         }
         let Some(prev) = prev_tab_index(self.active_tab, self.tabs.len()) else {
@@ -2733,7 +2761,7 @@ impl AppView {
     }
 
     fn shortcut_activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_overlay_open(window, cx) || self.showing_local {
+        if self.is_overlay_open(window, cx) {
             return;
         }
         if idx < self.tabs.len() {
@@ -2855,9 +2883,6 @@ impl AppView {
     }
 
     fn render_active_tab(&self, cx: &App) -> AnyElement {
-        if self.showing_local {
-            return self.local_terminal.clone().into_any_element();
-        }
         if self.workspace.read(cx).is_showing_hosts() {
             self.servers_view
                 .clone()

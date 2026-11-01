@@ -1,6 +1,6 @@
 [package]
 name = "g-ssh"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "SSH and SFTP client"
 license = "MIT"
@@ -93,9 +93,26 @@ winreg = "0.56"
 # Snappy blocks in the IndexedDB LevelDB tables.
 crypto_secretbox = "0.1"
 snap = "1"
+# The updater unpacks the release zip itself. Windows tar.exe calls the ANSI
+# chdir, which fails when the install folder is outside the active code page
+# (`could not chdir to '...\??\...'`). deflate-flate2 leaves the backend
+# unset; rust_backend is miniz_oxide, already used elsewhere in the build.
+zip = { version = "9.2", default-features = false, features = [
+    "deflate-flate2",
+] }
+flate2 = { version = "1.1", default-features = false, features = [
+    "rust_backend",
+] }
 
 [dev-dependencies]
 tempfile = "3"
+# The Windows updater's zip reader, so its tests run on every platform.
+zip = { version = "9.2", default-features = false, features = [
+    "deflate-flate2",
+] }
+flate2 = { version = "1.1", default-features = false, features = [
+    "rust_backend",
+] }
 
 [workspace]
 members = [".", "core"]

@@ -1,12 +1,17 @@
 //! Agent chats for one host. The file sits beside preferences.json: it
-//! belongs to this computer and is never synced. A missing or broken file
-//! opens one empty chat.
+//! belongs to this computer and is never synced. The bytes are sealed with
+//! [`AgentChatKey`], which the master password unlocks. A missing or broken
+//! file opens one empty chat. An older plaintext file is sealed the next
+//! time it is read. A file sealed for another vault is moved aside, so this
+//! vault can keep its own chats and the old bytes stay on disk.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use gssh::vault::AgentChatKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 pub(super) const NEW_CHAT: &str = "New chat";
 const MAX_CLOSED: usize = 40;
@@ -226,6 +231,9 @@ pub(super) struct ChatBook {
     pub open: Vec<SavedChat>,
     pub active: usize,
     pub closed: Vec<SavedChat>,
+    /// False when a sealed file could not be moved aside. Saving would erase
+    /// chats this vault cannot read.
+    writable: bool,
 }
 
 impl ChatBook {
@@ -234,21 +242,28 @@ impl ChatBook {
             open: vec![SavedChat::fresh()],
             active: 0,
             closed: Vec::new(),
+            writable: true,
         }
     }
 
-    pub(super) fn load(host_id: &str) -> Self {
+    /// The file on disk belongs to another vault and could not be moved.
+    /// A save would replace chats this vault cannot read.
+    pub(super) fn can_save(&self) -> bool {
+        self.writable
+    }
+
+    pub(super) fn load(host_id: &str, key: &AgentChatKey) -> Self {
         match chat_path(host_id) {
-            Some(path) => Self::load_from(&path),
+            Some(path) => Self::load_from(&path, key),
             None => Self::fresh(),
         }
     }
 
-    pub(super) fn save(&self, host_id: &str) {
+    pub(super) fn save(&self, host_id: &str, key: &AgentChatKey) {
         let Some(path) = chat_path(host_id) else {
             return;
         };
-        if let Err(error) = self.save_to(&path) {
+        if let Err(error) = self.save_to(&path, key) {
             tracing::warn!(?error, path = %path.display(), "could not save agent chats");
         }
     }
@@ -323,34 +338,159 @@ impl ChatBook {
         true
     }
 
-    fn load_from(path: &Path) -> Self {
-        let data = match std::fs::read(path) {
-            Ok(data) => data,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::fresh(),
-            Err(error) => {
-                tracing::warn!(?error, path = %path.display(), "failed to read agent chats");
-                return Self::fresh();
+    fn load_from(path: &Path, key: &AgentChatKey) -> Self {
+        match Self::read_file(path, key) {
+            Opened::Ready(book) => book,
+            Opened::Unreadable => Self::unreadable(),
+            Opened::Missing => Self::adopt_parked(path, key).unwrap_or_else(Self::fresh),
+            Opened::Foreign => {
+                if Self::park_foreign(path) {
+                    Self::adopt_parked(path, key).unwrap_or_else(Self::fresh)
+                } else {
+                    Self::unreadable()
+                }
             }
-        };
-        let file: ChatFile = match serde_json::from_slice(&data) {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::warn!(?error, "invalid agent chats, opening a new chat");
-                return Self::fresh();
-            }
-        };
-        if file.version != FILE_VERSION || file.open.is_empty() {
-            return Self::fresh();
-        }
-        let active = file.active.min(file.open.len() - 1);
-        Self {
-            open: file.open,
-            active,
-            closed: file.closed,
         }
     }
 
-    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+    fn unreadable() -> Self {
+        let mut book = Self::fresh();
+        book.writable = false;
+        book
+    }
+
+    fn read_file(path: &Path, key: &AgentChatKey) -> Opened {
+        let mut data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Opened::Missing,
+            Err(error) => {
+                tracing::warn!(?error, path = %path.display(), "failed to read agent chats");
+                return Opened::Unreadable;
+            }
+        };
+        let Some(host_id) = file_host_id(path) else {
+            return Opened::Unreadable;
+        };
+        if AgentChatKey::is_sealed(&data) {
+            return match key.open_file(host_id, &data) {
+                Some(plain) => Opened::Ready(Self::parse_plain(&plain).unwrap_or_else(Self::fresh)),
+                None => Opened::Foreign,
+            };
+        }
+        let parsed = Self::parse_plain(&data);
+        data.zeroize();
+        match parsed {
+            Some(book) => {
+                // Replace the plaintext file now, so a later crash does not
+                // leave the transcript sitting in the clear.
+                if let Err(error) = book.save_to(path, key) {
+                    tracing::warn!(?error, path = %path.display(), "could not seal agent chats");
+                }
+                Opened::Ready(book)
+            }
+            None => Opened::Ready(Self::fresh()),
+        }
+    }
+
+    fn parse_plain(data: &[u8]) -> Option<Self> {
+        let file: ChatFile = match serde_json::from_slice(data) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(?error, "invalid agent chats, opening a new chat");
+                return None;
+            }
+        };
+        if file.version != FILE_VERSION || file.open.is_empty() {
+            return None;
+        }
+        let active = file.active.min(file.open.len() - 1);
+        Some(Self {
+            open: file.open,
+            active,
+            closed: file.closed,
+            writable: true,
+        })
+    }
+
+    /// Move a file this vault cannot open to `<name>.sealed`, leaving the
+    /// usual path free. A later unlock of the vault that wrote it can adopt
+    /// the parked file.
+    fn park_foreign(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        for n in 0..1000 {
+            let parked = if n == 0 {
+                parent.join(format!("{name}.sealed"))
+            } else {
+                parent.join(format!("{name}.{n}.sealed"))
+            };
+            if parked.exists() {
+                continue;
+            }
+            match std::fs::rename(path, &parked) {
+                Ok(()) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        kept = %parked.display(),
+                        "agent chats are sealed for another vault and were kept aside"
+                    );
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        path = %path.display(),
+                        "could not move agent chats sealed for another vault"
+                    );
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// A parked file this key can open becomes the live file again.
+    fn adopt_parked(path: &Path, key: &AgentChatKey) -> Option<Self> {
+        let host_id = file_host_id(path)?;
+        let name = path.file_name().and_then(|name| name.to_str())?;
+        let parent = path.parent()?;
+        let prefix = format!("{name}.");
+        let read = std::fs::read_dir(parent).ok()?;
+        for entry in read.flatten() {
+            let candidate = entry.path();
+            let candidate_name = entry.file_name();
+            let Some(candidate_name) = candidate_name.to_str() else {
+                continue;
+            };
+            if !candidate_name.starts_with(&prefix) || !candidate_name.ends_with(".sealed") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&candidate) else {
+                continue;
+            };
+            let Some(plain) = key.open_file(host_id, &data) else {
+                continue;
+            };
+            let book = Self::parse_plain(&plain).unwrap_or_else(Self::fresh);
+            if book.save_to(path, key).is_ok() {
+                let _ = std::fs::remove_file(&candidate);
+            }
+            return Some(book);
+        }
+        None
+    }
+
+    fn save_to(&self, path: &Path, key: &AgentChatKey) -> std::io::Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
+        let Some(host_id) = file_host_id(path) else {
+            return Err(std::io::Error::other("agent chat file has no host id"));
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -360,11 +500,23 @@ impl ChatBook {
             active: self.active,
             closed: self.closed.clone(),
         };
-        let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
+        let mut json = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
+        let sealed = key.seal_file(host_id, &json);
+        json.zeroize();
         let unfinished = path.with_extension("json.new");
-        std::fs::write(&unfinished, json)?;
+        write_private(&unfinished, &sealed)?;
         std::fs::rename(&unfinished, path)
     }
+}
+
+enum Opened {
+    Ready(ChatBook),
+    /// Not on disk.
+    Missing,
+    /// Sealed, and this vault's key does not open it.
+    Foreign,
+    /// Present, but a read error or a move failure means it must stay put.
+    Unreadable,
 }
 
 pub(super) fn chat_title(question: &str, fallback: &str) -> String {
@@ -411,7 +563,7 @@ pub struct SessionRecord {
     pub title: String,
 }
 
-pub fn list_session_records() -> Vec<SessionRecord> {
+pub fn list_session_records(key: &AgentChatKey) -> Vec<SessionRecord> {
     let Some(dir) = chats_dir() else {
         return Vec::new();
     };
@@ -427,7 +579,10 @@ pub fn list_session_records() -> Vec<SessionRecord> {
         let Some(host_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let book = ChatBook::load_from(&path);
+        let book = ChatBook::load_from(&path, key);
+        if !book.can_save() {
+            continue;
+        }
         for chat in book.open.iter().chain(&book.closed) {
             if chat.is_blank() {
                 continue;
@@ -448,12 +603,12 @@ pub fn list_session_records() -> Vec<SessionRecord> {
     records
 }
 
-pub fn remove_session(host_id: &str, chat_id: &str) {
+pub fn remove_session(key: &AgentChatKey, host_id: &str, chat_id: &str) {
     let Some(path) = chat_path(host_id) else {
         return;
     };
-    let mut book = ChatBook::load_from(&path);
-    if !book.forget(chat_id) {
+    let mut book = ChatBook::load_from(&path, key);
+    if !book.can_save() || !book.forget(chat_id) {
         return;
     }
     if book
@@ -463,7 +618,7 @@ pub fn remove_session(host_id: &str, chat_id: &str) {
         .all(|chat| chat.is_blank())
     {
         let _ = std::fs::remove_file(&path);
-    } else if book.save_to(&path).is_err() {
+    } else if book.save_to(&path, key).is_err() {
         return;
     }
     bump_chat_records();
@@ -473,7 +628,9 @@ pub fn clear_host_sessions(host_id: &str) {
     let Some(path) = chat_path(host_id) else {
         return;
     };
-    if std::fs::remove_file(&path).is_ok() {
+    let removed = std::fs::remove_file(&path).is_ok();
+    let parked = remove_parked(&path);
+    if removed || parked {
         bump_chat_records();
     }
 }
@@ -488,7 +645,7 @@ pub fn clear_session_records() {
     let mut removed = false;
     for entry in read.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        if !is_chat_file(&path) {
             continue;
         }
         if std::fs::remove_file(&path).is_ok() {
@@ -497,6 +654,64 @@ pub fn clear_session_records() {
     }
     if removed {
         bump_chat_records();
+    }
+}
+
+fn file_host_id(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|stem| stem.to_str())
+}
+
+fn is_chat_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("json")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".sealed"))
+}
+
+fn remove_parked(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Ok(read) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    let prefix = format!("{name}.");
+    let mut removed = false;
+    for entry in read.flatten() {
+        let candidate = entry.path();
+        let candidate_name = entry.file_name();
+        let Some(candidate_name) = candidate_name.to_str() else {
+            continue;
+        };
+        if candidate_name.starts_with(&prefix) && candidate_name.ends_with(".sealed") {
+            removed |= std::fs::remove_file(&candidate).is_ok();
+        }
+    }
+    removed
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 
@@ -522,6 +737,22 @@ fn chat_path(host_id: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_key() -> AgentChatKey {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = gssh::vault::VaultManager::create_with_params(
+            &dir.path().join("vault.json"),
+            &secrecy::SecretString::from("test-password".to_string()),
+            gssh::vault::model::KdfParams {
+                m_cost: 256,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        )
+        .unwrap()
+        .0;
+        manager.agent_chat_key()
+    }
 
     fn titled(title: &str) -> SavedChat {
         let mut chat = SavedChat::fresh();
@@ -576,48 +807,124 @@ mod tests {
     fn saved_chats_load_back_for_that_host_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("host.json");
+        let key = chat_key();
         let mut book = ChatBook::fresh();
-        book.open[0] = titled("disk");
+        book.open[0] = titled("secret-disk-usage");
         book.closed.push(titled("older"));
-        book.save_to(&path).unwrap();
-        let loaded = ChatBook::load_from(&path);
-        assert_eq!(loaded.open[0].title, "disk");
+        book.save_to(&path, &key).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        assert!(AgentChatKey::is_sealed(&stored));
+        assert!(!stored
+            .windows(b"secret-disk-usage".len())
+            .any(|w| w == b"secret-disk-usage"));
+        let loaded = ChatBook::load_from(&path, &key);
+        assert_eq!(loaded.open[0].title, "secret-disk-usage");
         assert_eq!(loaded.closed[0].title, "older");
         assert_eq!(loaded, book);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]
     fn a_queued_message_is_saved_with_the_chat() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("host.json");
+        let key = chat_key();
         let mut book = ChatBook::fresh();
         book.open[0].queue.push(SavedQueued {
             text: "check the disk next".into(),
             cite: None,
             images: Vec::new(),
         });
-        book.save_to(&path).unwrap();
-        let loaded = ChatBook::load_from(&path);
+        book.save_to(&path, &key).unwrap();
+        let loaded = ChatBook::load_from(&path, &key);
         assert_eq!(loaded.open[0].queue[0].text, "check the disk next");
         assert!(!loaded.open[0].is_blank());
+    }
 
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    #[test]
+    fn an_older_plaintext_file_is_sealed_when_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host.json");
+        let key = chat_key();
+        let mut book = ChatBook::fresh();
+        book.open[0] = titled("legacy-chat");
+        let file = ChatFile {
+            version: FILE_VERSION,
+            open: book.open.clone(),
+            active: 0,
+            closed: Vec::new(),
+        };
+        let mut value = serde_json::to_value(&file).unwrap();
         value["open"][0].as_object_mut().unwrap().remove("queue");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let loaded = ChatBook::load_from(&path);
+
+        let loaded = ChatBook::load_from(&path, &key);
+        assert_eq!(loaded.open[0].title, "legacy-chat");
         assert!(loaded.open[0].queue.is_empty());
+        let stored = std::fs::read(&path).unwrap();
+        assert!(AgentChatKey::is_sealed(&stored));
+        assert!(!stored
+            .windows(b"legacy-chat".len())
+            .any(|w| w == b"legacy-chat"));
+    }
+
+    #[test]
+    fn a_file_sealed_for_another_vault_is_kept_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.json");
+        let ours = chat_key();
+        let theirs = chat_key();
+        let mut book = ChatBook::fresh();
+        book.open[0] = titled("kept-for-the-first-vault");
+        book.save_to(&path, &ours).unwrap();
+
+        let loaded = ChatBook::load_from(&path, &theirs);
+        assert!(loaded.open[0].is_blank());
+        assert!(loaded.can_save());
+        assert!(!path.exists());
+        let parked = dir.path().join("local.json.sealed");
+        assert!(parked.exists());
+        assert!(ours
+            .open_file("local", &std::fs::read(&parked).unwrap())
+            .is_some());
+
+        let mut theirs_book = ChatBook::fresh();
+        theirs_book.open[0] = titled("second-vault-chat");
+        theirs_book.save_to(&path, &theirs).unwrap();
+
+        let restored = ChatBook::load_from(&path, &ours);
+        assert_eq!(restored.open[0].title, "kept-for-the-first-vault");
+        let kept_for_theirs = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    return false;
+                };
+                name.ends_with(".sealed")
+                    && theirs
+                        .open_file("local", &std::fs::read(entry.path()).unwrap())
+                        .is_some()
+            });
+        assert!(kept_for_theirs);
     }
 
     #[test]
     fn a_missing_or_broken_file_opens_a_new_chat() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("host.json");
-        let loaded = ChatBook::load_from(&path);
+        let key = chat_key();
+        let loaded = ChatBook::load_from(&path, &key);
         assert_eq!(loaded.open.len(), 1);
         assert!(loaded.open[0].is_blank());
         std::fs::write(&path, "{not json").unwrap();
-        assert!(ChatBook::load_from(&path).open[0].is_blank());
+        assert!(ChatBook::load_from(&path, &key).open[0].is_blank());
     }
 
     #[test]

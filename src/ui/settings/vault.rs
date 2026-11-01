@@ -715,7 +715,7 @@ impl Render for VaultPane {
             )
             .child(heading("Master password").mt(px(6.)))
             .child(caption(
-                "Hosts, keys and snippets are not re-encrypted, and the recovery phrase keeps \
+                "Hosts, keys, snippets and agent chats are not re-encrypted, and the recovery phrase keeps \
                  working. A synced account takes the new password; other devices must sign in \
                  again.",
             ))

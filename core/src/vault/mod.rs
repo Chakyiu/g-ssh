@@ -8,6 +8,7 @@ pub mod recovery;
 pub(crate) mod storage;
 pub mod sync;
 
+pub use crypto::AgentChatKey;
 pub use error::VaultError;
 pub use model::{
     resolve_jump_chain, resolve_proxy, ssh_command, AgentSettings, AuthMethod, Group, HostSnippet,
@@ -518,6 +519,14 @@ impl VaultManager {
             self.enc_dek_by_recovery = old;
         }
         saved
+    }
+
+    /// Key for the agent chat files on this computer. It comes from the vault
+    /// key, so the master password and the recovery phrase both open those
+    /// files. Changing the password wraps the same vault key and leaves the
+    /// chat files as they are.
+    pub fn agent_chat_key(&self) -> AgentChatKey {
+        AgentChatKey::from_dek(self.dek.as_ref())
     }
 
     /// Zero the DEK and drop the vault state. The decrypted records are
@@ -2574,6 +2583,48 @@ mod tests {
         let reopened = VaultManager::unlock_with_password(&path, &pw("new")).unwrap();
         assert_eq!(reopened.list_entries().unwrap().len(), 2);
         assert_eq!(reopened.get_entry(entry_id).unwrap().id, entry_id);
+    }
+
+    #[test]
+    fn changing_the_master_password_still_opens_agent_chats() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.json");
+        let (mut vm, phrase) = make_vault(dir.path());
+        let sealed = vm
+            .agent_chat_key()
+            .seal_file("host-1", b"private transcript");
+        change_password(&mut vm, "hunter2", "new-secret").unwrap();
+        vm.lock();
+
+        let vm = VaultManager::unlock_with_password(&path, &pw("new-secret")).unwrap();
+        assert_eq!(
+            vm.agent_chat_key()
+                .open_file("host-1", &sealed)
+                .unwrap()
+                .as_slice(),
+            b"private transcript"
+        );
+        assert!(vm
+            .agent_chat_key()
+            .open_file("other-host", &sealed)
+            .is_none());
+        vm.lock();
+
+        // The recovery phrase unwraps the same vault key, so the chats stay readable.
+        let (vm, _) = VaultManager::unlock_with_recovery_with_params(
+            &path,
+            &phrase,
+            &pw("from-phrase"),
+            fast_kdf(),
+        )
+        .unwrap();
+        assert_eq!(
+            vm.agent_chat_key()
+                .open_file("host-1", &sealed)
+                .unwrap()
+                .as_slice(),
+            b"private transcript"
+        );
     }
 
     #[test]

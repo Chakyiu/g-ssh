@@ -1958,7 +1958,13 @@ impl SettingsView {
     }
 
     fn agent_sessions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let records: Vec<SessionRecord> = list_session_records();
+        let key = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .map(|manager| manager.agent_chat_key());
+        let records: Vec<SessionRecord> =
+            key.as_ref().map(list_session_records).unwrap_or_default();
         let labels = self
             .vault_state
             .read(cx)
@@ -2016,12 +2022,10 @@ impl SettingsView {
                         )
                     }),
             )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(muted)
-                    .child("One row per connection. Open … to remove that connection’s chats."),
-            )
+            .child(div().text_size(px(11.5)).text_color(muted).child(
+                "One row per connection. Open … to remove that connection’s chats. \
+                         The files are sealed with the vault password.",
+            ))
             .when(empty, |el| {
                 el.child(
                     div()
@@ -2052,7 +2056,14 @@ impl SettingsView {
     }
 
     fn remove_agent_session(&mut self, host_id: String, chat_id: String, cx: &mut Context<Self>) {
-        remove_session(&host_id, &chat_id);
+        if let Some(key) = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .map(|manager| manager.agent_chat_key())
+        {
+            remove_session(&key, &host_id, &chat_id);
+        }
         cx.notify();
     }
 
