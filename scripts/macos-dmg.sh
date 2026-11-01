@@ -97,6 +97,30 @@ codesign --verify --strict "$app"
 
 ln -s /Applications "$stage/Applications"
 
+# DiskImages locks an image so it cannot be opened twice. XProtect on a
+# GitHub macOS runner often still holds that lock, and hdiutil then
+# reports "Resource temporarily unavailable" or "Resource busy" for an
+# image that is valid. Retry only that failure.
+run_hdiutil() {
+  local log attempt
+  log=$(mktemp)
+  for attempt in 1 2 3 4 5; do
+    if "$@" >"$log" 2>&1; then
+      rm -f "$log"
+      return 0
+    fi
+    if grep -F -q -e 'Resource temporarily unavailable' -e 'Resource busy' "$log" \
+        && [ "$attempt" -lt 5 ]; then
+      echo "disk image is locked (attempt ${attempt}); waiting to retry" >&2
+      sleep $((2 ** attempt))
+      continue
+    fi
+    cat "$log" >&2
+    rm -f "$log"
+    return 1
+  done
+}
+
 rm -f "$out"
-hdiutil create -volname "g-ssh" -srcfolder "$stage" -ov -format UDZO "$out" >/dev/null
-hdiutil verify "$out" >/dev/null
+run_hdiutil hdiutil create -volname "g-ssh" -srcfolder "$stage" -ov -format UDZO "$out"
+run_hdiutil hdiutil verify "$out"
