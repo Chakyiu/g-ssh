@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, AnyElement, AnyWindowHandle, App, Context, Entity, EntityId, FocusHandle,
-    Focusable, ModifiersChangedEvent, StyleRefinement, SystemNotification, Task, WeakEntity,
-    Window,
+    actions, div, AnyElement, AnyWindowHandle, App, Context, DragMoveEvent, Entity, EntityId,
+    FocusHandle, Focusable, ModifiersChangedEvent, StyleRefinement, SystemNotification, Task,
+    WeakEntity, Window,
 };
 
 use gpui_component::{
@@ -26,7 +26,9 @@ use crate::ui::hints;
 use crate::ui::hosts::form::{FormEvent, FormMode, ServerFormView};
 use crate::ui::hosts::import::{plural, ImportView, ImportViewEvent};
 use crate::ui::hosts::list::{ServersView, ServersViewEvent};
-use crate::ui::hosts::sidebar::{HostStatus, Sidebar, SidebarEvent, SIDEBAR_WIDTH};
+use crate::ui::hosts::sidebar::{
+    sidebar_resize_handle, HostStatus, Sidebar, SidebarEvent, SidebarResize,
+};
 use crate::ui::keyboard::bind_chord;
 use crate::ui::local::LocalTerminal;
 use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
@@ -213,6 +215,8 @@ enum ConnectIntent {
     OpenSftp,
     /// Show the host's files in the left pane of this session.
     AttachLeft(WeakEntity<ServerSession>),
+    /// Connect again in this session's existing tab, so the tab stays put.
+    Replace(WeakEntity<ServerSession>),
 }
 
 pub struct AppView {
@@ -529,7 +533,7 @@ impl AppView {
             self.reopen_tabs(open_tabs, window, cx);
         }
 
-        // Reconnects first: each swaps a dead tab for a new one and activates it.
+        // Reconnects first. Each one stays in its own tab.
         for session in std::mem::take(&mut self.sessions_owed_reconnect) {
             if let Some(session) = session.upgrade() {
                 self.reconnect_session(&session, window, cx);
@@ -1540,7 +1544,25 @@ impl AppView {
                 self.set_status("The vault is locked.".to_string(), cx);
                 return;
             }
-            self.launch_session(entry, AuthCredential::Agent, WorkKind::Terminal, window, cx);
+            if let ConnectIntent::Replace(old) = &intent {
+                self.launch_replacement(
+                    entry,
+                    AuthCredential::Agent,
+                    WorkKind::Terminal,
+                    old,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            self.launch_session(
+                entry,
+                AuthCredential::Agent,
+                WorkKind::Terminal,
+                None,
+                window,
+                cx,
+            );
             return;
         }
         let credential = match self.vault_state.read(cx).manager() {
@@ -1591,11 +1613,16 @@ impl AppView {
     ) {
         let session = match intent {
             ConnectIntent::OpenTab => {
-                self.launch_session(entry, credential, WorkKind::Terminal, window, cx);
+                self.launch_session(entry, credential, WorkKind::Terminal, None, window, cx);
                 return;
             }
             ConnectIntent::OpenSftp => {
-                self.launch_session(entry, credential, WorkKind::Sftp, window, cx);
+                self.launch_session(entry, credential, WorkKind::Sftp, None, window, cx);
+                return;
+            }
+            ConnectIntent::Replace(old) => {
+                let kind = primary_work(entry.kind);
+                self.launch_replacement(entry, credential, kind, &old, window, cx);
                 return;
             }
             ConnectIntent::AttachLeft(session) => session,
@@ -1699,6 +1726,7 @@ impl AppView {
         entry: ServerEntry,
         credential: AuthCredential,
         kind: WorkKind,
+        replacing: Option<Entity<ServerSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1929,10 +1957,81 @@ impl AppView {
         )
         .detach();
 
+        if let Some(old) = replacing {
+            if self.install_in_place(&old, session.clone(), kind, window, cx) {
+                return;
+            }
+        }
+
         self.tabs.push(session.clone());
         self.workspace
             .update(cx, |workspace, cx| workspace.open_doc(session, kind, cx));
         self.change_active_tab(self.tabs.len() - 1, cx);
+    }
+
+    /// Start a fresh connection in `old`'s tab when that tab is still open.
+    /// Otherwise open the host the usual way.
+    fn launch_replacement(
+        &mut self,
+        entry: ServerEntry,
+        credential: AuthCredential,
+        kind: WorkKind,
+        old: &WeakEntity<ServerSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let replacing = old
+            .upgrade()
+            .filter(|old| self.tabs.iter().any(|tab| tab == old));
+        if replacing.is_some() {
+            self.launch_session(entry, credential, kind, replacing, window, cx);
+            return;
+        }
+        // Closed while a passphrase dialog was up, or already replaced.
+        let server_id = entry.id.to_string();
+        if self.tab_index_for_host(&server_id, cx).is_some() {
+            self.open_server(entry, window, cx);
+        } else {
+            self.launch_session(entry, credential, kind, None, window, cx);
+        }
+    }
+
+    /// Swap `session` into `old`'s slot. The tab strip, the sidebar, and a
+    /// split all keep their order. Returns false when `old` is no longer open,
+    /// so the caller can append a new tab instead.
+    fn install_in_place(
+        &mut self,
+        old: &Entity<ServerSession>,
+        session: Entity<ServerSession>,
+        kind: WorkKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(idx) = self.tabs.iter().position(|tab| tab == old) else {
+            return false;
+        };
+        self.tabs[idx] = session.clone();
+        let placed = self.workspace.update(cx, |workspace, cx| {
+            workspace.replace_session(old, session, cx)
+        });
+        if !placed {
+            let session = self.tabs[idx].clone();
+            self.workspace
+                .update(cx, |workspace, cx| workspace.open_doc(session, kind, cx));
+        }
+        old.update(cx, |old, cx| old.cleanup_before_close(cx));
+        let was_front = self.active_tab == idx && !self.showing_local;
+        self.sync_session_states(cx);
+        if was_front {
+            self.change_active_tab(idx, cx);
+            if !self.is_overlay_open(window, cx) {
+                self.focus_front_tab(window, cx);
+            }
+        } else {
+            self.remember_open_tabs(cx);
+            cx.notify();
+        }
+        true
     }
 
     /// Replace a dead session with a fresh connection to the same server.
@@ -1942,8 +2041,8 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A fresh connection needs the entry from the vault. Closing the tab
-        // now would lose it for good, so it waits for `resume_after_unlock`.
+        // A fresh connection needs the entry from the vault. The tab stays
+        // until the vault is open again, and `resume_after_unlock` retries it.
         if self.is_vault_locked(cx) {
             let session = session.downgrade();
             if !self.sessions_owed_reconnect.contains(&session) {
@@ -1952,16 +2051,32 @@ impl AppView {
             return;
         }
 
-        // Drop the dead session, then re-open the server fresh. Closing first
-        // is required: open_server's single-open guard would otherwise just
-        // re-activate this dead tab instead of connecting.
         let server_id = session.read(cx).server_id.clone();
-        if let Some(idx) = self.tabs.iter().position(|s| s == session) {
-            self.close_tab(idx, cx);
-        }
-        if let Ok(id) = Uuid::parse_str(&server_id) {
-            self.open_server_by_id(id, window, cx);
-        }
+        let Ok(id) = Uuid::parse_str(&server_id) else {
+            return;
+        };
+        let entry = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .and_then(|vm| vm.get_entry(id).ok());
+        let Some(entry) = entry else {
+            self.forget_pending_snippet(id);
+            if let Some(idx) = self.tabs.iter().position(|tab| tab == session) {
+                self.close_tab(idx, cx);
+            }
+            return;
+        };
+
+        // Same tab, new connection. Closing it and opening another would put
+        // the tab at the end of the strip.
+        self.record_open(id, cx);
+        self.connect_with_prompt(
+            entry,
+            ConnectIntent::Replace(session.downgrade()),
+            window,
+            cx,
+        );
     }
 
     /// Report a finished transfer to the user when they are looking at another
@@ -3117,15 +3232,32 @@ impl Render for AppView {
                     .overflow_hidden()
                     // Cached like the hosts view: a terminal frame or a
                     // transfer tick redraws this view, and the sidebar has
-                    // not changed. The style repeats the sidebar's own size.
+                    // not changed. The handle stays outside that cache: its
+                    // hover is a window refresh, which would not reach a
+                    // cached child.
                     .when(is_sidebar_shown, |row| {
+                        let width = Sidebar::laid_out_width(window, cx);
                         row.child(
-                            self.sidebar.clone().cached(
-                                StyleRefinement::default()
-                                    .w(px(SIDEBAR_WIDTH))
-                                    .flex_none()
-                                    .h_full(),
-                            ),
+                            div()
+                                .id("sidebar-frame")
+                                .relative()
+                                .flex_none()
+                                .w(px(width))
+                                .h_full()
+                                .on_drag_move(cx.listener(
+                                    move |_, event: &DragMoveEvent<SidebarResize>, window, cx| {
+                                        let width = event
+                                            .drag(cx)
+                                            .width_at(event.event.position.x.as_f32());
+                                        if Sidebar::resize_to(width, window, cx) {
+                                            cx.notify();
+                                        }
+                                    },
+                                ))
+                                .child(self.sidebar.clone().cached(
+                                    StyleRefinement::default().w(px(width)).flex_none().h_full(),
+                                ))
+                                .child(sidebar_resize_handle(width)),
                         )
                     })
                     .child(

@@ -280,6 +280,10 @@ pub struct Preferences {
     /// Whether the main window shows the hosts sidebar.
     #[serde(default = "default_true")]
     pub is_sidebar_shown: bool,
+    /// Sidebar width in designed pixels, once the user has dragged its edge.
+    /// Missing means the built-in width.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
     /// macOS: the vault key is in the keychain behind Touch ID.
     #[serde(default)]
     pub is_touch_id_enabled: bool,
@@ -369,6 +373,7 @@ impl Default for Preferences {
             terminal_position: TerminalPosition::default(),
             is_second_pane_shown: false,
             is_sidebar_shown: true,
+            sidebar_width: None,
             is_touch_id_enabled: false,
             is_server_panel_shown: false,
             server_panel_width: None,
@@ -442,6 +447,44 @@ impl Preferences {
     pub fn is_sidebar_shown(cx: &gpui::App) -> bool {
         cx.try_global::<Self>()
             .is_none_or(|prefs| prefs.is_sidebar_shown)
+    }
+
+    /// Sidebar width the user dragged to, if they have.
+    pub fn sidebar_width(cx: &gpui::App) -> Option<f32> {
+        finite_width(
+            cx.try_global::<Self>()
+                .and_then(|prefs| prefs.sidebar_width),
+        )
+    }
+
+    /// Remember a width from dragging the sidebar. The write waits until the
+    /// pointer settles, so a drag is one write.
+    pub fn set_sidebar_width(width: f32, cx: &mut gpui::App) {
+        if !width.is_finite() {
+            return;
+        }
+        let prefs = cx.default_global::<Self>();
+        if prefs.sidebar_width == Some(width) {
+            return;
+        }
+        prefs.sidebar_width = Some(width);
+
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(FONT_SIZE_SAVE_DELAY).await;
+            cx.update(|cx| {
+                let Some(prefs) = cx.try_global::<Self>() else {
+                    return;
+                };
+                // A later drag started its own timer and will do the write.
+                if prefs.sidebar_width != Some(width) {
+                    return;
+                }
+                if let Err(e) = prefs.save() {
+                    tracing::warn!(?e, "failed to save sidebar width");
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn is_touch_id_enabled(cx: &gpui::App) -> bool {
@@ -877,14 +920,17 @@ mod tests {
     fn sidebar_is_shown_when_missing_and_round_trips() {
         let old: Preferences = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
         assert!(old.is_sidebar_shown);
+        assert_eq!(old.sidebar_width, None);
 
         let hidden = Preferences {
             is_sidebar_shown: false,
+            sidebar_width: Some(320.),
             ..Preferences::default()
         };
         let json = serde_json::to_string(&hidden).unwrap();
         let back: Preferences = serde_json::from_str(&json).unwrap();
         assert!(!back.is_sidebar_shown);
+        assert_eq!(back.sidebar_width, Some(320.));
     }
 
     #[test]

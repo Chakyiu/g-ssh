@@ -85,6 +85,13 @@ impl SurfaceView {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         Self { session, files }
     }
+
+    /// Follow a connection that was replaced in the same tab.
+    fn retarget(&mut self, session: Entity<ServerSession>, cx: &mut Context<Self>) {
+        cx.observe(&session, |_, _, cx| cx.notify()).detach();
+        self.session = session;
+        cx.notify();
+    }
 }
 
 impl Render for SurfaceView {
@@ -248,6 +255,37 @@ impl Workspace {
         if let Some(ix) = terminal.or(any) {
             self.activate_doc(ix, cx);
         }
+    }
+
+    /// Point every tab of `old` at `new` and leave those tabs where they are.
+    /// A retry builds a fresh connection; appending it would move the tab to
+    /// the end of the strip.
+    pub(crate) fn replace_session(
+        &mut self,
+        old: &Entity<ServerSession>,
+        new: Entity<ServerSession>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let old_id = old.entity_id();
+        let mut replaced = false;
+        for doc in &mut self.docs {
+            let WorkBody::Session {
+                session, surface, ..
+            } = &mut doc.body
+            else {
+                continue;
+            };
+            if session.entity_id() != old_id {
+                continue;
+            }
+            *session = new.clone();
+            surface.update(cx, |view, cx| view.retarget(new.clone(), cx));
+            replaced = true;
+        }
+        if replaced {
+            cx.notify();
+        }
+        replaced
     }
 
     pub(crate) fn remove_session(

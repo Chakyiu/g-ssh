@@ -1,16 +1,22 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, Anchor, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EventEmitter,
+    div, Anchor, AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Entity, EventEmitter,
     MouseButton, MouseDownEvent, Pixels, Point, SharedString, Window,
 };
 
-use gpui_component::{h_flex, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon, IconName};
+use gpui_component::{
+    h_flex, resizable::HandleEdge, resize_handle, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon,
+    IconName,
+};
 use uuid::Uuid;
 
+use crate::preferences::Preferences;
 use crate::theme;
 use crate::ui::app::ToggleSettings;
 use crate::ui::hints;
@@ -20,7 +26,14 @@ use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
 use gssh::vault::{ConnectionKind, ProxyChoice, ServerEntrySummary};
 
+/// Designed width before the user drags the right edge.
 pub(crate) const SIDEBAR_WIDTH: f32 = 232.;
+/// Narrow enough that All hosts and Local still read.
+const SIDEBAR_MIN_WIDTH: f32 = 176.;
+/// Wide enough for a long host name, short of covering the session.
+const SIDEBAR_MAX_WIDTH: f32 = 480.;
+/// Designed pixels kept for the session beside the sidebar.
+const SIDEBAR_RESERVED: f32 = 420.;
 const ROW_HEIGHT: f32 = 28.;
 const SIDEBAR_GROUP: &str = "sidebar-host-row";
 /// Cap on how many closed-but-recent hosts the RECENT zone shows. The full
@@ -136,6 +149,24 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Width for this frame: the saved drag, or the built-in width, clamped
+    /// so the session beside the sidebar keeps room.
+    pub(crate) fn laid_out_width(window: &Window, cx: &App) -> f32 {
+        let saved = Preferences::sidebar_width(cx).unwrap_or(SIDEBAR_WIDTH);
+        clamp_sidebar_width(saved, window.viewport_size().width.as_f32())
+    }
+
+    /// Apply a drag. Returns whether the width changed, so the window frame
+    /// can resize around it.
+    pub(crate) fn resize_to(width: f32, window: &Window, cx: &mut App) -> bool {
+        let width = clamp_sidebar_width(width, window.viewport_size().width.as_f32());
+        if Self::laid_out_width(window, cx) == width {
+            return false;
+        }
+        Preferences::set_sidebar_width(width, cx);
+        true
+    }
+
     /// Replace the ordered list of open sessions. The caller (app_view) owns
     /// tab order, so the OPEN zone mirrors it exactly.
     pub fn set_sessions(&mut self, sessions: Vec<(String, HostStatus)>, cx: &mut Context<Self>) {
@@ -205,6 +236,7 @@ impl Sidebar {
             .id(("sidebar-host", ui_idx))
             .group(group_id.clone())
             .relative()
+            .flex_none()
             .h(px(ROW_HEIGHT))
             .gap(px(8.))
             .px(px(8.))
@@ -728,6 +760,68 @@ fn pointer_over(bounds: Bounds<Pixels>, point: Point<Pixels>) -> bool {
     x >= px(0.) && y >= px(0.) && x <= bounds.size.width && y <= bounds.size.height
 }
 
+/// The drag of the sidebar's right edge. The window frame hears it
+/// anywhere; the handle only starts it.
+pub(crate) struct SidebarResize {
+    /// Set when the drag starts. `None` until then, so the first move can
+    /// still lock the origin if the start hook has not run.
+    start_x: Rc<Cell<Option<f32>>>,
+    start_width: f32,
+}
+
+impl SidebarResize {
+    /// Width with the pointer at `x`. Dragging right grows the sidebar.
+    ///
+    /// `x` is a window pixel. The saved width is a designed pixel, the size
+    /// at zoom 1, so the drag is divided by the current zoom.
+    pub(crate) fn width_at(&self, x: f32) -> f32 {
+        let start_x = match self.start_x.get() {
+            Some(start) => start,
+            None => {
+                self.start_x.set(Some(x));
+                x
+            }
+        };
+        let delta = (x - start_x) / crate::ui::scale::factor();
+        self.start_width + delta
+    }
+}
+
+struct SidebarResizeGhost;
+
+impl Render for SidebarResizeGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size(px(0.))
+    }
+}
+
+/// The band on the sidebar's right edge. It hugs that edge so the parent
+/// clip does not eat the grab.
+pub(crate) fn sidebar_resize_handle(start_width: f32) -> impl IntoElement {
+    let drag = SidebarResize {
+        start_x: Rc::new(Cell::new(None)),
+        start_width,
+    };
+    resize_handle("sidebar-resize", Axis::Horizontal)
+        .inside(HandleEdge::Trailing)
+        .on_drag(drag, |drag, _, window, cx| {
+            drag.start_x.set(Some(window.mouse_position().x.as_f32()));
+            cx.stop_propagation();
+            cx.new(|_| SidebarResizeGhost)
+        })
+}
+
+fn clamp_sidebar_width(width: f32, window_width: f32) -> f32 {
+    // `window_width` is window pixels. The limits and `width` are designed
+    // pixels, so the window is measured in the same unit as the sidebar.
+    let window_width = window_width / crate::ui::scale::factor();
+    let max = (window_width - SIDEBAR_RESERVED).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    if !width.is_finite() {
+        return SIDEBAR_WIDTH;
+    }
+    width.round().clamp(SIDEBAR_MIN_WIDTH, max)
+}
+
 fn order_mark(at_top: bool) -> gpui::Div {
     let mark = div()
         .absolute()
@@ -921,6 +1015,7 @@ fn folder_header(
     };
     h_flex()
         .id(SharedString::from(format!("sidebar-folder-{path}")))
+        .flex_none()
         .h(px(26.))
         .mt(px(if depth == 0 { 6. } else { 0. }))
         .pr(px(4.))
@@ -1017,6 +1112,7 @@ impl Sidebar {
         };
         let shortcut = opened.and_then(|(index, _)| hints::tab_key(index));
         div()
+            .flex_none()
             .pl(px(4. + (depth as f32 + 1.) * 14.))
             .child(self.host_row(
                 ui_idx,
@@ -1064,7 +1160,7 @@ impl Sidebar {
     }
 
     /// The way back to the full list of hosts. Selected while that list is
-    /// in front.
+    /// in front. Stays full height above the scrolling connections.
     fn all_hosts_row(&self, host_count: usize, cx: &mut Context<Self>) -> AnyElement {
         let is_active = !self.local_selected && self.active_server_id.is_none();
         let text = cx.theme().foreground;
@@ -1075,6 +1171,7 @@ impl Sidebar {
         };
         h_flex()
             .id("sidebar-all-hosts")
+            .flex_none()
             .h(px(ROW_HEIGHT))
             .gap(px(8.))
             .px(px(8.))
@@ -1110,7 +1207,8 @@ impl Sidebar {
             .into_any_element()
     }
 
-    /// A terminal on this computer, between the host list and the connections.
+    /// A terminal on this computer, between All hosts and the connections.
+    /// Stays full height above the scrolling list.
     fn local_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let is_active = self.local_selected;
         let text = cx.theme().foreground;
@@ -1121,6 +1219,7 @@ impl Sidebar {
         };
         h_flex()
             .id("sidebar-local")
+            .flex_none()
             .h(px(ROW_HEIGHT))
             .gap(px(8.))
             .px(px(8.))
@@ -1220,8 +1319,9 @@ impl Render for Sidebar {
         recents.sort_by_key(|e| std::cmp::Reverse(e.last_opened_at));
         recents.truncate(RECENT_LIMIT);
 
-        let mut content: Vec<AnyElement> =
-            vec![self.all_hosts_row(entries.len(), cx), self.local_row(cx)];
+        // Connections scroll on their own. All hosts and Local stay put, or a
+        // long list flexes those two rows down until the labels disappear.
+        let mut content: Vec<AnyElement> = Vec::new();
         let mut ui_idx = 0usize;
 
         // With groups, every host stays in its group, including one that is
@@ -1301,6 +1401,7 @@ impl Render for Sidebar {
         if !has_groups && self.sessions.is_empty() && recents.is_empty() && !entries.is_empty() {
             content.push(
                 div()
+                    .flex_none()
                     .h(px(ROW_HEIGHT))
                     .px(px(8.))
                     .mt(px(6.))
@@ -1313,22 +1414,33 @@ impl Render for Sidebar {
             );
         }
 
+        // The window frame sizes this and draws the resize handle. A fixed
+        // width here would fight that drag.
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
-            .flex_none()
-            .h_full()
+            .size_full()
             .bg(bg)
+            .child(
+                v_flex()
+                    .flex_none()
+                    .px(px(8.))
+                    .child(self.all_hosts_row(entries.len(), cx))
+                    .child(self.local_row(cx)),
+            )
             .child(
                 v_flex()
                     .id("sidebar-list")
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .pb(px(4.))
                     .px(px(8.))
-                    .children(content),
+                    // One block, not a column of flex items: each row would
+                    // otherwise shrink to share the sidebar instead of scrolling.
+                    .child(div().w_full().flex_none().children(content)),
             )
             .child(
                 h_flex()
+                    .flex_none()
                     .h(px(46.))
                     .px(px(8.))
                     .gap(px(4.))
@@ -1627,6 +1739,9 @@ pub(crate) fn relative_time(ts: i64, now: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
 
     fn entry(label: &str, group: Option<&str>) -> ServerEntrySummary {
@@ -1778,6 +1893,25 @@ mod tests {
             detail.lines,
             vec![("Status", "Not connected".into()), ("Type", "SSH".into()),]
         );
+    }
+
+    #[test]
+    fn dragging_the_right_edge_right_widens_the_sidebar() {
+        let drag = SidebarResize {
+            start_x: Rc::new(Cell::new(Some(400.))),
+            start_width: 232.,
+        };
+        assert_eq!(drag.width_at(460.), 292.);
+        assert_eq!(drag.width_at(340.), 172.);
+    }
+
+    #[test]
+    fn sidebar_width_stays_between_the_session_and_the_cap() {
+        assert_eq!(clamp_sidebar_width(100., 1600.), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(2000., 1600.), SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(320., 1600.), 320.);
+        assert_eq!(clamp_sidebar_width(400., 700.), 280.);
+        assert_eq!(clamp_sidebar_width(f32::NAN, 1600.), SIDEBAR_WIDTH);
     }
 
     #[test]
