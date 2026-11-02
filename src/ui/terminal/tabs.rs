@@ -79,16 +79,16 @@ fn file_name(path: &str) -> &str {
 const MAX_TAB_TITLE: usize = 80;
 
 /// The name on a tab: a custom one, else the file it edits, else "Terminal"
-/// or its number.
+/// or "Term 2" and so on.
 fn tab_label(index: usize, alone: bool, title: Option<&str>, edited_file: Option<&str>) -> String {
     if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
         return title.to_string();
     }
     match edited_file {
         Some(path) if alone => file_name(path).to_string(),
-        Some(path) => format!("{} {}", index + 1, file_name(path)),
+        Some(path) => format!("Term {} {}", index + 1, file_name(path)),
         None if alone => "Terminal".to_string(),
-        None => (index + 1).to_string(),
+        None => format!("Term {}", index + 1),
     }
 }
 
@@ -1325,8 +1325,8 @@ impl ServerSession {
         }
     }
 
-    /// One "Terminal" tab, or numbered tabs once there are several shells,
-    /// and the "+" button. The docked pane uses the same strip.
+    /// One "Terminal" tab, or "Term 1", "Term 2" once there are several
+    /// shells, and the "+" button. The docked pane uses the same strip.
     pub(crate) fn render_terminal_tabs(&self, cx: &Context<Self>) -> AnyElement {
         self.render_pane_tabs(self.current_pane(), cx)
     }
@@ -2105,12 +2105,12 @@ mod tests {
     #[test]
     fn a_custom_name_replaces_the_number_and_the_file() {
         assert_eq!(tab_label(0, true, Some("logs"), None), "logs");
-        assert_eq!(tab_label(1, false, None, None), "2");
+        assert_eq!(tab_label(1, false, None, None), "Term 2");
         assert_eq!(tab_label(0, true, None, None), "Terminal");
         assert_eq!(tab_label(0, true, None, Some("/var/log/syslog")), "syslog");
         assert_eq!(
             tab_label(2, false, None, Some("/var/log/syslog")),
-            "3 syslog"
+            "Term 3 syslog"
         );
         assert_eq!(
             tab_label(2, false, Some("logs"), Some("/var/log/syslog")),

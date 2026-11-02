@@ -186,7 +186,7 @@ pub struct TerminalView {
     pub(crate) shell: ShellHandle,
     /// The remote file this tab was opened to edit. Its name goes on the tab.
     pub(crate) edited_file: Option<String>,
-    /// Name from the tab menu. Absent, the tab shows its number, "Terminal",
+    /// Name from the tab menu. Absent, the tab shows "Term 2", "Terminal",
     /// or the file it was opened to edit.
     pub(crate) tab_title: Option<String>,
     /// Colour from the tab menu. Absent, the mark stays the usual green.

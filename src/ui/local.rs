@@ -158,7 +158,7 @@ impl LocalTerminal {
         if self.shells.len() <= 1 {
             "Terminal".to_string()
         } else {
-            (self.active + 1).to_string()
+            format!("Term {}", self.active + 1)
         }
     }
 
@@ -389,7 +389,7 @@ impl LocalTerminal {
         let label = if self.shells.len() == 1 {
             "Terminal".to_string()
         } else {
-            (index + 1).to_string()
+            format!("Term {}", index + 1)
         };
         let fg = cx.theme().foreground;
         let close = (self.shells.len() > 1).then(|| {
