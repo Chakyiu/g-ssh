@@ -74,6 +74,8 @@ struct DraggedHost {
 pub enum SidebarEvent {
     OpenServer(Uuid),
     OpenSftp(Uuid),
+    /// Open a second connection to this host, with its files in front.
+    OpenAnotherSftp(Uuid),
     /// A terminal for a host whose click opens files.
     OpenTerminal(Uuid),
     CloseServer(Uuid),
@@ -462,18 +464,31 @@ impl Sidebar {
                 )
                 .icon("icons/square-terminal.svg"),
             ),
-            ConnectionKind::Ssh => menu.item(
-                ContextMenuItem::new(
-                    "sidebar-menu-sftp",
-                    "Open SFTP",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::OpenSftp(entry_id));
-                        cx.notify();
-                    }),
+            ConnectionKind::Ssh => menu
+                .item(
+                    ContextMenuItem::new(
+                        "sidebar-menu-sftp",
+                        "Open SFTP",
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_menu_for = None;
+                            cx.emit(SidebarEvent::OpenSftp(entry_id));
+                            cx.notify();
+                        }),
+                    )
+                    .icon("icons/folder-open.svg"),
                 )
-                .icon("icons/folder-open.svg"),
-            ),
+                .item(
+                    ContextMenuItem::new(
+                        "sidebar-menu-sftp-new",
+                        "Open SFTP in a new connection",
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_menu_for = None;
+                            cx.emit(SidebarEvent::OpenAnotherSftp(entry_id));
+                            cx.notify();
+                        }),
+                    )
+                    .icon("icons/folder-open.svg"),
+                ),
         };
         menu = menu
             .item(
@@ -1563,6 +1578,18 @@ impl Sidebar {
                     cx.listener(move |this, _, _, cx| {
                         this.host_menu = None;
                         cx.emit(SidebarEvent::OpenSftp(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/folder-open.svg"),
+            );
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-sftp-new",
+                    "Open SFTP in a new connection",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenAnotherSftp(entry_id));
                         cx.notify();
                     }),
                 )

@@ -307,6 +307,7 @@ impl AppView {
         cx.subscribe_in(&sidebar, window, |this, _, event, window, cx| match event {
             SidebarEvent::OpenServer(id) => this.open_server_by_id(*id, window, cx),
             SidebarEvent::OpenSftp(id) => this.open_sftp_by_id(*id, window, cx),
+            SidebarEvent::OpenAnotherSftp(id) => this.open_another_sftp(*id, window, cx),
             SidebarEvent::OpenTerminal(id) => this.open_terminal_by_id(*id, window, cx),
             SidebarEvent::CloseServer(id) => this.close_server_by_id(*id, cx),
             SidebarEvent::AddServerRequested => this.show_server_form(FormMode::Add, window, cx),
@@ -324,8 +325,8 @@ impl AppView {
             window,
             |this, _, event, window, cx| match event {
                 WorkspaceEvent::Activated(front) => match front {
-                    FrontTab::Host(id) => {
-                        if let Some(idx) = this.tab_index_for_host(id, cx) {
+                    FrontTab::Host(session) => {
+                        if let Some(idx) = this.tabs.iter().position(|tab| tab == session) {
                             // A connection coming forward leaves the local tab,
                             // including when that connection was already active.
                             let show_it = this.showing_local || this.active_tab != idx;
@@ -1152,6 +1153,42 @@ impl AppView {
             return;
         };
         self.open_server(entry, window, cx);
+    }
+
+    /// Open a second connection to a host that is already open, with its files
+    /// in front.
+    ///
+    /// Everywhere else a host opens at most one connection and a second request
+    /// brings that tab forward. That is right for a normal click, but it leaves
+    /// no way to browse one host twice with both panes in view, or to run
+    /// transfers that do not queue behind each other. A second connection is a
+    /// separate SSH session, so it gets its own SFTP channels and its own
+    /// transfer slots.
+    fn open_another_sftp(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = self
+            .vault_state
+            .read(cx)
+            .manager()
+            .and_then(|vm| vm.get_entry(id).ok());
+        let Some(entry) = entry else {
+            self.forget_pending_snippet(id);
+            return;
+        };
+        if entry.kind == ConnectionKind::Telnet {
+            self.set_status("Telnet hosts have no files.".to_string(), cx);
+            return;
+        }
+        if self.vault_state.read(cx).manager().is_none() {
+            self.set_status("The vault is locked.".to_string(), cx);
+            return;
+        }
+        self.showing_local = false;
+        self.record_open(id, cx);
+        let intent = match entry.kind {
+            ConnectionKind::Sftp => ConnectIntent::OpenSftp,
+            ConnectionKind::Ssh | ConnectionKind::Telnet => ConnectIntent::OpenTab,
+        };
+        self.connect_with_prompt(entry, intent, window, cx);
     }
 
     /// Open this host's files as their own tab. Connects first when the host
