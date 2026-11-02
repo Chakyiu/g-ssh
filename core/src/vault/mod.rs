@@ -692,8 +692,9 @@ impl VaultManager {
         self.save()
     }
 
-    /// The folders the SFTP browser last showed, so a restart or reconnect reopens them instead
-    /// of the home dir. No-op if both are unchanged.
+    /// The folders the SFTP browser last showed, recorded on the entry. A
+    /// fresh connect does not reopen them: it always starts at the home
+    /// folders. No-op if both are unchanged.
     pub fn set_entry_last_dirs(
         &mut self,
         id: Uuid,

@@ -562,8 +562,9 @@ impl SftpBrowser {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "/".to_string());
 
-        // Fresh connect: local home / remote home dir. Reconnect: the folders the
-        // panes were showing before the drop, so the user lands back where they were.
+        // A fresh connect starts at the home folders. A reconnect passes the
+        // folders the panes were showing before the drop, so the user stays
+        // where they were.
         let (local_start, remote_start) = match restore {
             Some(r) => (r.local, r.remote),
             None => (local_home, home_dir),

@@ -486,15 +486,15 @@ async fn drive_connection(
                             );
                             let conn_info = session.conn_info.clone();
                             let file_associations = session.file_associations.clone();
-                            // On a reconnect, carry over the folders the old
-                            // browser was showing. On the first connect, use the
-                            // folders saved for this host, so a restart opens
-                            // where the user left off.
+                            // A reconnect carries over the folders the old browser
+                            // was showing, so a dropped link does not move the
+                            // user. A fresh connect always starts at the home
+                            // folders: where they were last time is not where
+                            // they asked to go now.
                             let restore: Option<RestorePaths> = session
                                 .browser
                                 .as_ref()
-                                .map(|b| b.read(cx).current_paths(cx))
-                                .or_else(|| session.initial_restore.clone());
+                                .map(|b| b.read(cx).current_paths(cx));
                             // The left server has its own connection, which
                             // outlived this one. Its pane moves to the new
                             // browser with the transfers that only use it.
@@ -1028,9 +1028,6 @@ pub struct ServerSession {
     /// The server's shell history, kept so a terminal tab opened later gets
     /// the same suggestions as the first.
     pub(crate) shell_history: Vec<String>,
-    /// Folders persisted for this host, used to seed the first browser build so
-    /// a restart reopens them. Later reconnects use the live browser's paths.
-    initial_restore: Option<RestorePaths>,
     pub disconnected: Option<DisconnectedState>,
     /// Why a session that never connected stopped trying. Drives the "could
     /// not connect" card; the reconnect loop waits there for a retry.
@@ -1095,7 +1092,6 @@ impl ServerSession {
         conn_info: Connection,
         route: SshRoute,
         telnet_target: Option<TelnetTarget>,
-        initial_restore: Option<RestorePaths>,
         forwards: Vec<ForwardRuntime>,
         file_associations: SharedFileAssociations,
         vault_state: Entity<VaultState>,
@@ -1290,7 +1286,6 @@ impl ServerSession {
             is_sftp_hidden: true,
             is_server_panel_shown: false,
             shell_history: Vec::new(),
-            initial_restore,
             disconnected: None,
             connect_failure: None,
             password_input: None,
