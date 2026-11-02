@@ -1776,10 +1776,7 @@ mod tests {
         assert_eq!(detail.address, "me@example");
         assert_eq!(
             detail.lines,
-            vec![
-                ("Status", "Not connected".into()),
-                ("Type", "SSH".into()),
-            ]
+            vec![("Status", "Not connected".into()), ("Type", "SSH".into()),]
         );
     }
 

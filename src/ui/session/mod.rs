@@ -172,6 +172,9 @@ pub enum ServerSessionEvent {
         local: String,
         remote: String,
     },
+    /// Bring this connection's SFTP tab forward. The browser has already been
+    /// pointed at the folder to show.
+    ShowSftp,
     /// A transfer ended. AppView turns this into a system notification when the
     /// user is looking at another app.
     TransferFinished {
@@ -552,6 +555,10 @@ async fn drive_connection(
                                     uses_session,
                                     cancel,
                                 } => {
+                                    // A transfer that starts while nothing else
+                                    // is moving opens the panel. One that joins
+                                    // a batch the user has folded stays folded.
+                                    let reveal = this.transfers.is_empty();
                                     this.transfers.push(TransferTask {
                                         id: *id,
                                         name: name.clone(),
@@ -568,6 +575,9 @@ async fn drive_connection(
                                         expanded: false,
                                         cancel: cancel.clone(),
                                     });
+                                    if reveal {
+                                        this.transfer_panel_collapsed = false;
+                                    }
                                     this.ensure_tick(cx);
                                     cx.notify();
                                 }
@@ -1062,6 +1072,8 @@ pub struct ServerSession {
     pub transfer_history: Vec<TransferTask>,
     /// Whether the tasks popover is open.
     pub tasks_open: bool,
+    /// The transfer list under the file panes is folded to one row.
+    transfer_panel_collapsed: bool,
     /// The host's saved port forwards and their live state.
     pub forwards: Vec<ForwardRuntime>,
     /// Whether the forwards popover is open.
@@ -1294,6 +1306,7 @@ impl ServerSession {
             transfers: Vec::new(),
             transfer_history: Vec::new(),
             tasks_open: false,
+            transfer_panel_collapsed: false,
             forwards,
             forwards_open: false,
             ticking: false,
@@ -1415,6 +1428,11 @@ impl ServerSession {
         });
         self.transfer_history.insert(0, task);
         self.transfer_history.truncate(HISTORY_CAP);
+        // The file list gets its height back. The outcome stays as one row
+        // until the user clears it or starts another transfer.
+        if self.transfers.is_empty() {
+            self.transfer_panel_collapsed = true;
+        }
         cx.notify();
     }
 
@@ -2535,10 +2553,19 @@ impl ServerSession {
             // and an SFTP-only server may have no shell.
             let body = if show_files && has_files {
                 let browser = self.browser.clone().expect("has files");
-                div()
+                v_flex()
                     .size_full()
                     .overflow_hidden()
-                    .child(browser.cached(StyleRefinement::default().size_full()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(browser.cached(StyleRefinement::default().size_full())),
+                    )
+                    .when_some(self.render_sftp_transfer_panel(cx), |el, panel| {
+                        el.child(panel)
+                    })
                     .into_any_element()
             } else if has_terminal {
                 self.render_terminal_block(cx)

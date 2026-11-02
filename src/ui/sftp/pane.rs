@@ -223,6 +223,9 @@ pub enum FilePaneEvent {
     },
     /// The source pill was clicked: the user wants to choose what this pane shows.
     SourcePickerRequested,
+    /// The button before the pane name: switch between the second pane and
+    /// the session's files alone.
+    FileModeRequested,
 }
 
 /// What a context menu was opened on: one row, the selected rows, or nothing.
@@ -2082,6 +2085,17 @@ impl Render for FilePane {
                 cx.emit(FilePaneEvent::SourcePickerRequested);
             })) as SourcePillClick
         });
+        // One button for the whole browser, on whichever pane is at the left.
+        // With the second pane up that is Local (or the other server); without
+        // it, the session's own files.
+        let second_pane = Preferences::is_second_pane_shown(cx);
+        let file_mode = shows_file_mode_button(self.kind, second_pane).then(|| {
+            file_mode_button(
+                file_mode_button_id(self.kind),
+                second_pane,
+                cx.listener(|_, _, _, cx| cx.emit(FilePaneEvent::FileModeRequested)),
+            )
+        });
         let pill = source_pill(
             source_icon(self.kind),
             self.source_label.clone(),
@@ -2184,6 +2198,7 @@ impl Render for FilePane {
                     .pr(px(6.))
                     .gap(px(4.))
                     .items_center()
+                    .children(file_mode)
                     .child(pill)
                     .child(path_area)
                     .children(filter_field)
@@ -2428,6 +2443,44 @@ pub fn source_icon(kind: PaneKind) -> &'static str {
         PaneKind::Local => "icons/monitor.svg",
         PaneKind::Session | PaneKind::Peer => "icons/server.svg",
     }
+}
+
+/// The file-mode button belongs on the pane that starts the row: the second
+/// pane while it is open, otherwise the session's own files.
+fn shows_file_mode_button(kind: PaneKind, second_pane_shown: bool) -> bool {
+    match kind {
+        PaneKind::Session => !second_pane_shown,
+        PaneKind::Local | PaneKind::Peer => second_pane_shown,
+    }
+}
+
+fn file_mode_button_id(kind: PaneKind) -> &'static str {
+    match kind {
+        PaneKind::Local => "file-mode-local",
+        PaneKind::Session => "file-mode-session",
+        PaneKind::Peer => "file-mode-peer",
+    }
+}
+
+/// Switches the browser between the second pane and the server's files alone.
+/// Highlighted while the second pane is open. `on_click` does the switch.
+pub fn file_mode_button(
+    id: &'static str,
+    shows_second_pane: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::AnyElement {
+    Button::new(id)
+        .ghost()
+        .icon(Icon::empty().path("icons/columns-2.svg"))
+        .xsmall()
+        .selected(shows_second_pane)
+        .tooltip(if shows_second_pane {
+            "Remote files only"
+        } else {
+            "Local and remote"
+        })
+        .on_click(on_click)
+        .into_any_element()
 }
 
 /// The title at the start of a pane header that says what the pane shows.
@@ -3130,6 +3183,16 @@ mod tests {
         assert!(!PaneKind::Local.is_remote());
         assert!(PaneKind::Session.is_remote());
         assert!(PaneKind::Peer.is_remote());
+    }
+
+    #[test]
+    fn file_mode_button_sits_before_the_left_pane() {
+        assert!(shows_file_mode_button(PaneKind::Local, true));
+        assert!(shows_file_mode_button(PaneKind::Peer, true));
+        assert!(!shows_file_mode_button(PaneKind::Session, true));
+        assert!(shows_file_mode_button(PaneKind::Session, false));
+        assert!(!shows_file_mode_button(PaneKind::Local, false));
+        assert!(!shows_file_mode_button(PaneKind::Peer, false));
     }
 
     #[test]

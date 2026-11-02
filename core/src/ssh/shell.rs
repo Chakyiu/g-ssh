@@ -1,7 +1,7 @@
 use async_channel::{Receiver, Sender};
 use russh::Channel;
 use russh::ChannelMsg;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tokio::sync::{oneshot, watch};
@@ -96,11 +96,77 @@ pub enum ScrollTarget {
 pub struct ShellHandle {
     cmd_tx: Sender<ShellCmd>,
     event_rx: Receiver<ShellEvent>,
+    /// Folder of a shell on this computer, read from the operating system.
+    /// Empty for an SSH or Telnet shell.
+    native_cwd: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl ShellHandle {
     pub(crate) fn new(cmd_tx: Sender<ShellCmd>, event_rx: Receiver<ShellEvent>) -> Self {
-        Self { cmd_tx, event_rx }
+        Self {
+            cmd_tx,
+            event_rx,
+            native_cwd: None,
+        }
+    }
+
+    pub(crate) fn with_native_cwd(
+        mut self,
+        query: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.native_cwd = Some(query);
+        self
+    }
+
+    /// The folder of a shell on this computer. `None` for an SSH shell: its
+    /// folder is on the other machine, so it has to be asked.
+    pub fn native_directory(&self) -> Option<String> {
+        self.native_cwd.as_ref().and_then(|query| query())
+    }
+
+    /// Type `pwd` and keep what it prints. The answer is
+    /// [`Self::fresh_working_directory`].
+    pub async fn ask_working_directory(&self) {
+        let _ = self.cmd_tx.send(ShellCmd::AskWorkingDirectory).await;
+    }
+
+    /// The folder from the `pwd` started by [`Self::ask_working_directory`],
+    /// once the shell has printed it.
+    pub async fn fresh_working_directory(&self) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ShellCmd::FreshDirectory { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
+    }
+
+    /// The shell's folder, without typing into it. A local shell is read from
+    /// the operating system. An SSH shell uses the directory it last reported.
+    pub async fn current_directory(&self) -> Option<String> {
+        if let Some(query) = &self.native_cwd {
+            if let Some(path) = query() {
+                return Some(path);
+            }
+        }
+        self.reported_directory().await
+    }
+
+    async fn reported_directory(&self) -> Option<String> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ShellCmd::WorkingDirectory { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     pub async fn send_input(&self, data: Vec<u8>) {
@@ -276,6 +342,35 @@ pub enum ShellCmd {
     ScrollToOffset(usize),
     ScrollTo(ScrollTarget),
     ClearScrollback,
+    WorkingDirectory {
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Type the command that prints the folder, and remember the output.
+    AskWorkingDirectory,
+    FreshDirectory {
+        reply: oneshot::Sender<Option<String>>,
+    },
+}
+
+/// Keys that print the shell's folder. A Windows prompt (`C:\...>`) is `cmd`,
+/// which has no `pwd` and shows `^E` and `^U` as text, so it is asked with
+/// `cmd /c cd`. That also works in PowerShell. Anything else is a POSIX shell:
+/// Ctrl+E, Ctrl+U drop a half-typed line first, the same way [`cd_input`] does.
+pub fn directory_probe_input(screen: &str) -> Vec<u8> {
+    if is_windows_prompt(screen) {
+        b"cmd /c cd\r".to_vec()
+    } else {
+        b"\x05\x15pwd\r".to_vec()
+    }
+}
+
+fn is_windows_prompt(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.contains(":\\") && line.ends_with('>'))
 }
 
 pub enum ShellEvent {
@@ -442,6 +537,19 @@ pub(crate) fn apply_shell_cmd(emulator: &mut TermEmulator, cmd: ShellCmd) -> She
         ShellCmd::ClearScrollback => {
             emulator.clear_scrollback();
             ShellCmdEffect::Snapshot
+        }
+        ShellCmd::WorkingDirectory { reply } => {
+            let _ = reply.send(emulator.working_directory());
+            ShellCmdEffect::Quiet
+        }
+        ShellCmd::AskWorkingDirectory => {
+            let screen = emulator.buffer_text();
+            emulator.begin_pwd_watch();
+            ShellCmdEffect::Write(directory_probe_input(&screen))
+        }
+        ShellCmd::FreshDirectory { reply } => {
+            let _ = reply.send(emulator.fresh_directory());
+            ShellCmdEffect::Quiet
         }
     }
 }
@@ -746,6 +854,16 @@ mod tests {
         assert_eq!(shell_quote("dir\\"), r"'dir'\\''");
         assert_eq!(shell_quote(r#"a"b"#), r#"'a"b'"#);
         assert_eq!(shell_quote("notes!.txt"), r"'notes'\!'.txt'");
+    }
+
+    #[test]
+    fn pwd_report_asks_for_the_folder_without_running_the_typed_line() {
+        let posix = String::from_utf8(directory_probe_input("root@k3s:/etc# ")).unwrap();
+        assert_eq!(posix, "\u{5}\u{15}pwd\r");
+        let cmd = String::from_utf8(directory_probe_input(r"C:\Users\lcyha\Downloads>")).unwrap();
+        assert_eq!(cmd, "cmd /c cd\r");
+        let powershell = String::from_utf8(directory_probe_input(r"PS C:\Users\lcyha>")).unwrap();
+        assert_eq!(powershell, "cmd /c cd\r");
     }
 
     #[test]

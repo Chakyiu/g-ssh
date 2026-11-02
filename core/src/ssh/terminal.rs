@@ -10,6 +10,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{ClearMode, Color, CursorShape, Handler, Processor};
 
+use crate::ssh::cwd::DirectoryReports;
 use crate::ssh::shell::{
     GridPoint, GridSelectionRange, MouseModeFlags, ScrollTarget, SelectionExcerpt, SelectionSide,
     SelectionType, SnapshotCell, SnapshotColor, TermSnapshot,
@@ -41,6 +42,8 @@ pub struct TermEmulator {
     /// The match the user last stepped to, in absolute buffer coordinates. Painted
     /// apart from the others; next/prev continue from it.
     current_match: Option<GridSelectionRange>,
+    /// Folder the shell has reported. Empty until an OSC directory report arrives.
+    directories: DirectoryReports,
 }
 
 struct SimpleDims {
@@ -78,13 +81,30 @@ impl TermEmulator {
             replies,
             search: String::new(),
             current_match: None,
+            directories: DirectoryReports::default(),
         }
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
+        self.directories.feed(bytes);
         let history_before = self.term.history_size();
         self.processor.advance(&mut self.term, bytes);
         self.follow_scrolled_lines(history_before);
+    }
+
+    /// The folder the shell last reported, when it reports one.
+    pub(crate) fn working_directory(&self) -> Option<String> {
+        self.directories.path()
+    }
+
+    /// The next output is the answer to a `pwd` typed for the user.
+    pub(crate) fn begin_pwd_watch(&mut self) {
+        self.directories.begin_pwd_watch();
+    }
+
+    /// The folder from that `pwd`, once it has been printed.
+    pub(crate) fn fresh_directory(&self) -> Option<String> {
+        self.directories.fresh_directory()
     }
 
     /// Answers since the last call; send them to the server after each [`Self::advance`].
@@ -646,6 +666,15 @@ mod tests {
         let snapshot = emulator.snapshot();
         assert!(!snapshot.is_app_cursor);
         assert!(snapshot.is_alternate_scroll);
+    }
+
+    #[test]
+    fn a_split_directory_report_is_remembered() {
+        let mut emulator = TermEmulator::new(6, 20);
+        emulator.advance(b"\x1b]7;file://host/var");
+        assert_eq!(emulator.working_directory(), None);
+        emulator.advance(b"/log\x07");
+        assert_eq!(emulator.working_directory().as_deref(), Some("/var/log"));
     }
 
     #[test]

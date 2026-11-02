@@ -283,6 +283,9 @@ impl AppView {
                 crate::ui::local::LocalTerminalEvent::OpenAgentSettings => {
                     this.open_settings_at(SettingsSection::Agent, window, cx);
                 }
+                crate::ui::local::LocalTerminalEvent::Status(message) => {
+                    this.set_status(message.clone(), cx);
+                }
             },
         )
         .detach();
@@ -1836,6 +1839,12 @@ impl AppView {
                 }
                 ServerSessionEvent::LeftSourcePickerRequested => {
                     this.show_left_source_picker(session_entity, window, cx);
+                }
+                ServerSessionEvent::ShowSftp => {
+                    let session = session_entity.clone();
+                    this.workspace.update(cx, |workspace, cx| {
+                        workspace.open_doc(session, WorkKind::Sftp, cx);
+                    });
                 }
                 ServerSessionEvent::PathsChanged { local, remote } => {
                     let server_id = session_entity.read(cx).server_id.clone();

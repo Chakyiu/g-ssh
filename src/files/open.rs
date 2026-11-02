@@ -128,6 +128,52 @@ pub fn open_in_specific_app(app: &Path, file: &Path) -> Result<(), OpenError> {
     }
 }
 
+/// Open `path` in the system file manager. `path` is a folder on this computer.
+pub fn reveal_folder(path: &Path) -> Result<(), OpenError> {
+    if !path.is_dir() {
+        return Err(OpenError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the folder is not on this computer",
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `open` returns as soon as Finder has the folder. Waiting reaps it.
+        let status = std::process::Command::new("open")
+            .arg(path)
+            .status()
+            .map_err(OpenError::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(OpenError::Io(std::io::Error::other(format!(
+                "`open` exited with {status}"
+            ))))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        shell_open(&without_verbatim_prefix(path))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let status = std::process::Command::new("xdg-open")
+            .arg(path)
+            .status()
+            .map_err(OpenError::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(OpenError::Io(std::io::Error::other(format!(
+                "`xdg-open` exited with {status}"
+            ))))
+        }
+    }
+}
+
 pub fn open_in_default_app(path: &Path) -> Result<(), OpenError> {
     // A missing file must not look like a missing app.
     std::fs::metadata(path).map_err(OpenError::Io)?;

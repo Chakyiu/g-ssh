@@ -81,11 +81,23 @@ fn spawn_command(cmd: CommandBuilder, rows: u16, cols: u16) -> Result<ShellHandl
             pixel_height: 0,
         })
         .map_err(|err| err.to_string())?;
-    let child = Reap::new(
-        pair.slave
-            .spawn_command(cmd)
-            .map_err(|err| err.to_string())?,
-    );
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|err| err.to_string())?;
+    // Taken before the PTY moves onto the driver thread. The duplicate fd is
+    // only used to ask which process is in the foreground.
+    let native = child.process_id().map(|pid| {
+        #[cfg(unix)]
+        {
+            crate::ssh::cwd::NativeDirectory::from_pty(pair.master.as_ref(), pid)
+        }
+        #[cfg(windows)]
+        {
+            crate::ssh::cwd::NativeDirectory::from_pid(pid)
+        }
+    });
+    let child = Reap::new(child);
     let reader = pair
         .master
         .try_clone_reader()
@@ -122,7 +134,11 @@ fn spawn_command(cmd: CommandBuilder, rows: u16, cols: u16) -> Result<ShellHandl
         .map_err(|err| err.to_string())?;
 
     tracing::info!(rows, cols, "opened a local shell");
-    Ok(ShellHandle::new(cmd_tx, event_rx))
+    let handle = ShellHandle::new(cmd_tx, event_rx);
+    Ok(match native {
+        Some(native) => handle.with_native_cwd(native.into_query()),
+        None => handle,
+    })
 }
 
 fn pump_output(mut reader: Box<dyn Read + Send>, tx: Sender<PtyIn>) {
@@ -356,5 +372,74 @@ mod tests {
                 Err(_) => panic!("timed out:\n{}", last.lock().expect("last output")),
             }
         });
+    }
+
+    #[test]
+    fn a_local_shell_reports_the_folder_it_moved_to() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let start = root.path().join("start");
+        let next = root.path().join("next");
+        std::fs::create_dir(&start).unwrap();
+        std::fs::create_dir(&next).unwrap();
+
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.cwd(&start);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("ENV", "");
+        cmd.env("PS1", "$ ");
+        let shell = spawn_command(cmd, 24, 80).expect("open a local shell");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let events = shell.subscribe();
+            assert!(
+                directory_became(&shell, &start).await,
+                "shell did not start in {}",
+                start.display()
+            );
+            let moved = next.display().to_string().replace('\'', r"'\''");
+            shell
+                .send_input(format!("cd '{moved}' && echo MOVED\r").into_bytes())
+                .await;
+            let saw = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match events.recv().await {
+                        Ok(ShellEvent::Snapshot(snapshot))
+                            if visible_text(&snapshot).contains("MOVED") =>
+                        {
+                            return true;
+                        }
+                        Ok(ShellEvent::Exited) | Err(_) => return false,
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .await;
+            assert!(matches!(saw, Ok(true)), "cd did not finish");
+            assert!(
+                directory_became(&shell, &next).await,
+                "shell did not move to {}",
+                next.display()
+            );
+        });
+    }
+
+    async fn directory_became(
+        shell: &crate::ssh::shell::ShellHandle,
+        folder: &std::path::Path,
+    ) -> bool {
+        let expected = std::fs::canonicalize(folder).unwrap();
+        for _ in 0..50 {
+            if let Some(path) = shell.current_directory().await {
+                if std::fs::canonicalize(&path).ok().as_deref() == Some(expected.as_path()) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 }

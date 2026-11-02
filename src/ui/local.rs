@@ -5,8 +5,8 @@
 use crate::ui::scale::px;
 use gpui::prelude::*;
 use gpui::{
-    div, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter, Focusable as _,
-    MouseButton, StyleRefinement, Window,
+    div, Anchor, AnyElement, ClickEvent, Context, DragMoveEvent, Entity, EventEmitter,
+    Focusable as _, MouseButton, MouseDownEvent, Pixels, Point, StyleRefinement, Window,
 };
 
 use gpui_component::{
@@ -17,6 +17,7 @@ use gssh::vault::SnippetBody;
 
 use crate::theme;
 use crate::ui::hints;
+use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::session::panel::{
     panel_resize_handle, PanelHost, PanelResize, SelectionCite, ServerPanel, ServerPanelEvent,
 };
@@ -27,6 +28,8 @@ use crate::ui::VaultState;
 pub enum LocalTerminalEvent {
     /// Open Settings on the agent endpoint page.
     OpenAgentSettings,
+    /// A short message for the window's status line.
+    Status(String),
 }
 
 impl EventEmitter<LocalTerminalEvent> for LocalTerminal {}
@@ -51,14 +54,20 @@ pub struct LocalTerminal {
     panel_shown: bool,
     /// `user@hostname`, for the agent and a snippet's record of where it ran.
     machine_label: String,
+    /// Right-click menu for one shell tab, when it is open.
+    tab_menu: Option<TabMenu>,
+}
+
+struct TabMenu {
+    index: usize,
+    position: Point<Pixels>,
 }
 
 impl LocalTerminal {
     pub fn new(vault_state: Entity<VaultState>, cx: &mut Context<Self>) -> Self {
         let local = cx.entity().downgrade();
-        let panel = cx.new(|cx| {
-            ServerPanel::new(PanelHost::Local(local), false, vault_state.clone(), cx)
-        });
+        let panel =
+            cx.new(|cx| ServerPanel::new(PanelHost::Local(local), false, vault_state.clone(), cx));
         cx.subscribe(&panel, |this, _, event, cx| this.on_panel(event, cx))
             .detach();
         Self {
@@ -70,6 +79,7 @@ impl LocalTerminal {
             panel,
             panel_shown: false,
             machine_label: machine_label(),
+            tab_menu: None,
         }
     }
 
@@ -310,6 +320,7 @@ impl LocalTerminal {
         if self.shells.len() <= 1 || index >= self.shells.len() {
             return;
         }
+        self.tab_menu = None;
         self.shells.remove(index);
         if self.active > index {
             self.active -= 1;
@@ -413,6 +424,13 @@ impl LocalTerminal {
             })
             .child(label)
             .children(close)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.open_tab_menu(index, event.position, cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| this.activate(index, cx)))
             .on_aux_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 if event.is_middle_click() {
@@ -471,6 +489,90 @@ impl LocalTerminal {
             );
         }
         strip.into_any_element()
+    }
+
+    fn open_tab_menu(&mut self, index: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if index >= self.shells.len() {
+            return;
+        }
+        self.activate(index, cx);
+        self.tab_menu = Some(TabMenu { index, position });
+        cx.notify();
+    }
+
+    /// Open this computer's file manager in the folder the shell is in.
+    fn open_sftp_in_pwd(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tab_menu = None;
+        let Some(shell) = self.shells.get(index) else {
+            cx.notify();
+            return;
+        };
+        if shell.exited {
+            cx.emit(LocalTerminalEvent::Status(
+                "The shell has exited.".to_string(),
+            ));
+            return;
+        }
+        let view = shell.view.clone();
+        let (busy, handle) = {
+            let terminal = view.read(cx);
+            let busy = terminal
+                .last_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.alt_screen);
+            (busy, terminal.shell.clone())
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let path = crate::ui::terminal::working_directory(&handle, !busy, cx).await;
+            this.update(cx, |_terminal, cx| match path {
+                Some(path) => {
+                    if let Err(err) = crate::files::open::reveal_folder(std::path::Path::new(&path))
+                    {
+                        cx.emit(LocalTerminalEvent::Status(format!(
+                            "Couldn't open {path}: {err}"
+                        )));
+                    }
+                }
+                None if busy => cx.emit(LocalTerminalEvent::Status(
+                    "Terminal is busy with a full-screen program".to_string(),
+                )),
+                None => cx.emit(LocalTerminalEvent::Status(
+                    "Couldn't read the shell's folder".to_string(),
+                )),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_tab_menu(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let menu = self.tab_menu.as_ref()?;
+        if menu.index >= self.shells.len() {
+            return None;
+        }
+        let index = menu.index;
+        let items = vec![ContextMenuItem::new(
+            "local-tab-sftp",
+            "Open SFTP Here",
+            cx.listener(move |this, _, _, cx| {
+                this.open_sftp_in_pwd(index, cx);
+            }),
+        )
+        .icon("icons/folder-open.svg")];
+        Some(
+            ContextMenu::new(
+                "local-tab-menu",
+                menu.position,
+                Anchor::TopLeft,
+                cx.listener(|this, _, _, cx| {
+                    this.tab_menu = None;
+                    cx.notify();
+                }),
+                items,
+            )
+            .into_any_element(),
+        )
     }
 
     /// Agent and overview, drawn on the workspace tab row. The shell tabs
@@ -637,10 +739,13 @@ impl Render for LocalTerminal {
             .child(body)
             .into_any_element();
         let panel = self.panel_shown.then(|| self.render_side_panel(window, cx));
+        let menu = self.render_tab_menu(cx);
         h_flex()
+            .relative()
             .size_full()
             .overflow_hidden()
             .child(div().flex_1().min_w_0().h_full().child(main))
             .children(panel)
+            .children(menu)
     }
 }

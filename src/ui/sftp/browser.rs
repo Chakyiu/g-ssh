@@ -28,8 +28,8 @@ use crate::theme;
 use crate::ui::sftp::conflict::{free_name, ConflictChoice, Endpoint, FileFacts, TransferConflict};
 use crate::ui::sftp::keys::{pane_command, PaneCommand, SwitchPane, KEY_CONTEXT};
 use crate::ui::sftp::pane::{
-    source_icon, source_pill, DraggedEntry, EntryRef, FilePane, FilePaneEvent, PaneKind,
-    SourcePillClick, StagedFile, SyncIndicator,
+    file_mode_button, source_icon, source_pill, DraggedEntry, EntryRef, FilePane, FilePaneEvent,
+    PaneKind, SourcePillClick, StagedFile, SyncIndicator,
 };
 use gssh::ssh::connection::Connection;
 use gssh::ssh::{
@@ -330,6 +330,9 @@ pub struct SftpBrowser {
     next_conflict_id: u64,
     /// The "do the same for the others" checkbox of the conflict dialog.
     pub is_conflict_choice_for_all: bool,
+    /// After the file-mode button, the next render moves the keys. `true` is
+    /// the left half, `false` is the session's files.
+    focus_after_file_mode: Option<bool>,
 }
 
 impl EventEmitter<BrowserEvent> for SftpBrowser {}
@@ -631,6 +634,7 @@ impl SftpBrowser {
             transfer_conflicts: VecDeque::new(),
             next_conflict_id: 0,
             is_conflict_choice_for_all: false,
+            focus_after_file_mode: None,
         };
 
         browser.load_local_dir(&local_start, cx);
@@ -668,7 +672,7 @@ impl SftpBrowser {
     }
 
     /// Show the left half if it is hidden. The choice is saved, like the
-    /// header's switch.
+    /// file-mode button.
     fn reveal_second_pane(&mut self, cx: &mut Context<Self>) {
         if Preferences::is_second_pane_shown(cx) {
             return;
@@ -677,8 +681,39 @@ impl SftpBrowser {
         cx.notify();
     }
 
+    /// The button before the left pane's name. Open, the second pane sits
+    /// beside the session's files. Closed, those files fill the tab.
+    fn toggle_file_mode(&mut self, cx: &mut Context<Self>) {
+        let show_second = !Preferences::is_second_pane_shown(cx);
+        Preferences::update(cx, |prefs| prefs.is_second_pane_shown = show_second);
+        self.focus_after_file_mode = Some(show_second);
+        cx.notify();
+    }
+
+    /// The file-mode button is clicked where no `Window` is at hand. The next
+    /// render moves the keys into the half that stays on screen.
+    fn apply_file_mode_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(show_second) = self.focus_after_file_mode.take() else {
+            return;
+        };
+        if show_second {
+            self.focus_left(window, cx);
+        } else {
+            self.focus_files(window, cx);
+        }
+    }
+
     pub fn list_session_pane_again(&mut self, cx: &mut Context<Self>) {
         self.right.list_again(cx);
+    }
+
+    /// Show `path` in the session's file pane. The listing is the same one a
+    /// click in that pane starts.
+    pub fn open_remote_dir(&mut self, path: &str, cx: &mut Context<Self>) {
+        let current = self.right.pane.read(cx).path.clone();
+        let path = remote_folder(&current, path);
+        self.right.pane.update(cx, |pane, cx| pane.set_loading(cx));
+        self.go_to_remote(Side::Right, &path, cx);
     }
 
     /// The handle that holds the keys when they are in the left half.
@@ -1045,10 +1080,13 @@ impl SftpBrowser {
                 done,
                 total,
             } => {
-                // Throttled by the worker (~10/s). Tracked transfers also feed
-                // the tasks popover; everything updates the status bar.
+                // Throttled by the worker (~10/s). A tracked transfer draws
+                // its bar under the file panes, so it does not also take the
+                // status line. Opening a file has no row; that progress is
+                // the status line.
                 if let Some(id) = id {
                     cx.emit(BrowserEvent::TransferProgress { id, done, total });
+                    return;
                 }
                 let is_recent = self
                     .progress_shown_at
@@ -1195,6 +1233,7 @@ impl SftpBrowser {
             FilePaneEvent::SourcePickerRequested => {
                 cx.emit(BrowserEvent::LeftSourcePickerRequested);
             }
+            FilePaneEvent::FileModeRequested => self.toggle_file_mode(cx),
             // Remote-only items: the local menu never offers them.
             FilePaneEvent::Chmod { .. }
             | FilePaneEvent::CdTerminalHere(_)
@@ -1237,33 +1276,36 @@ impl SftpBrowser {
         self.load_local_dir(&dir, cx);
     }
 
+    /// List `path` on `side`. A cached folder is shown at once and refreshed.
+    fn go_to_remote(&mut self, side: Side, path: &str, cx: &mut Context<Self>) {
+        let Some(remote) = self.side_mut(side) else {
+            return;
+        };
+        remote.prefetch_ancestors(path);
+        let cached = remote.cache_get(path).cloned();
+        if let Some(entries) = cached {
+            remote.pending_navigation = None;
+            let path = path.to_string();
+            remote.pane.update(cx, |pane, cx| {
+                pane.set_entries(path.clone(), entries, cx);
+            });
+            if !remote.is_in_flight(&path) {
+                remote.mark_in_flight(&path);
+                remote.primary.list_dir(path);
+            }
+            return;
+        }
+        remote.pending_navigation = Some(PathBuf::from(path));
+        if !remote.is_in_flight(path) {
+            remote.mark_in_flight(path);
+            remote.primary.list_dir(path.to_string());
+        }
+    }
+
     fn on_remote_event(&mut self, side: Side, event: &FilePaneEvent, cx: &mut Context<Self>) {
         let is_session = side == Side::Right;
         match event {
-            FilePaneEvent::NavigateTo(path) => {
-                let Some(remote) = self.side_mut(side) else {
-                    return;
-                };
-                remote.prefetch_ancestors(path);
-                let cached = remote.cache_get(path).cloned();
-                if let Some(entries) = cached {
-                    remote.pending_navigation = None;
-                    let path = path.clone();
-                    remote.pane.update(cx, |pane, cx| {
-                        pane.set_entries(path.clone(), entries, cx);
-                    });
-                    if !remote.is_in_flight(&path) {
-                        remote.mark_in_flight(&path);
-                        remote.primary.list_dir(path);
-                    }
-                    return;
-                }
-                remote.pending_navigation = Some(PathBuf::from(path));
-                if !remote.is_in_flight(path) {
-                    remote.mark_in_flight(path);
-                    remote.primary.list_dir(path.clone());
-                }
-            }
+            FilePaneEvent::NavigateTo(path) => self.go_to_remote(side, path, cx),
             FilePaneEvent::PathChanged => {
                 self.persist_paths(cx);
             }
@@ -1367,6 +1409,7 @@ impl SftpBrowser {
             FilePaneEvent::SourcePickerRequested if !is_session => {
                 cx.emit(BrowserEvent::LeftSourcePickerRequested);
             }
+            FilePaneEvent::FileModeRequested => self.toggle_file_mode(cx),
             FilePaneEvent::CreateDir { path } => {
                 let Some(sftp) = self.side(side).map(|remote| remote.primary.clone()) else {
                     return;
@@ -1573,8 +1616,7 @@ impl SftpBrowser {
     }
 
     /// Allocate a task id + cancel flag for a transfer and announce it, so the
-    /// session lists it in the tasks popover with a progress ring and a stop
-    /// button.
+    /// session lists it under the file panes and in the tasks popover.
     fn begin_transfer(
         &mut self,
         name: &str,
@@ -2714,6 +2756,7 @@ impl Render for SftpBrowser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_peer_password_input(window, cx);
         self.move_left_focus(window, cx);
+        self.apply_file_mode_focus(window, cx);
         let root = div()
             .size_full()
             .flex()
@@ -2754,7 +2797,13 @@ impl SftpBrowser {
             .h(px(38.))
             .flex_none()
             .px(px(6.))
+            .gap(px(4.))
             .items_center()
+            .child(file_mode_button(
+                "file-mode-wait",
+                true,
+                cx.listener(|this, _, _, cx| this.toggle_file_mode(cx)),
+            ))
             .child(source_pill(
                 source_icon(PaneKind::Peer),
                 name.clone().into(),
@@ -3239,6 +3288,23 @@ fn load_local_entries(path: &str) -> std::io::Result<Vec<gssh::ssh::FileEntry>> 
     Ok(entries)
 }
 
+/// `folder` in the form this server's SFTP already uses. OpenSSH on Windows
+/// reports a drive as `C:/...` or `/C:/...`; the pane's current folder says which.
+fn remote_folder(current: &str, folder: &str) -> String {
+    let folder_is_drive = folder.as_bytes().get(1) == Some(&b':');
+    if folder_is_drive && current.starts_with('/') {
+        return format!("/{folder}");
+    }
+    if let Some(rest) = folder.strip_prefix('/') {
+        let rest_is_drive = rest.as_bytes().get(1) == Some(&b':');
+        let current_is_drive = current.as_bytes().get(1) == Some(&b':');
+        if rest_is_drive && current_is_drive {
+            return rest.to_string();
+        }
+    }
+    folder.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3250,6 +3316,19 @@ mod tests {
             to,
             cancel: CancelFlag::default(),
         }
+    }
+
+    #[test]
+    fn a_windows_folder_follows_the_form_the_server_already_uses() {
+        assert_eq!(
+            remote_folder("/C:/Users/lcyha", "C:/Users/lcyha/Downloads"),
+            "/C:/Users/lcyha/Downloads"
+        );
+        assert_eq!(
+            remote_folder("C:/Users/lcyha", "C:/Users/lcyha/Downloads"),
+            "C:/Users/lcyha/Downloads"
+        );
+        assert_eq!(remote_folder("/root", "/etc"), "/etc");
     }
 
     #[test]

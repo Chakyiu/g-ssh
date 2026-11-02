@@ -2,10 +2,13 @@
 //!
 //! Small pills in the terminal header show the running transfers; clicking one
 //! opens a popover that lists them with live progress, and the finished ones
-//! with their result. Several transfers can run at once.
+//! with their result. The same transfers sit in a panel under the file panes
+//! while that tab is in front. Several transfers can run at once.
 //!
 //! This is part of `impl ServerSession`, kept out of the session module so
 //! that module stays about the connection lifecycle.
+
+use std::time::Instant;
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
@@ -14,7 +17,7 @@ use gpui::{div, AnyElement, Context, Hsla, SharedString};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    progress::ProgressCircle,
+    progress::{Progress, ProgressCircle},
     spinner::Spinner,
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
@@ -294,7 +297,9 @@ impl ServerSession {
                 .into_any_element()
         };
 
-        let detail = t.expanded.then(|| transfer_detail_panel(t, cx));
+        let detail = t
+            .expanded
+            .then(|| transfer_detail_panel(t, "tr-detail", cx));
 
         let row = h_flex()
             .h(px(26.))
@@ -402,7 +407,7 @@ impl ServerSession {
             .unwrap_or_default();
         let id = t.id;
         let expanded = t.expanded;
-        let detail = expanded.then(|| transfer_detail_panel(t, cx));
+        let detail = expanded.then(|| transfer_detail_panel(t, "tr-detail", cx));
 
         let row = h_flex()
             .id(("tr-hrow", id as usize))
@@ -459,6 +464,294 @@ impl ServerSession {
             );
 
         v_flex().child(row).children(detail).into_any_element()
+    }
+
+    /// Live uploads and downloads under the file panes. Hidden when nothing
+    /// has been transferred this connection. Folds to one row once the last
+    /// transfer ends, so the file list gets its height back.
+    pub fn render_sftp_transfer_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.transfers.is_empty() && self.transfer_history.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let body = if self.transfer_panel_collapsed {
+            self.render_collapsed_transfer(now, cx)
+        } else {
+            self.render_transfer_panel_list(now, cx)
+        };
+
+        Some(
+            v_flex()
+                .id("sftp-transfer-panel")
+                .occlude()
+                .flex_none()
+                .w_full()
+                .overflow_hidden()
+                .border_t_1()
+                .border_color(theme::border())
+                .bg(cx.theme().background)
+                .child(self.render_transfer_panel_head(cx))
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    fn toggle_transfer_panel(&mut self, cx: &mut Context<Self>) {
+        self.transfer_panel_collapsed = !self.transfer_panel_collapsed;
+        cx.notify();
+    }
+
+    fn render_transfer_panel_head(&self, cx: &Context<Self>) -> AnyElement {
+        let active = self.transfers.len();
+        let can_clear = !self.transfer_history.is_empty();
+
+        h_flex()
+            .id("sftp-transfer-head")
+            .h(px(28.))
+            .w_full()
+            .pl(px(2.))
+            .pr(px(6.))
+            .gap(px(2.))
+            .items_center()
+            .bg(theme::sunken_soft())
+            .border_b_1()
+            .border_color(theme::border())
+            .child(self.transfer_panel_toggle(cx))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_semibold()
+                    .text_color(cx.theme().foreground)
+                    .child("Transfers"),
+            )
+            .when(active > 0, |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .child(SharedString::from(active.to_string())),
+                )
+            })
+            .child(div().flex_1())
+            .when(can_clear, |el| el.child(self.transfer_clear_button(cx)))
+            .into_any_element()
+    }
+
+    fn transfer_panel_toggle(&self, cx: &Context<Self>) -> AnyElement {
+        let icon = if self.transfer_panel_collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        Button::new("sftp-transfer-toggle")
+            .ghost()
+            .icon(icon)
+            .xsmall()
+            .tooltip(if self.transfer_panel_collapsed {
+                "Show transfers"
+            } else {
+                "Hide transfers"
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_transfer_panel(cx);
+            }))
+            .into_any_element()
+    }
+
+    fn transfer_clear_button(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id("sftp-transfer-clear")
+            .flex_none()
+            .h(px(18.))
+            .px(px(6.))
+            .flex()
+            .items_center()
+            .rounded(px(3.))
+            .text_size(px(10.5))
+            .text_color(theme::text_dim())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::element_hover()).text_color(theme::text()))
+            .active(|style| style.bg(theme::element_active()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.clear_finished_tasks(cx);
+            }))
+            .child("Clear")
+            .into_any_element()
+    }
+
+    fn render_collapsed_transfer(&self, now: Instant, cx: &Context<Self>) -> AnyElement {
+        if let Some(transfer) = featured_transfer(&self.transfers) {
+            let extra = self.transfers.len().saturating_sub(1);
+            return self.render_active_transfer_row(transfer, extra, now, false, cx);
+        }
+        let Some(transfer) = self.transfer_history.first() else {
+            return div().into_any_element();
+        };
+        let extra = self.transfer_history.len().saturating_sub(1);
+        self.render_finished_transfer_row(transfer, extra, false, cx)
+    }
+
+    fn render_transfer_panel_list(&self, now: Instant, cx: &Context<Self>) -> AnyElement {
+        let mut rows = Vec::new();
+        for transfer in &self.transfers {
+            rows.push(self.render_active_transfer_row(transfer, 0, now, true, cx));
+        }
+        for transfer in &self.transfer_history {
+            rows.push(self.render_finished_transfer_row(transfer, 0, true, cx));
+        }
+
+        div()
+            .id("sftp-transfer-list")
+            .w_full()
+            .max_h(px(280.))
+            .overflow_y_scroll()
+            .child(v_flex().w_full().children(rows))
+            .into_any_element()
+    }
+
+    fn render_active_transfer_row(
+        &self,
+        transfer: &TransferTask,
+        extra: usize,
+        now: Instant,
+        details: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let id = transfer.id;
+        let value = with_extra(transfer_value_text(transfer), extra);
+        let pace = if transfer.is_queued {
+            None
+        } else {
+            live_pace_text(transfer, now)
+        };
+        let show_bar = !transfer.is_queued;
+
+        v_flex()
+            .w_full()
+            .px(px(8.))
+            .pt(px(6.))
+            .pb(px(7.))
+            .gap(px(5.))
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap(px(8.))
+                    .items_center()
+                    .child(direction_icon(transfer.kind))
+                    .child(transfer_name(transfer.name.clone(), cx))
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child(SharedString::from(value)),
+                    )
+                    .child(self.transfer_stop_button(id, cx)),
+            )
+            .when(show_bar, |el| {
+                el.child(transfer_progress_line(transfer, pace))
+            })
+            .when(details, |el| {
+                el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_finished_transfer_row(
+        &self,
+        transfer: &TransferTask,
+        extra: usize,
+        details: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (icon, color, label) = match &transfer.outcome {
+            Some(TransferOutcome::Done { skipped_links }) => (
+                IconName::Check,
+                theme::status_online(),
+                done_text(transfer.done, *skipped_links),
+            ),
+            Some(TransferOutcome::Canceled) => {
+                (IconName::Close, theme::text_dim(), "Canceled".to_string())
+            }
+            Some(TransferOutcome::Failed(error)) => (
+                IconName::TriangleAlert,
+                theme::run_red(),
+                failed_label(error),
+            ),
+            None => (IconName::Close, theme::text_dim(), String::new()),
+        };
+        let label = with_extra(label, extra);
+
+        v_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(theme::border())
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .gap(px(8.))
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_none()
+                            .text_color(color)
+                            .child(Icon::new(icon).size(px(12.))),
+                    )
+                    .child(transfer_name(transfer.name.clone(), cx))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(240.))
+                            .truncate()
+                            .whitespace_nowrap()
+                            .text_size(px(11.))
+                            .text_color(color)
+                            .child(SharedString::from(label)),
+                    ),
+            )
+            .when(details, |el| {
+                el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
+            })
+            .into_any_element()
+    }
+
+    fn transfer_stop_button(&self, id: u64, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id(("sftp-xfer-stop", id as usize))
+            .flex_none()
+            .w(px(18.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .text_color(theme::text_dim())
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(theme::element_hover())
+                    .text_color(theme::run_red())
+            })
+            .active(|style| {
+                style
+                    .bg(theme::element_active())
+                    .text_color(theme::run_red())
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(id, cx)))
+            .child(Icon::new(IconName::Close).size(px(12.)))
+            .into_any_element()
     }
 }
 
@@ -524,7 +817,11 @@ fn chevron_icon(expanded: bool) -> Icon {
 }
 
 /// Expanded detail for a single SFTP transfer: direction, size, %, speed, time.
-fn transfer_detail_panel(t: &TransferTask, cx: &Context<ServerSession>) -> impl IntoElement {
+fn transfer_detail_panel(
+    t: &TransferTask,
+    id: &'static str,
+    cx: &Context<ServerSession>,
+) -> impl IntoElement {
     let dim = theme::text_dim();
     let fg = cx.theme().foreground;
 
@@ -587,7 +884,7 @@ fn transfer_detail_panel(t: &TransferTask, cx: &Context<ServerSession>) -> impl 
     };
 
     div()
-        .id(("tr-detail", t.id as usize))
+        .id((id, t.id as usize))
         .mx(px(2.))
         .mb(px(3.))
         .p(px(7.))
@@ -687,6 +984,77 @@ fn queued_mark(size: gpui::Pixels) -> AnyElement {
         .into_any_element()
 }
 
+/// The transfer a folded panel shows: one that is already moving, or the
+/// first in line when every one of them is still waiting for a slot.
+fn featured_transfer(transfers: &[TransferTask]) -> Option<&TransferTask> {
+    transfers
+        .iter()
+        .find(|transfer| !transfer.is_queued)
+        .or_else(|| transfers.first())
+}
+
+/// Appends a count of the transfers the folded row does not name.
+fn with_extra(label: String, extra: usize) -> String {
+    if extra == 0 {
+        label
+    } else {
+        format!("{label} \u{00b7} +{extra}")
+    }
+}
+
+fn failed_label(error: &str) -> String {
+    if error.is_empty() {
+        "Failed".to_string()
+    } else {
+        format!("Failed \u{00b7} {error}")
+    }
+}
+
+fn transfer_name(name: String, cx: &Context<ServerSession>) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .truncate()
+        .text_ellipsis_middle()
+        .text_size(px(12.))
+        .font_semibold()
+        .text_color(cx.theme().foreground)
+        .child(name)
+}
+
+fn transfer_progress_line(transfer: &TransferTask, pace: Option<String>) -> impl IntoElement {
+    let indeterminate = transfer.total == 0;
+    let bar = Progress::new(("sftp-xfer", transfer.id as usize))
+        .value(transfer.pct() as f32)
+        .loading(indeterminate)
+        .color(theme::accent())
+        .xsmall()
+        .w_full()
+        .accessibility_label(SharedString::from(format!(
+            "{} {}",
+            direction_text(transfer.kind, None),
+            transfer.name
+        )));
+
+    h_flex()
+        .w_full()
+        .gap(px(8.))
+        .items_center()
+        .child(div().flex_1().min_w(px(48.)).child(bar))
+        .when_some(pace, |el, pace| {
+            el.child(
+                div()
+                    .flex_none()
+                    .max_w(px(168.))
+                    .truncate()
+                    .whitespace_nowrap()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_dim())
+                    .child(SharedString::from(pace)),
+            )
+        })
+}
+
 /// Meta text of a finished transfer: its size, plus the symlinks a folder
 /// transfer left out, so a missing link in the copy is not a silent surprise.
 fn done_text(bytes: u64, skipped_links: usize) -> String {
@@ -722,6 +1090,21 @@ mod tests {
         assert_eq!(
             direction_text(TransferKind::Download, Some("web-02")),
             "Download via web-02"
+        );
+    }
+
+    #[test]
+    fn with_extra_names_the_transfers_a_folded_row_hides() {
+        assert_eq!(with_extra("64%".to_string(), 0), "64%");
+        assert_eq!(with_extra("64%".to_string(), 2), "64% \u{00b7} +2");
+    }
+
+    #[test]
+    fn failed_label_keeps_the_reason() {
+        assert_eq!(failed_label(""), "Failed");
+        assert_eq!(
+            failed_label("connection reset"),
+            "Failed \u{00b7} connection reset"
         );
     }
 

@@ -1,10 +1,10 @@
 //! Terminal tabs: several shells for one host over the same SSH connection,
-//! so a second shell needs no second login. A right-click renames a terminal
-//! tab or colours it. A middle-click closes it. Dragging a tab docks it into
-//! a second pane, which keeps its own tab list. Dropping a tab on an edge
-//! splits that cell, so the grid
-//! can grow to four, five, or more. SFTP for a host is its own workspace tab,
-//! opened from the host list.
+//! so a second shell needs no second login. A right-click opens SFTP in that
+//! shell's folder, or renames the tab, or colours it. A middle-click closes
+//! it. Dragging a tab docks it into a second pane, which keeps its own tab
+//! list. Dropping a tab on an edge splits that cell, so the grid can grow to
+//! four, five, or more. SFTP for a host is its own workspace tab, opened from
+//! the host list or from a terminal tab.
 //!
 //! The methods belong to `ServerSession`. They live here so that the session
 //! module stays about the connection lifecycle.
@@ -37,6 +37,7 @@ use crate::ui::session::{
 };
 use crate::ui::terminal::view::{TabColor, TerminalEvent, TerminalView};
 use gssh::ssh::shell::ShellHandle;
+use gssh::vault::ConnectionKind;
 
 /// Tabs past this would not fit the header. It is also close to what a server
 /// allows: OpenSSH's default `MaxSessions` is 10 and SFTP takes two of them.
@@ -960,6 +961,62 @@ impl ServerSession {
         cx.notify();
     }
 
+    /// Open this host's SFTP tab in the folder the shell at `ix` is in.
+    fn open_sftp_in_pwd(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.terminal_tab_menu = None;
+        if self.conn_info.kind == ConnectionKind::Telnet {
+            cx.emit(ServerSessionEvent::StatusChanged(
+                "Telnet hosts have no files.".to_string(),
+            ));
+            return;
+        }
+        let Some(view) = self.terminals.get(ix).cloned() else {
+            cx.notify();
+            return;
+        };
+        let (busy, shell) = {
+            let terminal = view.read(cx);
+            let busy = terminal
+                .last_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.alt_screen);
+            (busy, terminal.shell.clone())
+        };
+        if self.browser.is_none() {
+            cx.emit(ServerSessionEvent::StatusChanged(
+                "Can't open SFTP: not connected".to_string(),
+            ));
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let path = crate::ui::terminal::working_directory(&shell, !busy, cx).await;
+            this.update(cx, |session, cx| match path {
+                Some(path) => session.show_sftp_at(&path, cx),
+                None if busy => cx.emit(ServerSessionEvent::StatusChanged(
+                    "Terminal is busy with a full-screen program".to_string(),
+                )),
+                None => cx.emit(ServerSessionEvent::StatusChanged(
+                    "Couldn't read the shell's folder".to_string(),
+                )),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_sftp_at(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(browser) = self.browser.clone() else {
+            cx.emit(ServerSessionEvent::StatusChanged(
+                "Can't open SFTP: not connected".to_string(),
+            ));
+            return;
+        };
+        tracing::info!(path, "opening sftp in the shell's folder");
+        browser.update(cx, |browser, cx| browser.open_remote_dir(path, cx));
+        cx.emit(ServerSessionEvent::ShowSftp);
+    }
+
     fn apply_tab_title(&mut self, ix: usize, raw: &str, cx: &mut Context<Self>) {
         if ix >= self.terminals.len() {
             return;
@@ -1576,15 +1633,30 @@ impl ServerSession {
             return None;
         }
         let ix = menu.ix;
-        let items = vec![ContextMenuItem::new(
-            "terminal-tab-rename",
-            "Rename\u{2026}",
-            cx.listener(move |this, _, window, cx| {
-                this.terminal_tab_menu = None;
-                this.open_rename_tab(ix, window, cx);
-            }),
-        )
-        .icon("icons/pen-line.svg")];
+        let mut items = Vec::new();
+        if self.conn_info.kind != ConnectionKind::Telnet {
+            items.push(
+                ContextMenuItem::new(
+                    "terminal-tab-sftp",
+                    "Open SFTP Here",
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_sftp_in_pwd(ix, cx);
+                    }),
+                )
+                .icon("icons/folder-open.svg"),
+            );
+        }
+        items.push(
+            ContextMenuItem::new(
+                "terminal-tab-rename",
+                "Rename\u{2026}",
+                cx.listener(move |this, _, window, cx| {
+                    this.terminal_tab_menu = None;
+                    this.open_rename_tab(ix, window, cx);
+                }),
+            )
+            .icon("icons/pen-line.svg"),
+        );
         Some(
             ContextMenu::new(
                 "terminal-tab-menu",

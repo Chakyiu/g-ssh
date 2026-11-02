@@ -61,7 +61,10 @@ const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUESTION_CHARS: usize = 500;
 const MAX_QUESTION_OPTIONS: usize = 6;
+/// Fits on the option row. Longer text is the hover tooltip.
 const MAX_OPTION_CHARS: usize = 80;
+/// Kept for that tooltip and for the answer sent back.
+const MAX_OPTION_FULL_CHARS: usize = 2_000;
 const MAX_OTHER_CHARS: usize = 2_000;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -948,7 +951,7 @@ fn clean_options(value: &Value) -> Vec<String> {
         if option.is_empty() || option.contains('\0') || option.eq_ignore_ascii_case("other") {
             continue;
         }
-        let option = clip_label(option, MAX_OPTION_CHARS);
+        let option = clip_label(option, MAX_OPTION_FULL_CHARS);
         if out
             .iter()
             .any(|have: &String| have.eq_ignore_ascii_case(&option))
@@ -1001,6 +1004,11 @@ fn clip_label(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+/// The row shows two lines. Hover is how the rest of the option is read.
+fn option_needs_tip(label: &str) -> bool {
+    label.chars().count() > MAX_OPTION_CHARS || label.lines().count() > 2
 }
 
 /// Split a `<command>` tag off the end of a reply. `None` when the tag is
@@ -4931,6 +4939,7 @@ fn choice_row(
     selected: bool,
     cx: &Context<ServerPanel>,
 ) -> gpui::Stateful<gpui::Div> {
+    let tip = option_needs_tip(&label).then(|| label.clone());
     h_flex()
         .id(id)
         .w_full()
@@ -4949,6 +4958,8 @@ fn choice_row(
                 .text_size(chat_text())
                 .line_height(px(18.))
                 .whitespace_normal()
+                .line_clamp(2)
+                .text_ellipsis()
                 .text_color(cx.theme().foreground)
                 .child(label),
         )
@@ -4959,6 +4970,24 @@ fn choice_row(
                     .size(px(12.))
                     .text_color(theme::accent()),
             )
+        })
+        .when_some(tip, |row, tip| {
+            row.tooltip(move |window, cx| {
+                let tip = tip.clone();
+                Tooltip::element(move |_, cx| {
+                    div()
+                        .id("agent-option-tip")
+                        .w(px(360.))
+                        .max_h(px(280.))
+                        .overflow_y_scroll()
+                        .text_size(chat_text())
+                        .line_height(px(18.))
+                        .whitespace_normal()
+                        .text_color(cx.theme().foreground)
+                        .child(tip.clone())
+                })
+                .build(window, cx)
+            })
         })
 }
 
@@ -5670,6 +5699,60 @@ mod tests {
             }),
             PendingStep::Question
         ));
+    }
+
+    #[test]
+    fn a_long_option_is_kept_for_the_hover() {
+        let long = "Full safe path: backup /boot/firmware + /etc, apt update, apt full-upgrade, then reboot if the kernel changed";
+        assert!(option_needs_tip(long));
+        assert!(!option_needs_tip("Do nothing for now"));
+        assert!(option_needs_tip("one\ntwo\nthree"));
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "q1",
+                        "function": {
+                            "name": "ask_question",
+                            "arguments": serde_json::json!({
+                                "question": "How should I handle the update?",
+                                "options": [long, "Do nothing"]
+                            }).to_string(),
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let reply = parse_completion(200, &body).unwrap();
+        let question = reply.calls[0].question.as_ref().unwrap();
+        assert_eq!(question.options[0], long);
+
+        let huge = "a".repeat(MAX_OPTION_FULL_CHARS + 40);
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "q1",
+                        "function": {
+                            "name": "ask_question",
+                            "arguments": serde_json::json!({
+                                "question": "Which?",
+                                "options": [huge]
+                            }).to_string(),
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+        let reply = parse_completion(200, &body).unwrap();
+        let stored = &reply.calls[0].question.as_ref().unwrap().options[0];
+        assert_eq!(stored.chars().count(), MAX_OPTION_FULL_CHARS);
+        assert!(stored.ends_with('…'));
+        assert!(option_needs_tip(stored));
     }
 
     #[test]
