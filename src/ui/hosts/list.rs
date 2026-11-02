@@ -38,12 +38,7 @@ const ADD_HOST_HINT: &str = "or press Cmd+T to add a host";
 const ADD_HOST_HINT: &str = "or press Ctrl+Shift+T to add a host";
 
 fn host_line(entry: &gssh::vault::ServerEntrySummary) -> String {
-    let address = gssh::vault::endpoint_label(entry.kind, &entry.username, &entry.host, entry.port);
-    if entry.kind.is_ssh() {
-        address
-    } else {
-        format!("{address} · {}", entry.kind.label())
-    }
+    gssh::vault::endpoint_label(entry.kind, &entry.username, &entry.host, entry.port)
 }
 
 /// The empty-state line that offers the hosts of `~/.ssh/config`.
@@ -395,7 +390,6 @@ impl ServersView {
         &self,
         entries: Vec<ServerEntrySummary>,
         first_ix: usize,
-        now: i64,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let count = entries.len();
@@ -410,20 +404,19 @@ impl ServersView {
                 is_first: pos == 0,
                 is_last: pos + 1 == count,
             };
-            card = card.child(self.server_row(first_ix + pos, entry, place, now, cx));
+            card = card.child(self.server_row(first_ix + pos, entry, place, cx));
         }
         card.into_any_element()
     }
 
     /// One host in a card: the system's mark with the session dot, name,
-    /// address, OS, tags, and when it was last opened. The "more" menu takes
-    /// the place of the time while the row is hovered.
+    /// address, OS, tags, and how the host is reached. The "more" menu takes
+    /// the place of the type while the row is hovered.
     fn server_row(
         &self,
         ix: usize,
         entry: ServerEntrySummary,
         place: RowPlace,
-        now: i64,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme();
@@ -443,10 +436,7 @@ impl ServersView {
             entry.label.clone()
         };
         let addr = host_line(&entry);
-        let last_opened = entry
-            .last_opened_at
-            .map(|at| crate::ui::hosts::sidebar::relative_time(at, now))
-            .unwrap_or_default();
+        let kind_label: gpui::SharedString = entry.kind.label().into();
         // Detected OS (filled on connect); nothing shows until then.
         let os = entry.os.clone().filter(|os| !os.trim().is_empty());
         let tag_names = entry.tag_names.clone();
@@ -554,7 +544,7 @@ impl ServersView {
                     .child(Icon::new(IconName::User).size(px(11.)))
                     .child(team)
             }))
-            // Trailing slot: when it was last opened, or the menu on hover.
+            // Trailing slot: how the host is reached, or the menu on hover.
             .child(
                 div()
                     .relative()
@@ -565,12 +555,19 @@ impl ServersView {
                     .items_center()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .flex_none()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme::border())
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(text_dim)
                             .whitespace_nowrap()
                             .when(is_menu_open, |el| el.invisible())
                             .group_hover(group_id.clone(), |s| s.invisible())
-                            .child(last_opened),
+                            .child(kind_label),
                     )
                     .child(
                         div()
@@ -950,13 +947,12 @@ impl Render for ServersView {
             ungrouped.sort_by_key(host_order_key);
             let has_groups = !grouped.is_empty();
 
-            let now = crate::ui::hosts::sidebar::unix_now();
             let mut content: Vec<gpui::AnyElement> = Vec::new();
             let mut ix = 0usize;
             for (group_name, entries) in grouped {
                 content.push(self.group_header(&group_name, entries.len(), cx));
                 let count = entries.len();
-                content.push(self.host_card(entries, ix, now, cx));
+                content.push(self.host_card(entries, ix, cx));
                 ix += count;
             }
 
@@ -968,7 +964,7 @@ impl Render for ServersView {
                 } else {
                     content.push(div().h(px(8.)).into_any_element());
                 }
-                content.push(self.host_card(ungrouped, ix, now, cx));
+                content.push(self.host_card(ungrouped, ix, cx));
             }
 
             div()

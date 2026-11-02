@@ -281,18 +281,15 @@ impl Sidebar {
                     })),
             )
             // Trailing slot: the subtitle normally, the row controls on hover.
-            // The controls sit on top so the two never fight for width.
+            // The controls sit on top so the two never fight for width. A
+            // closed host shows its type as a small badge; the live states
+            // stay plain words.
             .child(
                 div()
                     .flex_none()
-                    .max_w(px(88.))
-                    .min_w_0()
-                    .text_color(text_dim)
-                    .text_size(px(11.5))
-                    .truncate()
                     .group_hover(group_id.clone(), |s| s.invisible())
                     .when(is_active || hint.is_some(), |el| el.invisible())
-                    .child(subtitle),
+                    .child(subtitle_badge(status, subtitle)),
             )
             .child(
                 h_flex()
@@ -1086,6 +1083,37 @@ fn section_label(text: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// What a sidebar row says after its name. A host that is not connected
+/// shows its type (`SSH`, `SFTP`, `Telnet`) in a boxed badge, so the column
+/// reads as a set of labels; a live session keeps plain words, since
+/// "connecting…" is too long for a badge.
+fn subtitle_badge(status: HostStatus, subtitle: SharedString) -> AnyElement {
+    let text = div()
+        .min_w_0()
+        .max_w(px(88.))
+        .truncate()
+        .whitespace_nowrap()
+        .text_color(theme::text_dim());
+    if status == HostStatus::Offline {
+        text.flex()
+            .flex_none()
+            .px(px(5.))
+            .py(px(1.))
+            .rounded(px(4.))
+            .border_1()
+            .border_color(theme::border())
+            .text_size(px(10.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(subtitle)
+            .into_any_element()
+    } else {
+        text.flex_none()
+            .text_size(px(11.5))
+            .child(subtitle)
+            .into_any_element()
+    }
+}
+
 impl Sidebar {
     /// The open session for this host, if it has one: its place in the tab
     /// order, and whether the connection is up.
@@ -1106,7 +1134,6 @@ impl Sidebar {
         &self,
         ui_idx: usize,
         entry: &ServerEntrySummary,
-        now: i64,
         depth: usize,
         group_key: &str,
         cx: &mut Context<Self>,
@@ -1115,15 +1142,13 @@ impl Sidebar {
         let status = opened
             .map(|(_, status)| status)
             .unwrap_or(HostStatus::Offline);
+        // A live session says what it is doing; a closed one says how it is
+        // reached.
         let sub: SharedString = match status {
             HostStatus::Connecting => "connecting…".into(),
             HostStatus::Disconnected => "disconnected".into(),
             HostStatus::Connected => SharedString::default(),
-            HostStatus::Offline => entry
-                .last_opened_at
-                .map(|opened_at| relative_time(opened_at, now))
-                .unwrap_or_default()
-                .into(),
+            HostStatus::Offline => entry.kind.label().into(),
         };
         let shortcut = opened.and_then(|(index, _)| hints::tab_key(index));
         div()
@@ -1149,7 +1174,6 @@ impl Sidebar {
         &self,
         nodes: &[GroupNode<'_>],
         depth: usize,
-        now: i64,
         ui_idx: &mut usize,
         content: &mut Vec<AnyElement>,
         cx: &mut Context<Self>,
@@ -1166,9 +1190,9 @@ impl Sidebar {
             if self.collapsed_groups.contains(&node.path) {
                 continue;
             }
-            self.push_group_nodes(&node.children, depth + 1, now, ui_idx, content, cx);
+            self.push_group_nodes(&node.children, depth + 1, ui_idx, content, cx);
             for entry in &node.hosts {
-                content.push(self.folder_host(*ui_idx, entry, now, depth, &node.path, cx));
+                content.push(self.folder_host(*ui_idx, entry, depth, &node.path, cx));
                 *ui_idx += 1;
             }
         }
@@ -1321,7 +1345,6 @@ impl Render for Sidebar {
             .manager()
             .and_then(|vm| vm.list_entries().ok())
             .unwrap_or_default();
-        let now = unix_now();
 
         let by_id: HashMap<String, &ServerEntrySummary> =
             entries.iter().map(|e| (e.id.to_string(), e)).collect();
@@ -1350,7 +1373,7 @@ impl Render for Sidebar {
         });
         if has_groups {
             let (roots, ungrouped) = group_tree(entries.iter());
-            self.push_group_nodes(&roots, 0, now, &mut ui_idx, &mut content, cx);
+            self.push_group_nodes(&roots, 0, &mut ui_idx, &mut content, cx);
             if !ungrouped.is_empty() {
                 content.push(folder_header(
                     &self.collapsed_groups,
@@ -1362,7 +1385,7 @@ impl Render for Sidebar {
                 ));
                 if !self.collapsed_groups.contains("Ungrouped") {
                     for entry in ungrouped {
-                        content.push(self.folder_host(ui_idx, entry, now, 0, "", cx));
+                        content.push(self.folder_host(ui_idx, entry, 0, "", cx));
                         ui_idx += 1;
                     }
                 }
@@ -1391,11 +1414,7 @@ impl Render for Sidebar {
                 content.push(section_label("Recent"));
             }
             for entry in &recents {
-                let sub: SharedString = entry
-                    .last_opened_at
-                    .map(|t| relative_time(t, now))
-                    .unwrap_or_default()
-                    .into();
+                let sub: SharedString = entry.kind.label().into();
                 content.push(self.host_row(
                     ui_idx,
                     entry,
