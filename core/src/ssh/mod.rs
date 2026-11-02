@@ -49,11 +49,16 @@ const FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSFER_CHUNK: usize = 256 * 1024;
 
 /// How long one SFTP request may go unanswered. The clock starts when the
-/// packet is queued, not when it reaches the server, so it also covers the
-/// time behind the requests already in flight: see [`SFTP_WRITE_CONCURRENCY`].
-/// Keepalive still finds a dead link in about 2 min, so a generous limit here
-/// does not delay that.
-const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// packet is queued, not when it reaches the server, so on top of the server's
+/// own latency it covers the time spent behind the requests already in flight
+/// (see [`SFTP_WRITE_CONCURRENCY`]) and any pause while the UI is too busy to
+/// drain the event channel.
+///
+/// A transferring file must never hit this: it is a limit on a *stalled*
+/// link, not a budget for a slow one. A real dead link is still found in about
+/// two minutes by keepalive (20 s × 6), so a longer deadline here costs
+/// nothing and removes the case where a healthy but slow upload is killed.
+const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Write requests one file may have in flight. Each is a 32 KiB packet, so
 /// this is the queue a request waits behind: at 8 that is 256 KiB per file,
@@ -690,7 +695,9 @@ impl<'a> TransferReporter<'a> {
         self.emit();
     }
 
-    /// Send the current figures now, whatever the throttle says.
+    /// Send the current figures now, whatever the throttle says. Never blocks
+    /// the transfer: a progress tick is not worth slowing the bytes down for,
+    /// and the next tick carries the newer total anyway.
     fn emit(&self) {
         let _ = self.event_tx.try_send(SftpEvent::TransferProgress {
             id: self.id,
@@ -1608,10 +1615,15 @@ async fn open_sftp_channel(
         .unwrap_or_else(|_| "/".to_string());
     tracing::info!(home_dir, "sftp session opened");
 
-    // Unbounded: a dropped command would lose a transfer. Events stay bounded;
-    // progress ticks may be dropped.
+    // Both unbounded, and deliberately so. The worker handles listings and
+    // reports transfer ends inline, so a bounded event channel makes a slow
+    // consumer (a busy frame, a tab switch, a big layout) block the worker in
+    // `send().await`. Everything queued behind it then stops — including the
+    // transfer that is mid-flight — which reads as a lost session. Progress
+    // ticks are already throttled per transfer and dropped when full, so the
+    // queue stays small in practice.
     let (sftp_cmd_tx, sftp_cmd_rx) = async_channel::unbounded::<SftpCmd>();
-    let (sftp_event_tx, sftp_event_rx) = async_channel::bounded::<SftpEvent>(64);
+    let (sftp_event_tx, sftp_event_rx) = async_channel::unbounded::<SftpEvent>();
 
     // SftpSession may not be Send; this runtime is single-threaded.
     tokio::task::spawn_local(handle_sftp_commands(sftp, sftp_cmd_rx, sftp_event_tx));
@@ -2333,8 +2345,8 @@ async fn run_tracked_download(
         }
         None => Err(anyhow::Error::new(TransferCanceled)),
     };
-    // Free the target before the events: a full event queue must not hold up
-    // the next transfer.
+    // Free the target before the events: a slow event consumer must not hold
+    // up the next transfer to the same place.
     drop(claim);
     let outcome = transfer_outcome(result, "download", &remote);
     let name = base_name(&remote).to_string();
