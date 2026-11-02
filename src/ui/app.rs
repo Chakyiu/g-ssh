@@ -1865,6 +1865,8 @@ impl AppView {
                     this.show_left_source_picker(session_entity, window, cx);
                 }
                 ServerSessionEvent::ShowSftp => {
+                    // SFTP is this connection's other face, so the tab it is
+                    // already in just switches to it.
                     let session = session_entity.clone();
                     this.workspace.update(cx, |workspace, cx| {
                         workspace.open_doc(session, WorkKind::Sftp, cx);
@@ -2887,7 +2889,10 @@ impl AppView {
         session.update(cx, |session, cx| session.open_extra_terminal(cx));
     }
 
-    fn toggle_sftp_pane(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// ⌘B: bring this connection's file panes to the front, or send them back
+    /// and return to the terminal. One tab serves both faces, so this no
+    /// longer opens a second one.
+    fn toggle_sftp_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.showing_local {
             return;
         }
@@ -2898,9 +2903,11 @@ impl AppView {
             self.set_status("Telnet hosts have no files.".to_string(), cx);
             return;
         }
-        self.workspace.update(cx, |workspace, cx| {
-            workspace.open_doc(session, WorkKind::Sftp, cx)
-        });
+        if !session.read(cx).has_files() {
+            self.set_status("Files are not ready on this host yet.".to_string(), cx);
+            return;
+        }
+        session.update(cx, |session, cx| session.toggle_files_face(window, cx));
     }
 
     fn shortcut_toggle_server_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {

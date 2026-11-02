@@ -1339,6 +1339,11 @@ impl ServerSession {
             .overflow_x_scroll()
             .gap(px(2.))
             .items_center();
+        // The file panes are a face of this connection, not a tab of their
+        // own, so they sit first in the strip that switches faces.
+        if let Some(chip) = self.render_sftp_chip(pane, cx) {
+            strip = strip.child(chip);
+        }
         let indices = self.pane_tabs(pane);
         if indices.len() > 1 {
             strip = strip.child(terminal_icon(theme::status_online()).ml(px(4.)).mr(px(2.)));
@@ -1394,6 +1399,62 @@ impl ServerSession {
             );
         }
         strip.into_any_element()
+    }
+
+    /// The SFTP chip: the file panes are the other face of this connection.
+    /// Only a connection that has files offers it, and only in the first cell,
+    /// since there is one browser per session rather than one per shell. A
+    /// host with no shell keeps the files in front and gets no chip: switching
+    /// away would leave "did not open a shell" and no way back.
+    fn render_sftp_chip(&self, pane: usize, cx: &Context<Self>) -> Option<AnyElement> {
+        if pane != 0 || !self.has_files() || self.disconnected.is_some() {
+            return None;
+        }
+        if self.active_terminal().is_none() {
+            return None;
+        }
+        let is_active = self.shows_files();
+        let is_split = self.layout_has_split();
+        let mut chip = header_button("session-sftp-chip", cx)
+            .gap(px(4.))
+            .child(Icon::empty().path("icons/folder-open.svg").size(px(14.)))
+            .child(div().child("SFTP"))
+            .tooltip(|window, cx| Tooltip::new("Files on this host").build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_files_face(window, cx)));
+        if is_active {
+            chip = chip
+                .bg(theme::element())
+                .text_color(cx.theme().foreground)
+                .font_semibold();
+        }
+        // In a split grid each cell carries its own strip, and only the first
+        // cell's chip is real, so the rest say why they have none.
+        if is_split && pane != 0 {
+            return None;
+        }
+        Some(chip.into_any_element())
+    }
+
+    /// Show the file panes, or the terminal if they are already in front. The
+    /// keys follow the face, so the terminal is ready to type in when it
+    /// comes back.
+    pub(crate) fn toggle_files_face(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_sftp_hidden {
+            if self.browser.is_none() {
+                return;
+            }
+            self.is_sftp_hidden = false;
+            self.browser
+                .clone()
+                .map(|browser| browser.update(cx, |browser, cx| browser.focus_files(window, cx)));
+        } else {
+            self.is_sftp_hidden = true;
+            self.is_terminal_focus_pending = true;
+            if let Some(terminal) = self.active_terminal() {
+                window.focus(&terminal.read(cx).focus_handle(cx), cx);
+            }
+        }
+        cx.notify();
     }
 
     fn render_terminal_tab(&self, ix: usize, pane: usize, cx: &Context<Self>) -> AnyElement {
@@ -1955,6 +2016,7 @@ impl ServerSession {
         Some(button)
     }
 
+    /// The panel icon: opens and closes this inspector (⌘I).
     pub(crate) fn render_server_panel_toggle(&self, cx: &Context<Self>) -> AnyElement {
         let inspector_open =
             self.is_server_panel_shown && !self.server_panel.read(cx).shows_agent();

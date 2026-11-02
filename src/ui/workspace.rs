@@ -74,16 +74,16 @@ impl WorkDoc {
     }
 }
 
-/// Draws one connection as either its terminal or its file browser.
+/// Draws one connection. Which of its faces shows, the terminal or the file
+/// browser, is the session's own business: its chip strip switches them.
 struct SurfaceView {
     session: Entity<ServerSession>,
-    files: bool,
 }
 
 impl SurfaceView {
-    fn new(session: Entity<ServerSession>, files: bool, cx: &mut Context<Self>) -> Self {
+    fn new(session: Entity<ServerSession>, cx: &mut Context<Self>) -> Self {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
-        Self { session, files }
+        Self { session }
     }
 
     /// Follow a connection that was replaced in the same tab.
@@ -96,9 +96,8 @@ impl SurfaceView {
 
 impl Render for SurfaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.files;
         self.session
-            .update(cx, |session, cx| session.render_surface(files, window, cx))
+            .update(cx, |session, cx| session.render_surface(window, cx))
     }
 }
 
@@ -158,8 +157,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Add a terminal or SFTP tab for this connection. An existing one of the
-    /// same kind comes forward instead of a second copy.
+    /// Add a tab for this connection. A second request for one already open
+    /// comes forward instead of making a copy; `kind` then only picks which
+    /// face of that connection is in front, terminal or files.
     pub(crate) fn open_doc(
         &mut self,
         session: Entity<ServerSession>,
@@ -167,12 +167,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_hosts = false;
-        if let Some(ix) = self.find_doc(&session, kind) {
+        if let Some(ix) = self.find_doc(&session) {
+            // One tab per connection: SFTP is a chip inside it, not a tab.
+            session.update(cx, |session, cx| session.show_face(kind, cx));
             self.activate_doc(ix, cx);
             return;
         }
-        let files = kind == WorkKind::Sftp;
-        let surface = cx.new(|cx| SurfaceView::new(session.clone(), files, cx));
+        let surface = cx.new(|cx| SurfaceView::new(session.clone(), cx));
         let ix = self.docs.len();
         self.docs.push(WorkDoc {
             body: WorkBody::Session {
@@ -181,6 +182,7 @@ impl Workspace {
                 surface,
             },
         });
+        session.update(cx, |session, cx| session.show_face(kind, cx));
         let pane = self.current_pane();
         if let Some(slot) = self.panes.get_mut(pane) {
             slot.tabs.push(ix);
@@ -305,17 +307,10 @@ impl Workspace {
         }
     }
 
-    fn find_doc(&self, session: &Entity<ServerSession>, kind: WorkKind) -> Option<usize> {
-        self.docs.iter().position(|doc| {
-            matches!(
-                &doc.body,
-                WorkBody::Session {
-                    session: found,
-                    kind: found_kind,
-                    ..
-                } if found == session && *found_kind == kind
-            )
-        })
+    fn find_doc(&self, session: &Entity<ServerSession>) -> Option<usize> {
+        self.docs
+            .iter()
+            .position(|doc| doc.session() == Some(session))
     }
 
     fn current_pane(&self) -> usize {
@@ -575,15 +570,13 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The name on a tab. A connection keeps one tab whichever face of it is
+    /// in front, so the name never gains or loses the "SFTP" suffix.
     fn doc_label(&self, ix: usize, cx: &App) -> String {
         match self.docs.get(ix).map(|doc| &doc.body) {
             Some(WorkBody::Local(_)) => "Local".to_string(),
-            Some(WorkBody::Session { session, kind, .. }) => {
-                let name = session.read(cx).conn_info.display_name().to_string();
-                match kind {
-                    WorkKind::Terminal => name,
-                    WorkKind::Sftp => format!("{name} SFTP"),
-                }
+            Some(WorkBody::Session { session, .. }) => {
+                session.read(cx).conn_info.display_name().to_string()
             }
             None => String::new(),
         }
@@ -675,8 +668,9 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Transfers, forwards, and the inspector, on the tab row of whatever is
-    /// in front. The name already lives on the tab.
+    /// Agent and inspector toggles, on the tab row of whatever is in front.
+    /// The name already lives on the tab. Forwards and transfers sit in the
+    /// panel icon's dropdown, so they cost the strip no width.
     fn render_pane_controls(&self, pane: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(ix) = self.shown(pane) else {
             return div().into_any_element();
@@ -703,8 +697,6 @@ impl Workspace {
                         .gap(px(4.))
                         .pr(px(8.))
                         .items_center()
-                        .when_some(session.render_forward_chip(cx), |el, chip| el.child(chip))
-                        .when_some(session.render_task_pills(cx), |el, pills| el.child(pills))
                         .when_some(session.render_agent_button(cx), |el, button| {
                             el.child(button)
                         })
@@ -719,11 +711,15 @@ impl Workspace {
         let label = self.doc_label(ix, cx);
         let icon = match self.docs.get(ix).map(|doc| &doc.body) {
             Some(WorkBody::Local(_)) => "icons/laptop.svg",
-            Some(WorkBody::Session {
-                kind: WorkKind::Sftp,
-                ..
-            }) => "icons/folder-open.svg",
-            _ => "icons/square-terminal.svg",
+            Some(WorkBody::Session { session, .. }) => {
+                // A connection with files open on screen reads as a folder.
+                if session.read(cx).shows_files() {
+                    "icons/folder-open.svg"
+                } else {
+                    "icons/square-terminal.svg"
+                }
+            }
+            None => "icons/square-terminal.svg",
         };
         let ghost = SharedString::from(label.clone());
         let session = cx.entity().downgrade();

@@ -1,24 +1,24 @@
-//! Tasks popover: the running transfers of a server session and their history.
+//! Port transfers for a server: the live list, its history, and the actions
+//! that manage them.
 //!
-//! Small pills in the terminal header show the running transfers; clicking one
-//! opens a popover that lists them with live progress, and the finished ones
-//! with their result. The same transfers sit in a panel under the file panes
-//! while that tab is in front. Several transfers can run at once.
+//! The rows are drawn in two places, from one implementation: the transfer list
+//! under the file panes, and the inspector's Tasks page. Each caller supplies
+//! its own [`TaskActions`], since the buttons act on different entities.
 //!
 //! This is part of `impl ServerSession`, kept out of the session module so
 //! that module stays about the connection lifecycle.
 
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
-use gpui::{div, AnyElement, Context, Hsla, SharedString};
+use gpui::{div, AnyElement, App, Context, Entity, Hsla, SharedString, Window};
 
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    progress::{Progress, ProgressCircle},
-    spinner::Spinner,
+    progress::Progress,
     v_flex, ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _,
 };
 
@@ -26,59 +26,41 @@ use crate::theme;
 use crate::ui::session::{ServerSession, TransferTask};
 use crate::ui::sftp::browser::TransferKind;
 use crate::ui::sftp::pane::fmt_size;
-use crate::ui::terminal::tabs::header_button;
 use gssh::ssh::TransferOutcome;
 
-const POPOVER_W: f32 = 340.0;
-
 impl ServerSession {
-    pub fn toggle_tasks(&mut self, cx: &mut Context<Self>) {
-        self.tasks_open = !self.tasks_open;
-        // The two popovers share a corner, so only one can be open.
-        self.forwards_open = false;
-        cx.notify();
-    }
-
-    fn close_tasks(&mut self, cx: &mut Context<Self>) {
-        self.tasks_open = false;
-        cx.notify();
-    }
-
     /// Drop one finished transfer from history, so a failure the user has read
     /// can go away without losing the others.
-    fn dismiss_finished_task(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss_finished_task(&mut self, id: u64, cx: &mut Context<Self>) {
         let before = self.transfer_history.len();
         self.transfer_history.retain(|t| t.id != id);
         if self.transfer_history.len() == before {
             return;
         }
         if self.transfers.is_empty() && self.transfer_history.is_empty() {
-            self.tasks_open = false;
             self.transfer_panel_collapsed = true;
         }
+        self.refresh_tasks(cx);
         cx.notify();
     }
 
-    /// Drop all finished transfers from history. If nothing is still active,
-    /// the popover has nothing left to show, so close it too.
-    fn clear_finished_tasks(&mut self, cx: &mut Context<Self>) {
+    /// Drop all finished transfers from history.
+    pub(crate) fn clear_finished_tasks(&mut self, cx: &mut Context<Self>) {
         self.transfer_history.clear();
-        if self.transfers.is_empty() {
-            self.tasks_open = false;
-        }
+        self.refresh_tasks(cx);
         cx.notify();
     }
 
     /// Flag a transfer for cancellation. The worker notices between chunks and
     /// reports back via `TransferFinished`, which moves the row to history.
-    fn cancel_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(t) = self.transfers.iter().find(|t| t.id == id) {
             t.request_cancel();
             cx.notify();
         }
     }
 
-    fn toggle_transfer_expand(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_transfer_expand(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(t) = self
             .transfers
             .iter_mut()
@@ -86,400 +68,29 @@ impl ServerSession {
             .find(|t| t.id == id)
         {
             t.expanded = !t.expanded;
+            self.refresh_tasks(cx);
             cx.notify();
         }
     }
 
-    pub fn render_task_pills(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.transfers.is_empty() {
-            return None;
-        }
-
-        let mut pills: Vec<AnyElement> = Vec::new();
-        for transfer in self.transfers.iter().take(3) {
-            pills.push(self.render_transfer_pill(transfer, cx));
-        }
-        let extra = self.transfers.len().saturating_sub(3);
-        if extra > 0 {
-            pills.push(self.render_glyph_pill(format!("+{extra}"), cx));
-        }
-
-        Some(
-            h_flex()
-                .gap(px(6.))
-                .items_center()
-                .children(pills)
-                .into_any_element(),
-        )
+    /// The count the inspector strip shows beside the Tasks icon: transfers
+    /// still running, which is status rather than a label. Zero shows nothing.
+    pub fn running_transfers(&self) -> usize {
+        self.transfers.len()
     }
 
-    fn render_transfer_pill(&self, t: &TransferTask, cx: &Context<Self>) -> AnyElement {
-        let determinate = t.total > 0;
-        let accent = theme::status_online();
-        let id = t.id as usize;
-        let indicator: AnyElement = if t.is_queued {
-            queued_mark(px(11.))
-        } else if determinate {
-            ProgressCircle::new(("tr-pill-ring", id))
-                .value(t.pct() as f32)
-                .color(accent)
-                .size(px(12.))
-                .into_any_element()
-        } else {
-            Spinner::new()
-                .with_size(px(11.))
-                .color(accent)
-                .into_any_element()
-        };
-        let value = transfer_value_text(t);
-
-        header_button(("tr-pill", id), cx)
-            .gap(px(5.))
-            .text_color(cx.theme().foreground)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_tasks(cx)))
-            .child(indicator)
-            .child(direction_icon(t.kind))
-            .child(
-                div()
-                    .max_w(px(96.))
-                    .truncate()
-                    .text_ellipsis_middle()
-                    .child(t.name.clone()),
-            )
-            .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(SharedString::from(value)),
-            )
-            .into_any_element()
+    /// Whether there is anything in the finished list. The strip's tooltip
+    /// says so, since no text sits beside the icon.
+    pub fn has_transfer_history(&self) -> bool {
+        !self.transfer_history.is_empty()
     }
 
-    fn render_glyph_pill(&self, label: String, cx: &Context<Self>) -> AnyElement {
-        header_button(SharedString::from(format!("task-glyph-{label}")), cx)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_tasks(cx)))
-            .child(SharedString::from(label))
-            .into_any_element()
-    }
-
-    pub fn render_tasks_popover(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if !self.tasks_open {
-            return None;
-        }
-        if self.transfers.is_empty() && self.transfer_history.is_empty() {
-            return None;
-        }
-
-        let mut body: Vec<AnyElement> = Vec::new();
-        for transfer in &self.transfers {
-            body.push(self.render_transfer_row(transfer, cx));
-        }
-        if !self.transfer_history.is_empty() {
-            body.push(self.render_section("EARLIER", true, cx));
-            for transfer in &self.transfer_history {
-                body.push(self.render_transfer_history_row(transfer, cx));
-            }
-        }
-
-        let popover = v_flex()
-            .occlude()
-            .absolute()
-            .right(px(8.))
-            .top(px(4.))
-            .w(px(POPOVER_W))
-            .bg(theme::pop_surface())
-            .border_1()
-            .border_color(theme::border_focused())
-            .rounded(px(6.))
-            .shadow_lg()
-            .overflow_hidden()
-            .child(self.render_popover_head(cx))
-            .child(
-                div()
-                    .id("tasks-pop-body")
-                    .max_h(px(360.))
-                    .overflow_y_scroll()
-                    .p(px(3.))
-                    .child(v_flex().gap(px(1.)).children(body)),
-            );
-
-        Some(popover.into_any_element())
-    }
-
-    fn render_popover_head(&self, cx: &Context<Self>) -> AnyElement {
-        let active = self.transfers.len();
-
-        h_flex()
-            .h(px(28.))
-            .pl(px(11.))
-            .pr(px(6.))
-            .items_center()
-            .gap(px(8.))
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(theme::sunken_soft())
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_semibold()
-                    .text_color(theme::muted_gray())
-                    .child("TASKS"),
-            )
-            .when(active > 0, |el| {
-                el.child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(theme::text_dim())
-                        .child(SharedString::from(active.to_string())),
-                )
-            })
-            .child(div().flex_1())
-            .child(
-                Button::new("tasks-close")
-                    .ghost()
-                    .icon(IconName::Close)
-                    .xsmall()
-                    .on_click(cx.listener(|this, _, _, cx| this.close_tasks(cx))),
-            )
-            .into_any_element()
-    }
-
-    fn render_section(
-        &self,
-        label: &'static str,
-        with_clear: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        h_flex()
-            .items_center()
-            .gap(px(8.))
-            .px(px(7.))
-            .pt(px(6.))
-            .pb(px(3.))
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .font_semibold()
-                    .text_color(theme::text_dim())
-                    .child(label),
-            )
-            .child(div().flex_1())
-            .when(with_clear, |el| {
-                el.child(
-                    div()
-                        .id("tasks-clear")
-                        .flex_none()
-                        .h(px(18.))
-                        .px(px(6.))
-                        .flex()
-                        .items_center()
-                        .rounded(px(3.))
-                        .text_size(px(10.5))
-                        .text_color(theme::text_dim())
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::element_hover()).text_color(theme::text()))
-                        .active(|s| s.bg(theme::element_active()))
-                        .on_click(cx.listener(|this, _, _, cx| this.clear_finished_tasks(cx)))
-                        .child("Clear"),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_transfer_row(&self, t: &TransferTask, cx: &Context<Self>) -> AnyElement {
-        let determinate = t.total > 0;
-        let accent = theme::status_online();
-        let id = t.id;
-        let value = transfer_value_text(t);
-        let pace = if t.is_queued {
-            String::new()
-        } else {
-            live_pace_text(t, std::time::Instant::now())
-                .unwrap_or_else(|| elapsed_compact(t.started.elapsed().as_secs()))
-        };
-
-        let indicator: AnyElement = if t.is_queued {
-            queued_mark(px(13.))
-        } else if determinate {
-            ProgressCircle::new(("tr-row-ring", id as usize))
-                .value(t.pct() as f32)
-                .color(accent)
-                .size(px(15.))
-                .into_any_element()
-        } else {
-            Spinner::new()
-                .with_size(px(13.))
-                .color(accent)
-                .into_any_element()
-        };
-
-        let detail = t
-            .expanded
-            .then(|| transfer_detail_panel(t, "tr-detail", cx));
-
-        let row = h_flex()
-            .h(px(26.))
-            .px(px(7.))
-            .gap(px(8.))
-            .items_center()
-            .rounded(px(3.))
-            .child(expand_chevron(
-                ("tr-row-chev", id as usize),
-                t.expanded,
-                cx.listener(move |this, _, _, cx| this.toggle_transfer_expand(id, cx)),
-            ))
-            .child(
-                div()
-                    .w(px(15.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(indicator),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(4.))
-                    .items_center()
-                    .child(direction_icon(t.kind))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_ellipsis_middle()
-                            .text_size(px(12.))
-                            .font_semibold()
-                            .text_color(cx.theme().foreground)
-                            .child(t.name.clone()),
-                    ),
-            )
-            // No bar here: the ring and the percent already say it, and the
-            // speed and time left need the room, or the name is squeezed out.
-            .child(
-                div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(px(10.5))
-                    .font_semibold()
-                    .text_color(cx.theme().foreground)
-                    .child(SharedString::from(value)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .text_size(px(10.))
-                    .text_color(theme::text_dim())
-                    .child(SharedString::from(pace)),
-            )
-            .child(
-                div()
-                    .id(("tr-stop", id as usize))
-                    .w(px(18.))
-                    .h(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(3.))
-                    .text_color(theme::text_dim())
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::element_hover()).text_color(theme::run_red()))
-                    .active(|s| s.bg(theme::element_active()).text_color(theme::run_red()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(id, cx)))
-                    .child(Icon::new(IconName::Close).size(px(12.))),
-            );
-
-        v_flex()
-            .id(("tr-arow", id as usize))
-            .child(row)
-            .children(detail)
-            .into_any_element()
-    }
-
-    fn render_transfer_history_row(&self, t: &TransferTask, cx: &Context<Self>) -> AnyElement {
-        let (icon, color, meta) = match &t.outcome {
-            Some(TransferOutcome::Done { skipped_links }) => (
-                Some(IconName::Check),
-                theme::status_online(),
-                done_text(t.done, *skipped_links),
-            ),
-            Some(TransferOutcome::Canceled) => (
-                Some(IconName::Close),
-                theme::text_dim(),
-                "canceled".to_string(),
-            ),
-            // The reason is too long for this cell; the expanded row shows it.
-            Some(TransferOutcome::Failed(_)) => (
-                Some(IconName::TriangleAlert),
-                theme::run_red(),
-                "failed".to_string(),
-            ),
-            None => (None, theme::text_dim(), String::new()),
-        };
-        let when = t
-            .finished_at
-            .map(|at| format!("{} ago", elapsed_compact(at.elapsed().as_secs())))
-            .unwrap_or_default();
-        let id = t.id;
-        let expanded = t.expanded;
-        let detail = expanded.then(|| transfer_detail_panel(t, "tr-detail", cx));
-
-        let row = h_flex()
-            .id(("tr-hrow", id as usize))
-            .h(px(26.))
-            .px(px(7.))
-            .gap(px(8.))
-            .items_center()
-            .rounded(px(3.))
-            .cursor_pointer()
-            .hover(|s| s.bg(theme::element_hover()))
-            .active(|s| s.bg(theme::element_active()))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_transfer_expand(id, cx)))
-            .child(chevron_glyph(expanded))
-            .child(
-                div()
-                    .w(px(15.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(color)
-                    .children(icon.map(|icon| Icon::new(icon).size(px(12.)))),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap(px(4.))
-                    .items_center()
-                    .child(direction_icon(t.kind))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_ellipsis_middle()
-                            .text_size(px(12.))
-                            .font_semibold()
-                            .text_color(cx.theme().foreground)
-                            .child(t.name.clone()),
-                    ),
-            )
-            .child(
-                div()
-                    .max_w(px(110.))
-                    .truncate()
-                    .text_size(px(10.5))
-                    .text_color(theme::text_dim())
-                    .child(SharedString::from(meta)),
-            )
-            .child(
-                div()
-                    .text_size(px(10.))
-                    .text_color(theme::text_dim())
-                    .child(SharedString::from(when)),
-            )
-            .child(self.transfer_dismiss_button(id, cx));
-
-        v_flex().child(row).children(detail).into_any_element()
+    /// A forward row's state changed, or the list did. The panel is drawn from
+    /// a cache keyed on its own entity, so the page that shows these rows has
+    /// to be told to draw again; this session's notify only repaints the shell
+    /// around it.
+    pub(crate) fn refresh_tasks(&self, cx: &mut Context<Self>) {
+        self.server_panel.update(cx, |_, cx| cx.notify());
     }
 
     /// Live uploads and downloads under the file panes. Hidden when nothing
@@ -598,24 +209,30 @@ impl ServerSession {
     }
 
     fn render_collapsed_transfer(&self, now: Instant, cx: &Context<Self>) -> AnyElement {
+        let actions = TaskActions::for_session(cx);
         if let Some(transfer) = featured_transfer(&self.transfers) {
             let extra = self.transfers.len().saturating_sub(1);
-            return self.render_active_transfer_row(transfer, extra, now, false, cx);
+            return render_active_transfer_row(transfer, extra, now, false, &actions, cx);
         }
         let Some(transfer) = self.transfer_history.first() else {
             return div().into_any_element();
         };
         let extra = self.transfer_history.len().saturating_sub(1);
-        self.render_finished_transfer_row(transfer, extra, false, cx)
+        render_finished_transfer_row(transfer, extra, false, &actions, cx)
     }
 
     fn render_transfer_panel_list(&self, now: Instant, cx: &Context<Self>) -> AnyElement {
+        let actions = TaskActions::for_session(cx);
         let mut rows = Vec::new();
         for transfer in &self.transfers {
-            rows.push(self.render_active_transfer_row(transfer, 0, now, true, cx));
+            rows.push(render_active_transfer_row(
+                transfer, 0, now, true, &actions, cx,
+            ));
         }
         for transfer in &self.transfer_history {
-            rows.push(self.render_finished_transfer_row(transfer, 0, true, cx));
+            rows.push(render_finished_transfer_row(
+                transfer, 0, true, &actions, cx,
+            ));
         }
 
         div()
@@ -626,174 +243,265 @@ impl ServerSession {
             .child(v_flex().w_full().children(rows))
             .into_any_element()
     }
+}
 
-    fn render_active_transfer_row(
-        &self,
-        transfer: &TransferTask,
-        extra: usize,
-        now: Instant,
-        details: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let id = transfer.id;
-        let value = with_extra(transfer_value_text(transfer), extra);
-        let pace = if transfer.is_queued {
-            None
-        } else {
-            live_pace_text(transfer, now)
-        };
-        let show_bar = !transfer.is_queued;
+pub(crate) fn render_active_transfer_row(
+    transfer: &TransferTask,
+    extra: usize,
+    now: Instant,
+    details: bool,
+    actions: &TaskActions,
+    cx: &App,
+) -> AnyElement {
+    let id = transfer.id;
+    let value = with_extra(transfer_value_text(transfer), extra);
+    let pace = if transfer.is_queued {
+        None
+    } else {
+        live_pace_text(transfer, now)
+    };
+    let show_bar = !transfer.is_queued;
 
-        v_flex()
-            .w_full()
-            .px(px(8.))
-            .pt(px(6.))
-            .pb(px(7.))
-            .gap(px(5.))
-            .border_b_1()
-            .border_color(theme::border())
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap(px(8.))
-                    .items_center()
-                    .child(direction_icon(transfer.kind))
-                    .child(transfer_name(transfer.name.clone(), cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_size(px(11.))
-                            .font_semibold()
-                            .text_color(cx.theme().foreground)
-                            .child(SharedString::from(value)),
-                    )
-                    .child(self.transfer_stop_button(id, cx)),
-            )
-            .when(show_bar, |el| {
-                el.child(transfer_progress_line(transfer, pace))
-            })
-            .when(details, |el| {
-                el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
-            })
-            .into_any_element()
+    v_flex()
+        .w_full()
+        .px(px(8.))
+        .pt(px(6.))
+        .pb(px(7.))
+        .gap(px(5.))
+        .border_b_1()
+        .border_color(theme::border())
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(8.))
+                .items_center()
+                .child(expand_chevron(
+                    ("xfer-expand", id as usize),
+                    transfer.expanded,
+                    {
+                        let expand = actions.expand.clone();
+                        move |_, window, cx| expand(id, window, cx)
+                    },
+                ))
+                .child(direction_icon(transfer.kind))
+                .child(transfer_name(transfer.name.clone(), cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_size(px(11.))
+                        .font_semibold()
+                        .text_color(cx.theme().foreground)
+                        .child(SharedString::from(value)),
+                )
+                .child(transfer_stop_button(id, actions)),
+        )
+        .when(show_bar, |el| {
+            el.child(transfer_progress_line(transfer, pace))
+        })
+        // `details` says this list may show detail at all; the row's own
+        // `expanded` says whether this one does, so the chevron means something.
+        .when(details && transfer.expanded, |el| {
+            el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
+        })
+        .into_any_element()
+}
+
+pub(crate) fn render_finished_transfer_row(
+    transfer: &TransferTask,
+    extra: usize,
+    details: bool,
+    actions: &TaskActions,
+    cx: &App,
+) -> AnyElement {
+    let (icon, color, label) = match &transfer.outcome {
+        Some(TransferOutcome::Done { skipped_links }) => (
+            IconName::Check,
+            theme::status_online(),
+            done_text(transfer.done, *skipped_links),
+        ),
+        Some(TransferOutcome::Canceled) => {
+            (IconName::Close, theme::text_dim(), "Canceled".to_string())
+        }
+        Some(TransferOutcome::Failed(error)) => (
+            IconName::TriangleAlert,
+            theme::run_red(),
+            failed_label(error),
+        ),
+        None => (IconName::Close, theme::text_dim(), String::new()),
+    };
+    let label = with_extra(label, extra);
+
+    v_flex()
+        .w_full()
+        .border_b_1()
+        .border_color(theme::border())
+        .child(
+            h_flex()
+                .w_full()
+                .h(px(28.))
+                .px(px(8.))
+                .gap(px(8.))
+                .items_center()
+                .child(expand_chevron(
+                    ("xfer-h-expand", transfer.id as usize),
+                    transfer.expanded,
+                    {
+                        let expand = actions.expand.clone();
+                        let id = transfer.id;
+                        move |_, window, cx| expand(id, window, cx)
+                    },
+                ))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_none()
+                        .text_color(color)
+                        .child(Icon::new(icon).size(px(12.))),
+                )
+                .child(transfer_name(transfer.name.clone(), cx))
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(200.))
+                        .truncate()
+                        .whitespace_nowrap()
+                        .text_size(px(11.))
+                        .text_color(color)
+                        .child(SharedString::from(label)),
+                )
+                .child(transfer_dismiss_button(transfer.id, actions)),
+        )
+        // `details` says this list may show detail at all; the row's own
+        // `expanded` says whether this one does, so the chevron means something.
+        .when(details && transfer.expanded, |el| {
+            el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
+        })
+        .into_any_element()
+}
+
+/// The row actions a transfer row needs. Both callers hand in handlers already
+/// bound to whatever entity owns them: the session itself for the list under
+/// the file panes, the panel for the inspector's Tasks page.
+#[derive(Clone)]
+pub(crate) struct TaskActions {
+    pub(crate) cancel: Rc<dyn Fn(u64, &mut Window, &mut App)>,
+    pub(crate) dismiss: Rc<dyn Fn(u64, &mut Window, &mut App)>,
+    pub(crate) expand: Rc<dyn Fn(u64, &mut Window, &mut App)>,
+}
+
+impl TaskActions {
+    /// Rows drawn by the session itself: the transfer list under the file
+    /// panes, where the handlers run against the session.
+    pub(crate) fn for_session(cx: &Context<ServerSession>) -> Self {
+        let view = cx.entity().downgrade();
+        let cancel_view = view.clone();
+        let dismiss_view = view.clone();
+        let expand_view = view;
+        Self {
+            cancel: Rc::new(move |id, _, cx| {
+                cancel_view
+                    .update(cx, |session, cx| session.cancel_transfer(id, cx))
+                    .ok();
+            }),
+            dismiss: Rc::new(move |id, _, cx| {
+                dismiss_view
+                    .update(cx, |session, cx| session.dismiss_finished_task(id, cx))
+                    .ok();
+            }),
+            expand: Rc::new(move |id, _, cx| {
+                expand_view
+                    .update(cx, |session, cx| session.toggle_transfer_expand(id, cx))
+                    .ok();
+            }),
+        }
     }
 
-    fn render_finished_transfer_row(
-        &self,
-        transfer: &TransferTask,
-        extra: usize,
-        details: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let (icon, color, label) = match &transfer.outcome {
-            Some(TransferOutcome::Done { skipped_links }) => (
-                IconName::Check,
-                theme::status_online(),
-                done_text(transfer.done, *skipped_links),
-            ),
-            Some(TransferOutcome::Canceled) => {
-                (IconName::Close, theme::text_dim(), "Canceled".to_string())
-            }
-            Some(TransferOutcome::Failed(error)) => (
-                IconName::TriangleAlert,
-                theme::run_red(),
-                failed_label(error),
-            ),
-            None => (IconName::Close, theme::text_dim(), String::new()),
-        };
-        let label = with_extra(label, extra);
-
-        v_flex()
-            .w_full()
-            .border_b_1()
-            .border_color(theme::border())
-            .child(
-                h_flex()
-                    .w_full()
-                    .h(px(28.))
-                    .px(px(8.))
-                    .gap(px(8.))
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .flex_none()
-                            .text_color(color)
-                            .child(Icon::new(icon).size(px(12.))),
-                    )
-                    .child(transfer_name(transfer.name.clone(), cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .max_w(px(200.))
-                            .truncate()
-                            .whitespace_nowrap()
-                            .text_size(px(11.))
-                            .text_color(color)
-                            .child(SharedString::from(label)),
-                    )
-                    .child(self.transfer_dismiss_button(transfer.id, cx)),
-            )
-            .when(details, |el| {
-                el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
-            })
-            .into_any_element()
+    /// Rows drawn by the inspector's Tasks page, which reports back to the
+    /// session that owns the transfers.
+    pub(crate) fn for_panel(session: &Entity<ServerSession>) -> Self {
+        let view = session.downgrade();
+        let cancel_view = view.clone();
+        let dismiss_view = view.clone();
+        let expand_view = view;
+        Self {
+            cancel: Rc::new(move |id, _, cx| {
+                cancel_view
+                    .update(cx, |session, cx| session.cancel_transfer(id, cx))
+                    .ok();
+            }),
+            dismiss: Rc::new(move |id, _, cx| {
+                dismiss_view
+                    .update(cx, |session, cx| session.dismiss_finished_task(id, cx))
+                    .ok();
+            }),
+            expand: Rc::new(move |id, _, cx| {
+                expand_view
+                    .update(cx, |session, cx| session.toggle_transfer_expand(id, cx))
+                    .ok();
+            }),
+        }
     }
+}
 
-    /// The close button of a finished row: dismissing it is not a cancel, but
-    /// it reads the same and sits in the same corner as the stop button.
-    fn transfer_dismiss_button(&self, id: u64, cx: &Context<Self>) -> AnyElement {
-        div()
-            .id(("sftp-xfer-dismiss", id as usize))
-            .flex_none()
-            .w(px(18.))
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(3.))
-            .text_color(theme::text_dim())
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::element_hover()).text_color(theme::text()))
-            .active(|style| style.bg(theme::element_active()))
-            .on_click(cx.listener(move |this, _, _, cx| {
+/// The close button of a finished row: dismissing it is not a cancel, but it
+/// reads the same and sits in the same corner as the stop button.
+fn transfer_dismiss_button(id: u64, actions: &TaskActions) -> AnyElement {
+    div()
+        .id(("sftp-xfer-dismiss", id as usize))
+        .flex_none()
+        .w(px(18.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .text_color(theme::text_dim())
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::element_hover()).text_color(theme::text()))
+        .active(|style| style.bg(theme::element_active()))
+        .on_click({
+            let dismiss = actions.dismiss.clone();
+            move |_, window, cx| dismiss(id, window, cx)
+        })
+        .child(Icon::new(IconName::Close).size(px(12.)))
+        .into_any_element()
+}
+
+fn transfer_stop_button(id: u64, actions: &TaskActions) -> AnyElement {
+    div()
+        .id(("sftp-xfer-stop", id as usize))
+        .flex_none()
+        .w(px(18.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .text_color(theme::text_dim())
+        .cursor_pointer()
+        .hover(|style| {
+            style
+                .bg(theme::element_hover())
+                .text_color(theme::run_red())
+        })
+        .active(|style| {
+            style
+                .bg(theme::element_active())
+                .text_color(theme::run_red())
+        })
+        .on_click({
+            let cancel = actions.cancel.clone();
+            move |_, window, cx| {
                 cx.stop_propagation();
-                this.dismiss_finished_task(id, cx);
-            }))
-            .child(Icon::new(IconName::Close).size(px(12.)))
-            .into_any_element()
-    }
-
-    fn transfer_stop_button(&self, id: u64, cx: &Context<Self>) -> AnyElement {
-        div()
-            .id(("sftp-xfer-stop", id as usize))
-            .flex_none()
-            .w(px(18.))
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(3.))
-            .text_color(theme::text_dim())
-            .cursor_pointer()
-            .hover(|style| {
-                style
-                    .bg(theme::element_hover())
-                    .text_color(theme::run_red())
-            })
-            .active(|style| {
-                style
-                    .bg(theme::element_active())
-                    .text_color(theme::run_red())
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.cancel_transfer(id, cx)))
-            .child(Icon::new(IconName::Close).size(px(12.)))
-            .into_any_element()
-    }
+                cancel(id, window, cx);
+            }
+        })
+        .child(Icon::new(IconName::Close).size(px(12.)))
+        .into_any_element()
 }
 
 /// Compact duration: "8s", "1m04s", "2h13m".
@@ -828,17 +536,6 @@ fn expand_chevron(
         .child(chevron_icon(expanded))
 }
 
-/// Non-interactive chevron for rows whose whole body already toggles.
-fn chevron_glyph(expanded: bool) -> impl IntoElement {
-    div()
-        .w(px(12.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(theme::text_dim())
-        .child(chevron_icon(expanded))
-}
-
 fn direction_icon(kind: TransferKind) -> Icon {
     let icon = match kind {
         TransferKind::Upload => IconName::ArrowUp,
@@ -858,11 +555,7 @@ fn chevron_icon(expanded: bool) -> Icon {
 }
 
 /// Expanded detail for a single SFTP transfer: direction, size, %, speed, time.
-fn transfer_detail_panel(
-    t: &TransferTask,
-    id: &'static str,
-    cx: &Context<ServerSession>,
-) -> impl IntoElement {
+fn transfer_detail_panel(t: &TransferTask, id: &'static str, cx: &App) -> impl IntoElement {
     let dim = theme::text_dim();
     let fg = cx.theme().foreground;
 
@@ -1015,16 +708,6 @@ fn transfer_value_text(t: &TransferTask) -> String {
     fmt_size(t.done)
 }
 
-/// Stands where the spinner is for a transfer that has not started: a spinner
-/// would say it is busy.
-fn queued_mark(size: gpui::Pixels) -> AnyElement {
-    div()
-        .text_size(size)
-        .text_color(theme::text_dim())
-        .child("\u{2026}")
-        .into_any_element()
-}
-
 /// The transfer a folded panel shows: one that is already moving, or the
 /// first in line when every one of them is still waiting for a slot.
 fn featured_transfer(transfers: &[TransferTask]) -> Option<&TransferTask> {
@@ -1043,6 +726,13 @@ fn with_extra(label: String, extra: usize) -> String {
     }
 }
 
+/// Whether the inspector strip shows a count beside the Tasks icon: only while
+/// something is running. With nothing moving, the clock stands alone and the
+/// tooltip explains it.
+pub(crate) fn running_count_label(running: usize) -> Option<String> {
+    (running > 0).then(|| running.to_string())
+}
+
 fn failed_label(error: &str) -> String {
     if error.is_empty() {
         "Failed".to_string()
@@ -1051,7 +741,7 @@ fn failed_label(error: &str) -> String {
     }
 }
 
-fn transfer_name(name: String, cx: &Context<ServerSession>) -> impl IntoElement {
+fn transfer_name(name: String, cx: &App) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(0.))
@@ -1154,5 +844,18 @@ mod tests {
         assert_eq!(done_text(0, 0), fmt_size(0));
         assert!(done_text(10, 1).ends_with("1 link skipped"));
         assert!(done_text(10, 3).ends_with("3 links skipped"));
+    }
+
+    #[test]
+    fn the_strip_shows_no_count_when_nothing_is_running() {
+        // "history" used to sit here, but it is a label, not status: the
+        // tooltip carries it instead.
+        assert_eq!(running_count_label(0), None);
+    }
+
+    #[test]
+    fn the_strip_counts_what_is_running() {
+        assert_eq!(running_count_label(1).unwrap(), "1");
+        assert_eq!(running_count_label(3).unwrap(), "3");
     }
 }

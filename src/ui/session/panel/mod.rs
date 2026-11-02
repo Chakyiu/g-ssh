@@ -5,8 +5,10 @@
 
 mod agent;
 mod agent_store;
+mod forwards;
 mod metrics;
 mod snippets;
+mod tasks;
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -19,12 +21,12 @@ use futures::future::Either;
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{
-    div, Axis, BackgroundExecutor, ClipboardItem, Context, Div, Entity, EntityId, EventEmitter,
-    SharedString, Task, WeakEntity, Window,
+    div, AnyElement, Axis, BackgroundExecutor, ClipboardItem, Context, Div, ElementId, Entity,
+    EntityId, EventEmitter, SharedString, Task, WeakEntity, Window,
 };
 
 use gpui_component::{
-    h_flex, resizable::HandleEdge, resize_handle, tooltip::Tooltip, v_flex, ActiveTheme as _,
+    h_flex, resizable::HandleEdge, resize_handle, tooltip::Tooltip, v_flex, ActiveTheme as _, Icon,
     StyledExt as _,
 };
 
@@ -32,6 +34,7 @@ use crate::host_stats::{self, Sample, SystemInfo};
 use crate::preferences::Preferences;
 use crate::theme;
 use crate::ui::local::LocalTerminal;
+use crate::ui::session::tasks::running_count_label;
 use crate::ui::session::ServerSession;
 use crate::ui::VaultState;
 use gssh::ssh::shell::ShellHandle;
@@ -68,6 +71,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Overview,
+    Forwards,
+    Tasks,
     Snippets,
 }
 
@@ -389,37 +394,117 @@ impl ServerPanel {
         cx.notify();
     }
 
+    /// The strip above the body. Page tabs are icons with hover labels: at
+    /// 320px wide, "Overview" and "Snippets" spelled out leave no room for the
+    /// rest of the row.
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
-        let hover_color = cx.theme().muted_foreground;
-        let option = |id: &'static str, tab: Tab, label: &'static str| {
+        let option = |id: &'static str, tab: Tab, icon: &'static str, label: &'static str| {
             let is_active = self.tab == tab;
-            div()
-                .id(id)
-                .flex_1()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(5.))
-                .text_size(px(11.5))
-                .cursor_pointer()
-                .text_color(if is_active {
-                    cx.theme().foreground
-                } else {
-                    theme::text_dim()
-                })
-                .when(is_active, |el| el.bg(theme::element()))
-                .when(!is_active, |el| el.hover(|s| s.text_color(hover_color)))
-                .child(label)
+            tab_icon(id, is_active, cx)
+                .child(Icon::empty().path(icon).size(px(14.)))
+                .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_tab(tab, cx)))
         };
-        h_flex()
+
+        let mut row = h_flex()
             .p(px(2.))
             .gap(px(2.))
             .rounded(px(7.))
             .bg(theme::field())
-            .child(option("server-panel-overview", Tab::Overview, "Overview"))
-            .child(option("server-panel-snippets", Tab::Snippets, "Snippets"))
+            .child(option(
+                "server-panel-overview",
+                Tab::Overview,
+                "icons/gauge.svg",
+                "Overview",
+            ));
+
+        // Forwards and transfers belong to a connection, so a local shell has
+        // no pages for them at all. A connection keeps both, empty or not: a
+        // missing icon would leave no way to reach the page.
+        if self.remote().is_some() {
+            row = row.child(self.render_forwards_tab(cx));
+        }
+
+        row = row.child(option(
+            "server-panel-snippets",
+            Tab::Snippets,
+            "icons/file-code.svg",
+            "Snippets",
+        ));
+
+        if self.remote().is_some() {
+            row = row.child(self.render_tasks_tab(cx));
+        }
+        row
+    }
+
+    /// The Forwards page tab. The count stays beside the icon because it is
+    /// status, not a label: `0/1` says at a glance that nothing is bound.
+    fn render_forwards_tab(&self, cx: &Context<Self>) -> AnyElement {
+        let entry = self
+            .remote()
+            .and_then(|session| session.read(cx).forwards_menu_entry());
+        let (count, failed) = match entry {
+            Some(entry) => (Some(entry.count), entry.failed),
+            None => (None, false),
+        };
+        // A forward that died by itself keeps the red it had as a chip.
+        let count_color = if failed {
+            theme::run_red()
+        } else {
+            theme::text_dim()
+        };
+        let tip = match &count {
+            Some(count) => format!("Forwards {count}"),
+            None => "Forwards".to_string(),
+        };
+        let is_active = self.tab == Tab::Forwards;
+        tab_icon("server-panel-forwards", is_active, cx)
+            .child(
+                Icon::empty()
+                    .path("icons/arrow-right-left.svg")
+                    .size(px(14.)),
+            )
+            .children(count.map(|count| {
+                div()
+                    .text_size(px(9.5))
+                    .text_color(count_color)
+                    .child(SharedString::from(count))
+            }))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| this.set_tab(Tab::Forwards, cx)))
+            .into_any_element()
+    }
+
+    /// The Tasks page tab. No text sits beside the clock: with nothing running
+    /// the old one read "history", which is a label rather than status, and
+    /// the tooltip says it. A running count still shows, since that changes.
+    fn render_tasks_tab(&self, cx: &Context<Self>) -> AnyElement {
+        let (running, has_history) = match self.remote() {
+            Some(session) => {
+                let session = session.read(cx);
+                (session.running_transfers(), session.has_transfer_history())
+            }
+            None => (0, false),
+        };
+        let tip = match (running, has_history) {
+            (0, true) => "Tasks history".to_string(),
+            (0, false) => "Tasks".to_string(),
+            (running, false) => format!("Tasks, {running} running"),
+            (running, true) => format!("Tasks, {running} running and history"),
+        };
+        let is_active = self.tab == Tab::Tasks;
+        tab_icon("server-panel-tasks", is_active, cx)
+            .child(Icon::empty().path("icons/clock.svg").size(px(14.)))
+            .children(running_count_label(running).map(|count| {
+                div()
+                    .text_size(px(9.5))
+                    .text_color(theme::text_dim())
+                    .child(SharedString::from(count))
+            }))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| this.set_tab(Tab::Tasks, cx)))
+            .into_any_element()
     }
 
     pub(crate) fn vault(&self) -> Entity<VaultState> {
@@ -526,6 +611,8 @@ impl Render for ServerPanel {
         } else {
             match self.tab {
                 Tab::Overview => self.scroll_body(self.render_overview(cx)),
+                Tab::Forwards => self.scroll_body(self.render_forwards(cx)),
+                Tab::Tasks => self.scroll_body(self.render_tasks(cx)),
                 Tab::Snippets => self.scroll_body(self.render_snippets(cx)),
             }
         };
@@ -590,6 +677,36 @@ async fn run_command(
         Either::Left((output, _)) => output,
         Either::Right(_) => None,
     }
+}
+
+/// One control on the panel's strip: a square that takes the pressed look
+/// while its page is in front. `flex_1` is deliberately absent: the tabs size
+/// to their icons so a long row can still fit four of them.
+fn tab_icon(
+    id: impl Into<ElementId>,
+    is_active: bool,
+    cx: &Context<ServerPanel>,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(24.))
+        .min_w(px(28.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(3.))
+        .rounded(px(5.))
+        .cursor_pointer()
+        .text_color(if is_active {
+            cx.theme().foreground
+        } else {
+            theme::text_dim()
+        })
+        .when(is_active, |el| el.bg(theme::element()))
+        .when(!is_active, |el| {
+            el.hover(|style| style.bg(theme::element_hover()))
+        })
 }
 
 fn section_title(text: &'static str) -> Div {

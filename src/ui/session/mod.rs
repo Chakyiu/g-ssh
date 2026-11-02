@@ -1,6 +1,6 @@
-pub mod forwards;
+mod forwards;
 pub mod panel;
-pub mod tasks;
+mod tasks;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -116,6 +116,13 @@ impl ForwardRuntime {
             ForwardState::Bound { .. } => None,
         }
     }
+}
+
+/// What a connection's tab menu says about its forwards: how many are bound
+/// out of how many exist, and whether one died by itself.
+pub struct ForwardMenuEntry {
+    pub count: String,
+    pub failed: bool,
 }
 
 pub enum ServerSessionEvent {
@@ -579,6 +586,7 @@ async fn drive_connection(
                                         this.transfer_panel_collapsed = false;
                                     }
                                     this.ensure_tick(cx);
+                                    this.refresh_tasks(cx);
                                     cx.notify();
                                 }
                                 BrowserEvent::TransferProgress { id, done, total } => {
@@ -1067,14 +1075,10 @@ pub struct ServerSession {
     pub transfers: Vec<TransferTask>,
     /// Finished transfers, newest first, capped at [`HISTORY_CAP`].
     pub transfer_history: Vec<TransferTask>,
-    /// Whether the tasks popover is open.
-    pub tasks_open: bool,
     /// The transfer list under the file panes is folded to one row.
     transfer_panel_collapsed: bool,
     /// The host's saved port forwards and their live state.
     pub forwards: Vec<ForwardRuntime>,
-    /// Whether the forwards popover is open.
-    pub forwards_open: bool,
     /// A 1 s repaint loop is live (drives elapsed-time labels while transfers run).
     ticking: bool,
     pub(crate) connection_generation: u64,
@@ -1168,6 +1172,7 @@ impl ServerSession {
                                     for forward in session.forwards.iter_mut() {
                                         forward.state = ForwardState::Stopped { reason: None };
                                     }
+                                    session.refresh_forwards(cx);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -1300,10 +1305,8 @@ impl ServerSession {
             pending_conflict: None,
             transfers: Vec::new(),
             transfer_history: Vec::new(),
-            tasks_open: false,
             transfer_panel_collapsed: false,
             forwards,
-            forwards_open: false,
             ticking: false,
             connection_generation: 0,
             file_associations,
@@ -1428,6 +1431,7 @@ impl ServerSession {
         if self.transfers.is_empty() {
             self.transfer_panel_collapsed = true;
         }
+        self.refresh_tasks(cx);
         cx.notify();
     }
 
@@ -1484,6 +1488,7 @@ impl ServerSession {
         for forward in self.forwards.iter_mut() {
             forward.state = ForwardState::Stopped { reason: None };
         }
+        self.refresh_forwards(cx);
         match &self.browser {
             Some(browser) => {
                 let preserved = browser.update(cx, |b, _| b.cleanup_on_disconnect());
@@ -1631,17 +1636,26 @@ impl ServerSession {
 
     /// Record what the SSH thread reports about one forward. The state is
     /// always complete, so a missed event heals on the next one.
+    /// A forward row's state changed, or the list did. The panel is drawn from
+    /// a cache keyed on its own entity, so the page that shows these rows has
+    /// to be told to draw again; this session's notify only repaints the shell
+    /// around it.
+    fn refresh_forwards(&self, cx: &mut Context<Self>) {
+        self.server_panel.update(cx, |_, cx| cx.notify());
+    }
+
     fn apply_forward_state(&mut self, id: &str, state: ForwardState, cx: &mut Context<Self>) {
         let Some(forward) = self.forwards.iter_mut().find(|f| f.spec.id == id) else {
             return;
         };
         forward.state = state;
-        // An auto-start that failed has no other way to reach the user: the
-        // popover may well be closed.
+        // An auto-start that failed has no other way to reach the user: they
+        // may not be looking at the Forwards page.
         if let Some(reason) = forward.failure() {
             let message = format!("Port forward '{}' stopped: {reason}", forward.name);
             cx.emit(ServerSessionEvent::StatusChanged(message));
         }
+        self.refresh_forwards(cx);
         cx.notify();
     }
 
@@ -1671,6 +1685,7 @@ impl ServerSession {
             }
         }
         self.forwards = next;
+        self.refresh_forwards(cx);
         cx.notify();
 
         if stale.is_empty() {
@@ -1891,6 +1906,9 @@ impl ServerSession {
                         s.ticking = false;
                         false
                     } else {
+                        // The Tasks page shows the same live numbers, and it is
+                        // drawn from a cache of its own entity.
+                        s.refresh_tasks(cx);
                         cx.notify();
                         true
                     }
@@ -2511,16 +2529,52 @@ impl ServerSession {
             )
             .into_any_element()
     }
+}
 
-    /// The session body. `show_files` draws the SFTP browser; otherwise the
-    /// terminal grid. A workspace cell picks one, so one connection can be a
-    /// terminal tab and an SFTP tab at the same time.
+impl ServerSession {
+    /// Bring the terminal or the file panes to the front. The workspace calls
+    /// this when a host is opened "as SFTP" or "as terminal"; from then on the
+    /// session's own chip strip owns the choice.
+    pub fn show_face(&mut self, kind: crate::ui::workspace::WorkKind, cx: &mut Context<Self>) {
+        let want_files = matches!(kind, crate::ui::workspace::WorkKind::Sftp);
+        // A host with no shell keeps its files in front: the other face would
+        // be an empty "did not open a shell" card with nothing to go back to.
+        if !want_files && self.active_terminal().is_none() {
+            return;
+        }
+        // `is_sftp_hidden` means "the terminal is the face in front", the
+        // opposite of `want_files`.
+        let should_hide_files = !want_files;
+        if self.is_sftp_hidden != should_hide_files {
+            self.is_sftp_hidden = should_hide_files;
+            if !should_hide_files {
+                self.is_terminal_focus_pending = false;
+            } else {
+                self.is_terminal_focus_pending = true;
+            }
+            cx.notify();
+        }
+    }
+
+    /// Whether the file panes are the face in front.
+    pub fn shows_files(&self) -> bool {
+        !self.is_sftp_hidden && self.browser.is_some()
+    }
+
+    /// Whether this connection has an SFTP face at all. Telnet and a host that
+    /// never opened files have none, so its chip is left out.
+    pub fn has_files(&self) -> bool {
+        self.browser.is_some()
+    }
+
+    /// The session body: the file panes when the SFTP chip is the one showing,
+    /// else the terminal grid.
     pub(crate) fn render_surface(
         &mut self,
-        show_files: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let show_files = !self.is_sftp_hidden;
         self.ensure_auth_prompt_inputs(window, cx);
         self.ensure_password_input(window, cx);
         if !show_files {
@@ -2579,8 +2633,10 @@ impl ServerSession {
                             .h_full()
                             .overflow_hidden()
                             // A dock draws the main strip inside its own pane, so
-                            // the other pane's strip stays with that pane.
-                            .when(!show_files && !self.layout_has_split(), |el| {
+                            // the other pane's strip stays with that pane. The
+                            // strip stays up over the files too: its SFTP chip
+                            // is what switches back to the terminal.
+                            .when(!self.layout_has_split(), |el| {
                                 el.child(self.render_session_tabs(cx))
                             })
                             .child(div().flex_1().min_h_0().overflow_hidden().child(body)),
@@ -2781,15 +2837,13 @@ impl ServerSession {
             .when_some(self.render_auth_prompt(Link::Peer, cx), |el, prompt| {
                 el.child(prompt)
             })
-            .when_some(self.render_tasks_popover(cx), |el, pop| el.child(pop))
-            .when_some(self.render_forwards_popover(cx), |el, pop| el.child(pop))
             .into_any_element()
     }
 }
 
 impl Render for ServerSession {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.render_surface(!self.is_sftp_hidden, window, cx)
+        self.render_surface(window, cx)
     }
 }
 
