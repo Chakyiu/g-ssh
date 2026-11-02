@@ -738,7 +738,8 @@ pub struct ServerEntry {
     /// next connect prompts; a mismatch gives a hard warning.
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
-    /// Last SFTP folder shown, reopened on restart or reconnect instead of home.
+    /// The SFTP folder last shown, kept for the record only: a fresh connect
+    /// now always starts at the home folders, so nothing seeds a pane from it.
     /// Saved together with `last_local_dir`.
     #[serde(default)]
     pub last_remote_dir: Option<String>,

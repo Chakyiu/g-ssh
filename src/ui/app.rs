@@ -34,7 +34,7 @@ use crate::ui::local::LocalTerminal;
 use crate::ui::palette::{CommandPalette, CommandPaletteEvent, PaletteCommand};
 use crate::ui::session::{connect_time_message, ForwardRuntime, ServerSession, ServerSessionEvent};
 use crate::ui::settings::{SettingsSection, SettingsView, SettingsViewEvent};
-use crate::ui::sftp::browser::{RestorePaths, TransferKind};
+use crate::ui::sftp::browser::TransferKind;
 use crate::ui::sftp::conflict::transfer_conflict_dialog;
 use crate::ui::sftp::picker::{AppPicker, AppPickerEvent};
 use crate::ui::sync::SyncService;
@@ -1759,12 +1759,9 @@ impl AppView {
         };
 
         let conn_info = connection_info(&entry);
-        // Seed the browser with the folders last shown for this host (persisted
-        // together), so a restart or fresh open lands back where the user was.
-        let initial_restore = match (entry.last_local_dir.clone(), entry.last_remote_dir.clone()) {
-            (Some(local), Some(remote)) => Some(RestorePaths { local, remote }),
-            _ => None,
-        };
+        // The file panes always start at the home folders. They used to reopen
+        // whatever folder this host last showed, which meant a fresh open landed
+        // somewhere the user did not choose.
         // The session keeps the forwards itself, so it can start the
         // auto-start ones again on every reconnect without the vault.
         let forwards = forward_runtimes(&entry);
@@ -1776,7 +1773,6 @@ impl AppView {
                 conn_info,
                 route,
                 telnet,
-                initial_restore,
                 forwards,
                 file_associations,
                 self.vault_state.clone(),

@@ -48,6 +48,24 @@ const FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// larger ones, so this is about one maximal request per loop.
 const TRANSFER_CHUNK: usize = 256 * 1024;
 
+/// How long one SFTP request may go unanswered. The clock starts when the
+/// packet is queued, not when it reaches the server, so on top of the server's
+/// own latency it covers the time spent behind the requests already in flight
+/// (see [`SFTP_WRITE_CONCURRENCY`]) and any pause while the UI is too busy to
+/// drain the event channel.
+///
+/// A transferring file must never hit this: it is a limit on a *stalled*
+/// link, not a budget for a slow one. A real dead link is still found in about
+/// two minutes by keepalive (20 s × 6), so a longer deadline here costs
+/// nothing and removes the case where a healthy but slow upload is killed.
+const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Write requests one file may have in flight. Each is a 32 KiB packet, so
+/// this is the queue a request waits behind: at 8 that is 256 KiB per file,
+/// which a slow uplink drains well within [`SFTP_REQUEST_TIMEOUT`] even when
+/// several transfers share the link.
+const SFTP_WRITE_CONCURRENCY: usize = 8;
+
 /// Minimum interval between [`SftpEvent::TransferProgress`] events for one
 /// transfer, so a fast link doesn't flood the UI channel.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -57,7 +75,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const FOLDER_FILE_CONCURRENCY: usize = 16;
 
 /// Files of a folder upload that send a chunk at once. Each chunk must be answered
-/// within the 10 s SFTP timeout, counted from queueing, so a slow uplink needs few.
+/// within [`SFTP_REQUEST_TIMEOUT`], counted from queueing, so a slow uplink needs few.
 const FOLDER_WRITE_CONCURRENCY: usize = 4;
 
 /// Tracked transfers (drag/drop, menu) that run at once on one SFTP channel;
@@ -677,7 +695,9 @@ impl<'a> TransferReporter<'a> {
         self.emit();
     }
 
-    /// Send the current figures now, whatever the throttle says.
+    /// Send the current figures now, whatever the throttle says. Never blocks
+    /// the transfer: a progress tick is not worth slowing the bytes down for,
+    /// and the next tick carries the newer total anyway.
     fn emit(&self) {
         let _ = self.event_tx.try_send(SftpEvent::TransferProgress {
             id: self.id,
@@ -1574,9 +1594,20 @@ async fn open_sftp_channel(
         .request_subsystem(true, "sftp")
         .await
         .map_err(|e| SshError::ChannelOpen(e.to_string()))?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SshError::SftpInit(e.to_string()))?;
+    // The defaults are tuned for one file at a time: 16 writes of 32 KiB in
+    // flight per file, and a 10 s deadline that counts from queueing. With two
+    // uploads sharing a slow uplink the queue alone can take longer than that,
+    // and a healthy transfer dies with "Timeout".
+    let sftp = SftpSession::new_with_config(
+        channel.into_stream(),
+        russh_sftp::client::Config {
+            request_timeout_secs: SFTP_REQUEST_TIMEOUT.as_secs(),
+            max_concurrent_writes: SFTP_WRITE_CONCURRENCY,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| SshError::SftpInit(e.to_string()))?;
 
     let home_dir = sftp
         .canonicalize(".")
@@ -1584,10 +1615,15 @@ async fn open_sftp_channel(
         .unwrap_or_else(|_| "/".to_string());
     tracing::info!(home_dir, "sftp session opened");
 
-    // Unbounded: a dropped command would lose a transfer. Events stay bounded;
-    // progress ticks may be dropped.
+    // Both unbounded, and deliberately so. The worker handles listings and
+    // reports transfer ends inline, so a bounded event channel makes a slow
+    // consumer (a busy frame, a tab switch, a big layout) block the worker in
+    // `send().await`. Everything queued behind it then stops — including the
+    // transfer that is mid-flight — which reads as a lost session. Progress
+    // ticks are already throttled per transfer and dropped when full, so the
+    // queue stays small in practice.
     let (sftp_cmd_tx, sftp_cmd_rx) = async_channel::unbounded::<SftpCmd>();
-    let (sftp_event_tx, sftp_event_rx) = async_channel::bounded::<SftpEvent>(64);
+    let (sftp_event_tx, sftp_event_rx) = async_channel::unbounded::<SftpEvent>();
 
     // SftpSession may not be Send; this runtime is single-threaded.
     tokio::task::spawn_local(handle_sftp_commands(sftp, sftp_cmd_rx, sftp_event_tx));
@@ -2246,9 +2282,25 @@ fn transfer_outcome(result: anyhow::Result<usize>, what: &str, path: &str) -> Tr
         }
         Err(e) => {
             tracing::warn!(?e, path, "{what} failed");
-            TransferOutcome::Failed(e.to_string())
+            TransferOutcome::Failed(failure_message(&e))
         }
     }
+}
+
+/// The reason a transfer failed, in words the user can act on. A request
+/// timeout is the one failure that hits a healthy link: it names its own limit
+/// instead of the bare "Timeout" the SFTP layer reports.
+fn failure_message(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+    {
+        return format!(
+            "the server did not answer within {}s",
+            SFTP_REQUEST_TIMEOUT.as_secs()
+        );
+    }
+    error.to_string()
 }
 
 /// `on_done` is the event that makes the pane reload.
@@ -2293,8 +2345,8 @@ async fn run_tracked_download(
         }
         None => Err(anyhow::Error::new(TransferCanceled)),
     };
-    // Free the target before the events: a full event queue must not hold up
-    // the next transfer.
+    // Free the target before the events: a slow event consumer must not hold
+    // up the next transfer to the same place.
     drop(claim);
     let outcome = transfer_outcome(result, "download", &remote);
     let name = base_name(&remote).to_string();
@@ -5070,6 +5122,19 @@ mod tests {
         assert!(is_owner_change(Some((1000, 1000)), (33, 33)));
         assert!(is_owner_change(Some((1000, 1000)), (1000, 33)));
         assert!(!is_owner_change(None, (33, 33)));
+    }
+
+    #[test]
+    fn a_request_timeout_says_which_limit_expired() {
+        let timed_out = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let message = failure_message(&timed_out);
+        assert!(
+            message.contains(&SFTP_REQUEST_TIMEOUT.as_secs().to_string()),
+            "{message}"
+        );
+        // A failure that is not a timeout keeps the reason the server gave.
+        let denied = anyhow::anyhow!("permission denied");
+        assert_eq!(failure_message(&denied), "permission denied");
     }
 
     #[test]

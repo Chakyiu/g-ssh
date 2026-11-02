@@ -44,6 +44,21 @@ impl ServerSession {
         cx.notify();
     }
 
+    /// Drop one finished transfer from history, so a failure the user has read
+    /// can go away without losing the others.
+    fn dismiss_finished_task(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.transfer_history.len();
+        self.transfer_history.retain(|t| t.id != id);
+        if self.transfer_history.len() == before {
+            return;
+        }
+        if self.transfers.is_empty() && self.transfer_history.is_empty() {
+            self.tasks_open = false;
+            self.transfer_panel_collapsed = true;
+        }
+        cx.notify();
+    }
+
     /// Drop all finished transfers from history. If nothing is still active,
     /// the popover has nothing left to show, so close it too.
     fn clear_finished_tasks(&mut self, cx: &mut Context<Self>) {
@@ -461,7 +476,8 @@ impl ServerSession {
                     .text_size(px(10.))
                     .text_color(theme::text_dim())
                     .child(SharedString::from(when)),
-            );
+            )
+            .child(self.transfer_dismiss_button(id, cx));
 
         v_flex().child(row).children(detail).into_any_element()
     }
@@ -713,17 +729,42 @@ impl ServerSession {
                     .child(
                         div()
                             .flex_none()
-                            .max_w(px(240.))
+                            .max_w(px(200.))
                             .truncate()
                             .whitespace_nowrap()
                             .text_size(px(11.))
                             .text_color(color)
                             .child(SharedString::from(label)),
-                    ),
+                    )
+                    .child(self.transfer_dismiss_button(transfer.id, cx)),
             )
             .when(details, |el| {
                 el.child(transfer_detail_panel(transfer, "sftp-xfer-detail", cx))
             })
+            .into_any_element()
+    }
+
+    /// The close button of a finished row: dismissing it is not a cancel, but
+    /// it reads the same and sits in the same corner as the stop button.
+    fn transfer_dismiss_button(&self, id: u64, cx: &Context<Self>) -> AnyElement {
+        div()
+            .id(("sftp-xfer-dismiss", id as usize))
+            .flex_none()
+            .w(px(18.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .text_color(theme::text_dim())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::element_hover()).text_color(theme::text()))
+            .active(|style| style.bg(theme::element_active()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.dismiss_finished_task(id, cx);
+            }))
+            .child(Icon::new(IconName::Close).size(px(12.)))
             .into_any_element()
     }
 
