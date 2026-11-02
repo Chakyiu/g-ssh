@@ -802,8 +802,23 @@ pub(crate) fn sidebar_resize_handle(start_width: f32) -> impl IntoElement {
         start_x: Rc::new(Cell::new(None)),
         start_width,
     };
+    // The stock handle paints a full-height hairline. This edge has no
+    // divider; the mark only shows while the pointer is dragging it.
     resize_handle("sidebar-resize", Axis::Horizontal)
         .inside(HandleEdge::Trailing)
+        .with_appearance(Rc::new(|handle, _, _| {
+            if !handle.is_active() {
+                return Some(div().into_any_element());
+            }
+            Some(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(px(1.))
+                    .bg(theme::accent())
+                    .into_any_element(),
+            )
+        }))
         .on_drag(drag, |drag, _, window, cx| {
             drag.start_x.set(Some(window.mouse_position().x.as_f32()));
             cx.stop_propagation();
