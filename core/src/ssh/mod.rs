@@ -48,6 +48,19 @@ const FORWARD_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// larger ones, so this is about one maximal request per loop.
 const TRANSFER_CHUNK: usize = 256 * 1024;
 
+/// How long one SFTP request may go unanswered. The clock starts when the
+/// packet is queued, not when it reaches the server, so it also covers the
+/// time behind the requests already in flight: see [`SFTP_WRITE_CONCURRENCY`].
+/// Keepalive still finds a dead link in about 2 min, so a generous limit here
+/// does not delay that.
+const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Write requests one file may have in flight. Each is a 32 KiB packet, so
+/// this is the queue a request waits behind: at 8 that is 256 KiB per file,
+/// which a slow uplink drains well within [`SFTP_REQUEST_TIMEOUT`] even when
+/// several transfers share the link.
+const SFTP_WRITE_CONCURRENCY: usize = 8;
+
 /// Minimum interval between [`SftpEvent::TransferProgress`] events for one
 /// transfer, so a fast link doesn't flood the UI channel.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -57,7 +70,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const FOLDER_FILE_CONCURRENCY: usize = 16;
 
 /// Files of a folder upload that send a chunk at once. Each chunk must be answered
-/// within the 10 s SFTP timeout, counted from queueing, so a slow uplink needs few.
+/// within [`SFTP_REQUEST_TIMEOUT`], counted from queueing, so a slow uplink needs few.
 const FOLDER_WRITE_CONCURRENCY: usize = 4;
 
 /// Tracked transfers (drag/drop, menu) that run at once on one SFTP channel;
@@ -1574,9 +1587,20 @@ async fn open_sftp_channel(
         .request_subsystem(true, "sftp")
         .await
         .map_err(|e| SshError::ChannelOpen(e.to_string()))?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SshError::SftpInit(e.to_string()))?;
+    // The defaults are tuned for one file at a time: 16 writes of 32 KiB in
+    // flight per file, and a 10 s deadline that counts from queueing. With two
+    // uploads sharing a slow uplink the queue alone can take longer than that,
+    // and a healthy transfer dies with "Timeout".
+    let sftp = SftpSession::new_with_config(
+        channel.into_stream(),
+        russh_sftp::client::Config {
+            request_timeout_secs: SFTP_REQUEST_TIMEOUT.as_secs(),
+            max_concurrent_writes: SFTP_WRITE_CONCURRENCY,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| SshError::SftpInit(e.to_string()))?;
 
     let home_dir = sftp
         .canonicalize(".")
@@ -2246,9 +2270,25 @@ fn transfer_outcome(result: anyhow::Result<usize>, what: &str, path: &str) -> Tr
         }
         Err(e) => {
             tracing::warn!(?e, path, "{what} failed");
-            TransferOutcome::Failed(e.to_string())
+            TransferOutcome::Failed(failure_message(&e))
         }
     }
+}
+
+/// The reason a transfer failed, in words the user can act on. A request
+/// timeout is the one failure that hits a healthy link: it names its own limit
+/// instead of the bare "Timeout" the SFTP layer reports.
+fn failure_message(error: &anyhow::Error) -> String {
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+    {
+        return format!(
+            "the server did not answer within {}s",
+            SFTP_REQUEST_TIMEOUT.as_secs()
+        );
+    }
+    error.to_string()
 }
 
 /// `on_done` is the event that makes the pane reload.
@@ -5070,6 +5110,19 @@ mod tests {
         assert!(is_owner_change(Some((1000, 1000)), (33, 33)));
         assert!(is_owner_change(Some((1000, 1000)), (1000, 33)));
         assert!(!is_owner_change(None, (33, 33)));
+    }
+
+    #[test]
+    fn a_request_timeout_says_which_limit_expired() {
+        let timed_out = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let message = failure_message(&timed_out);
+        assert!(
+            message.contains(&SFTP_REQUEST_TIMEOUT.as_secs().to_string()),
+            "{message}"
+        );
+        // A failure that is not a timeout keeps the reason the server gave.
+        let denied = anyhow::anyhow!("permission denied");
+        assert_eq!(failure_message(&denied), "permission denied");
     }
 
     #[test]
