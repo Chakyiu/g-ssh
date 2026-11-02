@@ -33,9 +33,7 @@ pub(crate) enum WorkKind {
 
 /// The tab the workspace just brought to the front.
 pub(crate) enum FrontTab {
-    /// The session itself, not its host id: one host can be open as more than
-    /// one connection, and the id alone always resolves to the first of them.
-    Host(Entity<ServerSession>),
+    Host(String),
     Local,
 }
 
@@ -360,7 +358,7 @@ impl Workspace {
         };
         let front = match &doc.body {
             WorkBody::Local(_) => FrontTab::Local,
-            WorkBody::Session { session, .. } => FrontTab::Host(session.clone()),
+            WorkBody::Session { session, .. } => FrontTab::Host(session.read(cx).server_id.clone()),
         };
         cx.emit(WorkspaceEvent::Activated(front));
     }
