@@ -1,6 +1,6 @@
 [package]
 name = "g-ssh"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "SSH, SFTP and Telnet client"
 license = "MIT"
