@@ -1143,10 +1143,10 @@ impl Sidebar {
             .map(|(_, status)| status)
             .unwrap_or(HostStatus::Offline);
         // A live session says what it is doing; a closed one says how it is
-        // reached.
+        // reached. A dropped connection says nothing: the dot is enough.
         let sub: SharedString = match status {
             HostStatus::Connecting => "connecting…".into(),
-            HostStatus::Disconnected => "disconnected".into(),
+            HostStatus::Disconnected => SharedString::default(),
             HostStatus::Connected => SharedString::default(),
             HostStatus::Offline => entry.kind.label().into(),
         };
@@ -1400,7 +1400,7 @@ impl Render for Sidebar {
                 let sub: SharedString = match status {
                     HostStatus::Connected => "",
                     HostStatus::Connecting => "connecting…",
-                    HostStatus::Disconnected => "disconnected",
+                    HostStatus::Disconnected => "",
                     HostStatus::Offline => "offline",
                 }
                 .into();
