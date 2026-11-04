@@ -512,6 +512,9 @@ impl ServerFormView {
         if user.is_empty() {
             return false;
         }
+        if self.kind == ConnectionKind::Rdp {
+            return !self.pass_input.read(cx).value().is_empty();
+        }
 
         match self.auth_mode {
             AuthMode::Password => !self.pass_input.read(cx).value().is_empty(),
@@ -752,19 +755,23 @@ impl ServerFormView {
             .unwrap_or(22);
         let username = strip_whitespace(&self.user_input.read(cx).value());
 
-        let auth = match self.auth_mode {
-            AuthMode::Password => {
-                AuthMethod::Password(self.pass_input.read(cx).value().to_string())
+        let auth = if self.kind == ConnectionKind::Rdp {
+            AuthMethod::Password(self.pass_input.read(cx).value().to_string())
+        } else {
+            match self.auth_mode {
+                AuthMode::Password => {
+                    AuthMethod::Password(self.pass_input.read(cx).value().to_string())
+                }
+                AuthMode::PrivateKey => {
+                    let Some(key_id) = self.selected_key_id else {
+                        self.error = Some("Select a key or add a new one.".to_string());
+                        cx.notify();
+                        return;
+                    };
+                    AuthMethod::PrivateKey { key_id }
+                }
+                AuthMode::Agent => AuthMethod::Agent,
             }
-            AuthMode::PrivateKey => {
-                let Some(key_id) = self.selected_key_id else {
-                    self.error = Some("Select a key or add a new one.".to_string());
-                    cx.notify();
-                    return;
-                };
-                AuthMethod::PrivateKey { key_id }
-            }
-            AuthMode::Agent => AuthMethod::Agent,
         };
 
         let (group, tags) = match self.resolve_group_and_tags(cx) {
@@ -851,24 +858,27 @@ impl ServerFormView {
                 .update(cx, |input, cx| input.set_value(next, window, cx));
         }
         self.kind = kind;
+        if kind == ConnectionKind::Rdp {
+            self.auth_mode = AuthMode::Password;
+        }
         self.close_dropdowns(cx);
         cx.notify();
     }
 
     /// Telnet has no SSH tunnel, so a jump host is kept in the form but not saved.
     fn jump_to_save(&self) -> Option<Uuid> {
-        if self.kind == ConnectionKind::Telnet {
-            None
-        } else {
+        if self.kind.uses_ssh() {
             self.selected_jump_id
+        } else {
+            None
         }
     }
 
     fn forwards_to_save(&self) -> Vec<PortForward> {
-        if self.kind == ConnectionKind::Telnet {
-            Vec::new()
-        } else {
+        if self.kind.uses_ssh() {
             self.forwards.clone()
+        } else {
+            Vec::new()
         }
     }
 
@@ -1359,18 +1369,23 @@ impl Render for ServerFormView {
                 (ConnectionKind::Ssh, "SSH"),
                 (ConnectionKind::Sftp, "SFTP"),
                 (ConnectionKind::Telnet, "Telnet"),
+                (ConnectionKind::Rdp, "RDP"),
             ],
             self.kind,
             cx,
             |this, kind, window, cx| this.pick_kind(kind, window, cx),
         );
         let is_telnet = self.kind == ConnectionKind::Telnet;
+        let is_rdp = self.kind == ConnectionKind::Rdp;
         let kind_note = match self.kind {
             ConnectionKind::Ssh => None,
             ConnectionKind::Sftp => {
                 Some("Opens the file browser. A shell is opened too when the server allows one.")
             }
             ConnectionKind::Telnet => Some("Opens a terminal. Sign in at the prompt."),
+            ConnectionKind::Rdp => {
+                Some("Opens the remote desktop. A domain goes in front of the user, as CORP\\ada.")
+            }
         };
 
         // User @ host : port, the order ssh writes it in. A pasted
@@ -1462,7 +1477,7 @@ impl Render for ServerFormView {
                     .child(address_row)
                     .child(labeled("Name", cx, Input::new(&self.name_input))),
             )
-            .when(!is_telnet, |column| {
+            .when(self.kind.uses_ssh(), |column| {
                 column.child(
                     v_flex()
                         .gap(px(12.))
@@ -1474,6 +1489,18 @@ impl Render for ServerFormView {
                                 .child(auth_switch),
                         )
                         .child(auth_body),
+                )
+            })
+            .when(is_rdp, |column| {
+                column.child(
+                    v_flex()
+                        .gap(px(12.))
+                        .child(section_title("Authentication", cx))
+                        .child(labeled(
+                            "Password",
+                            cx,
+                            Input::new(&self.pass_input).mask_toggle(),
+                        )),
                 )
             })
             .child(
@@ -1488,7 +1515,7 @@ impl Render for ServerFormView {
                             .child(tags_field.flex_1().min_w_0()),
                     ),
             )
-            .when(!is_telnet, |column| {
+            .when(self.kind.uses_ssh(), |column| {
                 column.child(v_flex().gap(px(12.)).child(advanced_toggle).when(
                     is_advanced_open,
                     |el| {
@@ -1637,6 +1664,12 @@ impl ServerFormView {
             return Some("The port is a number from 1 to 65535.");
         }
         if self.kind == ConnectionKind::Telnet {
+            return None;
+        }
+        if self.kind == ConnectionKind::Rdp && self.pass_input.read(cx).value().is_empty() {
+            return Some("Enter the password.");
+        }
+        if self.kind == ConnectionKind::Rdp {
             return None;
         }
         match self.auth_mode {

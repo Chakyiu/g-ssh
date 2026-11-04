@@ -115,8 +115,9 @@ pub struct ServerPanel {
     /// face, and the two do not share a tab strip.
     showing_agent: bool,
     info: Option<SystemInfo>,
-    /// Telnet has no exec channel, so the overview never waits on one.
-    is_telnet: bool,
+    /// Telnet and RDP have no exec channel. The overview names the host
+    /// with this instead of waiting for a probe.
+    idle_label: Option<&'static str>,
     /// The host printed no `/proc/stat`: only the system info shows.
     is_unsupported: bool,
     last_sample: Option<Sample>,
@@ -160,7 +161,7 @@ impl EventEmitter<ServerPanelEvent> for ServerPanel {}
 impl ServerPanel {
     pub fn new(
         host: PanelHost,
-        is_telnet: bool,
+        idle_label: Option<&'static str>,
         vault_state: Entity<VaultState>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -219,8 +220,8 @@ impl ServerPanel {
             tab: Tab::Overview,
             showing_agent: false,
             info: None,
-            is_telnet,
-            is_unsupported: is_telnet,
+            idle_label,
+            is_unsupported: idle_label.is_some(),
             last_sample: None,
             history: VecDeque::with_capacity(HISTORY_LEN),
             snippet_editor: None,

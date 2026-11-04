@@ -37,7 +37,6 @@ use crate::ui::session::{
 };
 use crate::ui::terminal::view::{TabColor, TerminalEvent, TerminalView};
 use gssh::ssh::shell::ShellHandle;
-use gssh::vault::ConnectionKind;
 
 /// Tabs past this would not fit the header. It is also close to what a server
 /// allows: OpenSSH's default `MaxSessions` is 10 and SFTP takes two of them.
@@ -964,10 +963,11 @@ impl ServerSession {
     /// Open this host's SFTP tab in the folder the shell at `ix` is in.
     fn open_sftp_in_pwd(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.terminal_tab_menu = None;
-        if self.conn_info.kind == ConnectionKind::Telnet {
-            cx.emit(ServerSessionEvent::StatusChanged(
-                "Telnet hosts have no files.".to_string(),
-            ));
+        if !self.conn_info.kind.uses_ssh() {
+            cx.emit(ServerSessionEvent::StatusChanged(format!(
+                "{} hosts have no files.",
+                self.conn_info.kind.label()
+            )));
             return;
         }
         let Some(view) = self.terminals.get(ix).cloned() else {
@@ -1322,6 +1322,8 @@ impl ServerSession {
         }
         if let Some(terminal) = self.active_terminal() {
             terminal.read(cx).focus_handle(cx).focus(window, cx);
+        } else if let Some(desktop) = &self.desktop {
+            desktop.read(cx).focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -1695,7 +1697,7 @@ impl ServerSession {
         }
         let ix = menu.ix;
         let mut items = Vec::new();
-        if self.conn_info.kind != ConnectionKind::Telnet {
+        if self.conn_info.kind.uses_ssh() {
             items.push(
                 ContextMenuItem::new(
                     "terminal-tab-sftp",

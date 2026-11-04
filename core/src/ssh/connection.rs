@@ -17,6 +17,7 @@ pub enum ConnectionKind {
     Ssh,
     Sftp,
     Telnet,
+    Rdp,
 }
 
 impl ConnectionKind {
@@ -25,12 +26,14 @@ impl ConnectionKind {
             ConnectionKind::Ssh => "SSH",
             ConnectionKind::Sftp => "SFTP",
             ConnectionKind::Telnet => "Telnet",
+            ConnectionKind::Rdp => "RDP",
         }
     }
 
     pub fn default_port(self) -> u16 {
         match self {
             ConnectionKind::Telnet => 23,
+            ConnectionKind::Rdp => 3389,
             ConnectionKind::Ssh | ConnectionKind::Sftp => 22,
         }
     }
@@ -39,14 +42,14 @@ impl ConnectionKind {
         *self == ConnectionKind::Ssh
     }
 
-    /// SSH and SFTP both log in over SSH. Telnet does not.
+    /// SSH and SFTP both log in over SSH. Telnet and RDP do not.
     pub fn uses_ssh(self) -> bool {
         matches!(self, ConnectionKind::Ssh | ConnectionKind::Sftp)
     }
 }
 
 /// `user@host` with the port only when it is not the kind's default.
-/// An empty user is left off, which is normal for Telnet.
+/// An empty user is left off, which is normal for Telnet. RDP keeps its user.
 pub fn endpoint_label(kind: ConnectionKind, username: &str, host: &str, port: u16) -> String {
     let address = if port == kind.default_port() {
         host.to_string()
@@ -206,6 +209,14 @@ mod tests {
         assert_eq!(
             endpoint_label(ConnectionKind::Sftp, "deploy", "files", 22),
             "deploy@files"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Rdp, "ada", "desktop", 3389),
+            "ada@desktop"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Rdp, "ada", "desktop", 3390),
+            "ada@desktop:3390"
         );
     }
 

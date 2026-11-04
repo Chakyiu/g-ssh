@@ -1,3 +1,4 @@
+mod desktop;
 mod forwards;
 pub mod panel;
 mod tasks;
@@ -33,6 +34,7 @@ use gpui_component::{
     spinner::Spinner,
     v_flex, ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
 };
+use gssh::rdp::{RdpConnection, RdpEvent, RdpTarget, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use gssh::ssh::connection::{Connection, ForwardSpec};
 use gssh::ssh::shell::ShellHandle;
 use gssh::ssh::{
@@ -949,6 +951,224 @@ async fn drive_telnet(
     SessionOutcome::Ended(None)
 }
 
+/// The RDP counterpart of the Telnet reconnect loop. Each try dials again,
+/// with the password the route holds now, so a retype on the error card is
+/// the one that is sent.
+async fn run_rdp_loop(
+    this: WeakEntity<ServerSession>,
+    cx: &mut AsyncApp,
+    route: Arc<Mutex<SshRoute>>,
+    retry_rx: async_channel::Receiver<()>,
+    target_id: String,
+    mut connect_started: Instant,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        let Some(target) = rdp_target_from_route(&route) else {
+            let _ = this.update(cx, |session, cx| {
+                session.give_up(
+                    ConnectFailure {
+                        entry_id: target_id,
+                        message: "RDP needs a password.".to_string(),
+                        is_password_rejected: true,
+                        is_transient: false,
+                    },
+                    cx,
+                );
+            });
+            break;
+        };
+        let conn = RdpConnection::spawn(target);
+        if this
+            .update(cx, |session, cx| {
+                if let Some(desktop) = &session.desktop {
+                    desktop.update(cx, |desktop, cx| desktop.follow(conn.clone(), cx));
+                }
+                session.rdp = Some(conn.clone());
+                session.connection = None;
+                session.connection_generation = session.connection_generation.wrapping_add(1);
+                session.reconnecting = (attempt > 0).then_some(attempt);
+                session.auth_prompt = None;
+                session.host_key_prompt = None;
+                cx.notify();
+            })
+            .is_err()
+        {
+            break;
+        }
+
+        let failure = match drive_rdp(conn, connect_started, &this, cx).await {
+            SessionOutcome::Gone => break,
+            SessionOutcome::Ended(failure) => failure.unwrap_or_else(|| ConnectFailure {
+                entry_id: target_id.clone(),
+                message: CONNECTION_CLOSED.to_string(),
+                is_password_rejected: false,
+                is_transient: true,
+            }),
+        };
+        let Ok((has_connected, has_recovered)) = this.update(cx, |session, _| {
+            (session.has_connected_once, session.reconnecting.is_none())
+        }) else {
+            break;
+        };
+        if has_recovered {
+            attempt = 0;
+        }
+        let is_retrying = has_connected && failure.is_transient && attempt < MAX_RECONNECT_ATTEMPTS;
+        if !is_retrying {
+            if this
+                .update(cx, |session, cx| session.give_up(failure, cx))
+                .is_err()
+                || has_connected
+            {
+                break;
+            }
+            while retry_rx.try_recv().is_ok() {}
+            if retry_rx.recv().await.is_err() {
+                break;
+            }
+        } else {
+            attempt += 1;
+            if this
+                .update(cx, |session, cx| {
+                    session.reconnecting = Some(attempt);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+            while retry_rx.try_recv().is_ok() {}
+            let backoff = Duration::from_secs(1u64 << (attempt - 1).min(3));
+            let timer = cx.background_executor().timer(backoff);
+            futures::future::select(Box::pin(timer), Box::pin(retry_rx.recv())).await;
+        }
+        connect_started = Instant::now();
+    }
+}
+
+fn rdp_target_from_route(route: &Arc<Mutex<SshRoute>>) -> Option<RdpTarget> {
+    let route = route.lock().expect("route mutex");
+    let gssh::ssh::AuthCredential::Password(password) = &route.target.credential else {
+        return None;
+    };
+    Some(RdpTarget::new(
+        route.target.host.clone(),
+        route.target.port,
+        &route.target.username,
+        password.clone(),
+        DEFAULT_WIDTH,
+        DEFAULT_HEIGHT,
+    ))
+}
+
+async fn drive_rdp(
+    conn: RdpConnection,
+    connect_started: Instant,
+    this: &WeakEntity<ServerSession>,
+    cx: &mut AsyncApp,
+) -> SessionOutcome {
+    let events = conn.subscribe_events();
+    while let Ok(event) = events.recv().await {
+        match event {
+            RdpEvent::Connected { width, height } => {
+                let elapsed = connect_started.elapsed();
+                let built = this.update(cx, |session, cx| {
+                    let is_reconnect = session.has_connected_once;
+                    tracing::info!(
+                        target: "g-ssh::rdp",
+                        host = %session.conn_info.display_name(),
+                        width,
+                        height,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        is_reconnect,
+                        "rdp session ready"
+                    );
+                    if session.desktop.is_none() {
+                        let desktop = cx.new(|cx| desktop::DesktopView::new(conn.clone(), cx));
+                        session.desktop = Some(desktop);
+                    }
+                    session.has_connected_once = true;
+                    session.reconnecting = None;
+                    session.disconnected = None;
+                    session.connect_failure = None;
+                    session.is_terminal_focus_pending = true;
+                    cx.emit(ServerSessionEvent::Connected {
+                        elapsed: shown_connect_time(elapsed, is_reconnect, false),
+                    });
+                    cx.notify();
+                });
+                if built.is_err() {
+                    return SessionOutcome::Gone;
+                }
+            }
+            RdpEvent::Failed(detail) => {
+                tracing::warn!(target: "g-ssh::rdp", error = %detail, "rdp connect failed");
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message: readable_rdp_error(&detail),
+                    is_password_rejected: is_logon_failure(&detail),
+                    is_transient: !is_logon_failure(&detail) && !is_classic_rdp_security(&detail),
+                }));
+            }
+            RdpEvent::Closed {
+                message,
+                is_transient,
+            } => {
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                // Closing the tab drops the connection, and IronRDP reports
+                // that as the GUI stopping. That is not a failure to show.
+                if message.contains("GUI is stopped") {
+                    return SessionOutcome::Gone;
+                }
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message: if message.is_empty() {
+                        CONNECTION_CLOSED.to_string()
+                    } else {
+                        readable_rdp_error(&message)
+                    },
+                    is_password_rejected: false,
+                    is_transient: is_transient && !is_classic_rdp_security(&message),
+                }));
+            }
+        }
+    }
+    SessionOutcome::Ended(None)
+}
+
+/// IronRDP's errors are a debug dump. The first line is the part worth reading.
+fn readable_rdp_error(detail: &str) -> String {
+    if is_classic_rdp_security(detail) {
+        return "This server chose classic RDP security. This client speaks TLS and Network Level Authentication. Set the server security layer to Negotiate or TLS. On xrdp, use security_layer=negotiate or security_layer=tls.".to_string();
+    }
+    let line = detail.lines().next().unwrap_or(detail).trim();
+    let line = line.strip_prefix("ConnectorError").unwrap_or(line).trim();
+    capitalize_first(line)
+}
+
+/// The server picked PROTOCOL_RDP (no TLS). IronRDP does not implement that
+/// protocol, so another attempt would fail the same way.
+fn is_classic_rdp_security(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("standard_rdp_security") || lower.contains("standard rdp security")
+}
+
+fn is_logon_failure(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("logon")
+        || lower.contains("authentication")
+        || lower.contains("credssp")
+        || lower.contains("access denied")
+        || lower.contains("0xc000006d")
+        || lower.contains("0xc000006a")
+}
+
 /// Which terminal tab the right-click menu belongs to, and where it opened.
 pub(crate) struct TerminalTabMenu {
     pub(crate) ix: usize,
@@ -993,6 +1213,10 @@ pub struct ServerSession {
     pub connection: Option<SshConnection>,
     /// Set for a Telnet host. SSH and SFTP leave this empty.
     pub(crate) telnet: Option<TelnetConnection>,
+    /// Set for an RDP host. The desktop view holds a clone while it is live.
+    rdp: Option<RdpConnection>,
+    /// The remote desktop. Present once an RDP session has shown a frame.
+    pub(crate) desktop: Option<Entity<desktop::DesktopView>>,
     /// True after a connect has shown a shell or a file browser. A later drop
     /// can then retry, including Telnet, which has no browser to mark it by.
     has_connected_once: bool,
@@ -1104,11 +1328,15 @@ impl ServerSession {
         let server_id = conn_info.id.clone();
         let stored_conn = conn_info.clone();
         let session = cx.entity().downgrade();
-        let is_telnet = conn_info.kind == ConnectionKind::Telnet;
+        let idle_label = match conn_info.kind {
+            ConnectionKind::Telnet => Some("Telnet"),
+            ConnectionKind::Rdp => Some("Remote Desktop"),
+            ConnectionKind::Ssh | ConnectionKind::Sftp => None,
+        };
         let server_panel = cx.new(|cx| {
             ServerPanel::new(
                 crate::ui::session::panel::PanelHost::Remote(session),
-                is_telnet,
+                idle_label,
                 vault_state,
                 cx,
             )
@@ -1142,6 +1370,14 @@ impl ServerSession {
                 .await;
             });
             (None, Some(telnet), task)
+        } else if conn_info.kind == ConnectionKind::Rdp {
+            let route = route.clone();
+            let retry_rx = retry_rx.clone();
+            let target_id = server_id.clone();
+            let task = cx.spawn(async move |this, cx| {
+                run_rdp_loop(this, cx, route, retry_rx, target_id, connect_started).await;
+            });
+            (None, None, task)
         } else {
             let ssh_conn = SshConnection::spawn(route.lock().expect("route mutex").clone());
             let task =
@@ -1272,6 +1508,8 @@ impl ServerSession {
             conn_info: stored_conn,
             connection: ssh_conn,
             telnet: telnet_conn,
+            rdp: None,
+            desktop: None,
             has_connected_once: false,
             browser: None,
             terminals: Vec::new(),
@@ -1477,6 +1715,10 @@ impl ServerSession {
         );
         self.connection = None;
         self.telnet = None;
+        self.rdp = None;
+        if let Some(desktop) = &self.desktop {
+            desktop.update(cx, |desktop, cx| desktop.disconnect(cx));
+        }
         self.probe_task = None;
         self.reconnecting = None;
         // Nothing is left to answer these prompts.
@@ -1973,12 +2215,18 @@ impl ServerSession {
         if let Some(terminal) = self.active_terminal() {
             return Some(terminal.read(cx).focus_handle(cx));
         }
-        [Link::Session, Link::Peer]
+        let prompt = [Link::Session, Link::Peer]
             .into_iter()
             .filter_map(|link| self.auth_prompt(link))
             .find_map(|prompt| prompt.inputs.first())
             .or(self.password_input.as_ref())
-            .map(|input| input.read(cx).focus_handle(cx))
+            .map(|input| input.read(cx).focus_handle(cx));
+        if prompt.is_some() {
+            return prompt;
+        }
+        self.desktop
+            .as_ref()
+            .map(|desktop| desktop.read(cx).focus_handle(cx))
     }
 
     /// The SFTP tab has to be on screen before a file pane can take the keys.
@@ -2594,7 +2842,8 @@ impl ServerSession {
 
         let has_terminal = self.active_terminal().is_some();
         let has_files = self.browser.is_some();
-        let content: AnyElement = if has_terminal || has_files {
+        let has_desktop = self.desktop.is_some();
+        let content: AnyElement = if has_terminal || has_files || has_desktop {
             // One fills the session: the SFTP tab, or the terminal. The strip
             // above switches between them. Cached so terminal output, which
             // redraws the session many times a second, leaves the file panes
@@ -2616,6 +2865,8 @@ impl ServerSession {
                         el.child(panel)
                     })
                     .into_any_element()
+            } else if let Some(desktop) = self.desktop.clone() {
+                div().size_full().child(desktop).into_any_element()
             } else if has_terminal {
                 self.render_terminal_block(cx)
             } else {
@@ -2636,7 +2887,7 @@ impl ServerSession {
                             // the other pane's strip stays with that pane. The
                             // strip stays up over the files too: its SFTP chip
                             // is what switches back to the terminal.
-                            .when(!self.layout_has_split(), |el| {
+                            .when(!self.layout_has_split() && self.desktop.is_none(), |el| {
                                 el.child(self.render_session_tabs(cx))
                             })
                             .child(div().flex_1().min_h_0().overflow_hidden().child(body)),
@@ -2942,6 +3193,14 @@ mod tests {
 
         let timed_out = futures::executor::block_on(finish_within(pending::<u8>(), ready(())));
         assert_eq!(timed_out, None);
+    }
+
+    #[test]
+    fn classic_rdp_security_is_explained_and_not_retried() {
+        let detail = r#"Error { context: "Initiation", kind: Reason("client advertised SSL | HYBRID | HYBRID_EX, but server selected STANDARD_RDP_SECURITY"), source: None }"#;
+        assert!(is_classic_rdp_security(detail));
+        assert!(readable_rdp_error(detail).contains("classic RDP security"));
+        assert!(!readable_rdp_error("ConnectorError: logon failed").contains("classic"));
     }
 
     #[test]

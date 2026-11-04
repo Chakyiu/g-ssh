@@ -451,7 +451,7 @@ impl Sidebar {
         let mut menu = PopoverMenu::new(("sidebar-host-more", ui_idx), is_menu_open, trigger)
             .anchor(Anchor::TopRight);
         menu = match kind {
-            ConnectionKind::Telnet => menu,
+            ConnectionKind::Telnet | ConnectionKind::Rdp => menu,
             ConnectionKind::Sftp => menu.item(
                 ContextMenuItem::new(
                     "sidebar-menu-terminal",
@@ -1543,7 +1543,20 @@ impl Sidebar {
         let (entry_id, position) = self.host_menu?;
         let kind = self.kind_of(entry_id, cx);
         let mut items = Vec::new();
-        if kind != ConnectionKind::Sftp {
+        if kind == ConnectionKind::Rdp {
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-desktop",
+                    "Open desktop",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::OpenServer(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/monitor.svg"),
+            );
+        } else if kind != ConnectionKind::Sftp {
             items.push(
                 ContextMenuItem::new(
                     "host-menu-terminal",

@@ -2,7 +2,7 @@
 name = "core"
 version = "0.1.2"
 edition = "2021"
-description = "The part of g-ssh without UI: SSH, SFTP, Telnet, terminal emulator, vault and sync"
+description = "The part of g-ssh without UI: SSH, SFTP, Telnet, RDP, terminal emulator, vault and sync"
 license = "MIT"
 publish = false
 
@@ -53,6 +53,11 @@ hkdf = "0.13"
 ed25519-dalek = "3"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 portable-pty = "0.9.0"
+# RDP. rustls accepts the self-signed certificate an RDP server presents;
+# CredSSP still checks that certificate's key.
+ironrdp-client = { version = "0.1", features = ["rustls"] }
+ironrdp-pdu = "0.9"
+smallvec = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -436,6 +436,25 @@ pub fn resolve_jump_chain<'a>(
     Ok(chain)
 }
 
+/// `mstsc` on Windows, `xfreerdp` elsewhere. The port is left off at 3389.
+pub fn rdp_command(entry: &ServerEntry) -> String {
+    let address = if entry.port == crate::ssh::connection::ConnectionKind::Rdp.default_port() {
+        entry.host.clone()
+    } else {
+        format!("{}:{}", entry.host, entry.port)
+    };
+    let address = shell_quote(&address);
+    if cfg!(windows) {
+        return format!("mstsc /v:{address}");
+    }
+    let mut command = format!("xfreerdp /v:{address}");
+    if !entry.username.is_empty() {
+        command.push_str(" /u:");
+        command.push_str(&shell_quote(&entry.username));
+    }
+    command
+}
+
 /// `telnet host [port]`. The port is left off when it is 23.
 pub fn telnet_command(entry: &ServerEntry) -> String {
     let host = shell_quote(&entry.host);

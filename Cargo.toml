@@ -2,7 +2,7 @@
 name = "g-ssh"
 version = "0.3.4"
 edition = "2021"
-description = "SSH, SFTP and Telnet client"
+description = "SSH, SFTP, Telnet and RDP client"
 license = "MIT"
 authors = ["chakyiu"]
 repository = "https://github.com/Chakyiu/g-ssh"
@@ -56,6 +56,9 @@ base64 = "0.23"
 async-channel = "2"
 futures = "0.3"
 gif = "0.14"
+# The remote desktop is painted from raw pixels. The buffer type is all this needs.
+image = { version = "0.25", default-features = false }
+smallvec = "1"
 
 secrecy = "0.10"
 zeroize = { version = "1", features = ["derive"] }
@@ -117,6 +120,15 @@ flate2 = { version = "1.1", default-features = false, features = [
 
 [workspace]
 members = [".", "core", "updater"]
+
+# ironrdp-connector 0.10 and sspi 0.21 pin picky 7.0.0-rc.25, whose RustCrypto
+# pre-releases cannot be selected beside the stable crates russh already uses.
+# third_party/picky is published 7.0.0-rc.29 (stable RustCrypto) with its
+# version kept at 7.0.0-rc.25 so the pin matches. third_party/sspi is 0.21.3
+# without the unused macOS pins that forced those same pre-releases.
+[patch.crates-io]
+picky = { path = "third_party/picky" }
+sspi = { path = "third_party/sspi" }
 
 # Style lints that the UI code trips on purpose: gpui handlers take many
 # arguments, and events carry whole entries.

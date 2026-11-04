@@ -39,7 +39,7 @@ pub enum VaultError {
     #[error("invalid SSH key: {0}")]
     InvalidKey(String),
 
-    #[error("'{0}' is a Telnet host, so it cannot be a jump host")]
+    #[error("'{0}' is not an SSH host, so it cannot be a jump host")]
     JumpNotSsh(String),
 
     #[error("'{0}' would be reached through itself")]

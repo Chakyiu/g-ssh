@@ -12,10 +12,10 @@ pub use crate::ssh::connection::{endpoint_label, ConnectionKind};
 pub use crypto::AgentChatKey;
 pub use error::VaultError;
 pub use model::{
-    resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, AgentSettings, AuthMethod,
-    Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary, ProxyKind,
-    ProxyMode, ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody, SnippetUsage,
-    SshKey, SshKeySummary, Tag, MAX_JUMP_HOSTS,
+    rdp_command, resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, AgentSettings,
+    AuthMethod, Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary,
+    ProxyKind, ProxyMode, ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody,
+    SnippetUsage, SshKey, SshKeySummary, Tag, MAX_JUMP_HOSTS,
 };
 pub use recovery::RecoveryPhrase;
 
@@ -821,7 +821,7 @@ impl VaultManager {
     fn check_jump_link(&self, id: Uuid, jump: Option<Uuid>) -> Result<(), VaultError> {
         let Some(jump_id) = jump else { return Ok(()) };
         let candidate = self.get_entry(jump_id)?;
-        if candidate.kind == crate::ssh::connection::ConnectionKind::Telnet {
+        if !candidate.kind.uses_ssh() {
             let name = if candidate.label.is_empty() {
                 candidate.host
             } else {
@@ -911,6 +911,9 @@ impl VaultManager {
         if entry.kind == crate::ssh::connection::ConnectionKind::Telnet {
             return Ok(telnet_command(entry));
         }
+        if entry.kind == crate::ssh::connection::ConnectionKind::Rdp {
+            return Ok(crate::vault::rdp_command(entry));
+        }
         let chain = resolve_jump_chain(entry, &self.payload.entries).unwrap_or_else(|e| {
             // A broken chain cannot be written as -J; the direct command beats copying nothing.
             tracing::warn!(error = %e, host = %entry.host, "jump chain is broken, copying the direct ssh command");
@@ -943,7 +946,7 @@ impl VaultManager {
         exclude: Option<Uuid>,
         behind: usize,
     ) -> bool {
-        if candidate.kind == crate::ssh::connection::ConnectionKind::Telnet {
+        if !candidate.kind.uses_ssh() {
             return false;
         }
         let Ok(chain) = resolve_jump_chain(candidate, &self.payload.entries) else {

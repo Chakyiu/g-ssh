@@ -27,8 +27,8 @@ const BLANK: &str = "\u{a0}";
 impl ServerPanel {
     fn render_identity(&self, cx: &Context<Self>) -> AnyElement {
         let Some(info) = &self.info else {
-            if self.is_telnet {
-                return identity_row(None, "Telnet".into(), None, cx).into_any_element();
+            if let Some(label) = self.idle_label {
+                return identity_row(None, label.into(), None, cx).into_any_element();
             }
             // The same two lines as below, so nothing moves when the info comes.
             let waiting = if self.is_local() {

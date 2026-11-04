@@ -1011,7 +1011,7 @@ impl AppView {
         let Some((snippet_id, script)) = startup else {
             return;
         };
-        if session.read(cx).conn_info.kind == ConnectionKind::Telnet {
+        if !session.read(cx).conn_info.kind.uses_ssh() {
             return;
         }
         let Some(shell) = session.read(cx).shell_handle(cx) else {
@@ -1157,14 +1157,14 @@ impl AppView {
     /// Open this host's files as their own tab. Connects first when the host
     /// is not already open.
     fn open_sftp_by_id(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self
+        let kind = self
             .vault_state
             .read(cx)
             .manager()
             .and_then(|vm| vm.get_entry(id).ok())
-            .is_some_and(|entry| entry.kind == ConnectionKind::Telnet)
-        {
-            self.set_status("Telnet hosts have no files.".to_string(), cx);
+            .map(|entry| entry.kind);
+        if let Some(kind) = kind.filter(|kind| !kind.uses_ssh()) {
+            self.set_status(format!("{} hosts have no files.", kind.label()), cx);
             return;
         }
         let server_id = id.to_string();
@@ -1198,7 +1198,7 @@ impl AppView {
             .manager()
             .and_then(|vm| vm.get_entry(id).ok());
         let Some(entry) = entry else { return };
-        if entry.kind == ConnectionKind::Telnet {
+        if !entry.kind.uses_ssh() {
             self.open_server(entry, window, cx);
             return;
         }
@@ -1525,7 +1525,9 @@ impl AppView {
 
         let intent = match entry.kind {
             ConnectionKind::Sftp => ConnectIntent::OpenSftp,
-            ConnectionKind::Ssh | ConnectionKind::Telnet => ConnectIntent::OpenTab,
+            ConnectionKind::Ssh | ConnectionKind::Telnet | ConnectionKind::Rdp => {
+                ConnectIntent::OpenTab
+            }
         };
         self.connect_with_prompt(entry, intent, window, cx);
     }
@@ -1731,6 +1733,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let is_telnet = entry.kind == ConnectionKind::Telnet;
+        let is_rdp = entry.kind == ConnectionKind::Rdp;
         let telnet = if is_telnet {
             match self.telnet_target(&entry, cx) {
                 Ok(target) => Some(target),
@@ -1746,6 +1749,18 @@ impl AppView {
         };
         let route = if is_telnet {
             direct_route(&entry)
+        } else if is_rdp {
+            let gssh::ssh::AuthCredential::Password(password) = &credential else {
+                self.forget_pending_snippet(entry.id);
+                self.set_status("RDP needs a password.".to_string(), cx);
+                return;
+            };
+            if let Some(message) = self.rdp_proxy_block(&entry, cx) {
+                self.forget_pending_snippet(entry.id);
+                self.set_status(message, cx);
+                return;
+            }
+            rdp_route(&entry, password.clone())
         } else {
             match self.build_route(&entry, credential, cx) {
                 Ok(route) => route,
@@ -2899,8 +2914,9 @@ impl AppView {
         let Some(session) = self.tabs.get(self.active_tab).cloned() else {
             return;
         };
-        if session.read(cx).conn_info.kind == ConnectionKind::Telnet {
-            self.set_status("Telnet hosts have no files.".to_string(), cx);
+        if !session.read(cx).conn_info.kind.uses_ssh() {
+            let label = session.read(cx).conn_info.kind.label();
+            self.set_status(format!("{label} hosts have no files."), cx);
             return;
         }
         if !session.read(cx).has_files() {
@@ -3345,7 +3361,7 @@ fn quick_connect_entry(
 fn primary_work(kind: ConnectionKind) -> WorkKind {
     match kind {
         ConnectionKind::Sftp => WorkKind::Sftp,
-        ConnectionKind::Ssh | ConnectionKind::Telnet => WorkKind::Terminal,
+        ConnectionKind::Ssh | ConnectionKind::Telnet | ConnectionKind::Rdp => WorkKind::Terminal,
     }
 }
 
@@ -3367,7 +3383,33 @@ fn direct_route(entry: &ServerEntry) -> SshRoute {
     }
 }
 
+/// A route the session stores for an RDP host. IronRDP dials from the
+/// password on the target, including a password retyped on the error card.
+fn rdp_route(entry: &ServerEntry, password: Zeroizing<String>) -> SshRoute {
+    SshRoute {
+        jumps: Vec::new(),
+        target: SshHop {
+            entry_id: entry.id.to_string(),
+            label: entry.label.clone(),
+            host: entry.host.clone(),
+            port: entry.port,
+            username: entry.username.clone(),
+            credential: AuthCredential::Password(password),
+            expected_host_key: None,
+        },
+        proxy: None,
+    }
+}
+
 impl AppView {
+    /// IronRDP dials the host itself, so a saved proxy would be skipped silently.
+    fn rdp_proxy_block(&self, entry: &ServerEntry, cx: &App) -> Option<String> {
+        let vault = self.vault_state.read(cx);
+        let vm = vault.manager()?;
+        route::resolved_proxy(vm, entry.id)
+            .map(|_| "RDP dials the host directly, and this host uses a proxy.".to_string())
+    }
+
     fn telnet_target(&self, entry: &ServerEntry, cx: &App) -> Result<TelnetTarget, String> {
         let vault = self.vault_state.read(cx);
         let Some(vm) = vault.manager() else {

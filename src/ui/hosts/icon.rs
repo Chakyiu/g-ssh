@@ -71,12 +71,13 @@ pub fn distro_mark(os: &str) -> Option<DistroMark> {
 }
 
 /// The mark for how a host is reached: a terminal for SSH, a folder for
-/// SFTP, a network for Telnet.
+/// SFTP, a network for Telnet, a monitor for RDP.
 pub fn connection_icon(kind: ConnectionKind) -> &'static str {
     match kind {
         ConnectionKind::Ssh => "icons/square-terminal.svg",
         ConnectionKind::Sftp => "icons/folder-open.svg",
         ConnectionKind::Telnet => "icons/network.svg",
+        ConnectionKind::Rdp => "icons/monitor.svg",
     }
 }
 
@@ -282,6 +283,7 @@ mod tests {
             ConnectionKind::Ssh,
             ConnectionKind::Sftp,
             ConnectionKind::Telnet,
+            ConnectionKind::Rdp,
         ] {
             let icon = connection_icon(kind);
             assert!(assets.join(icon).exists(), "{kind:?}: {icon} is missing");
