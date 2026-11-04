@@ -46,10 +46,9 @@ pub fn dialog_wide() -> gpui::Pixels {
     scale::px(480.)
 }
 
-/// The host form: user, host and port share a row, and so do the folder and
-/// the tags.
+/// The connection editor: a nav rail beside one settings page.
 pub fn dialog_form() -> gpui::Pixels {
-    scale::px(620.)
+    scale::px(860.)
 }
 
 /// The four-layer shadow Zed gives its modals, shared by dialogs, the palette

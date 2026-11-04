@@ -5,13 +5,17 @@
 //! IronRDP's own reconnect. Jump hosts and the vault's proxy are not on this
 //! path: IronRDP dials the address itself.
 
+mod clipboard;
+
 use std::sync::Arc;
 
-use ironrdp_client::config::{ConfigBuilder, Destination};
+use clipboard::SharedClipboard;
+use ironrdp_client::config::{ClipboardType, ConfigBuilder, Destination};
 use ironrdp_client::rdp::{RdpClient, RdpInputEvent, RdpOutputEvent};
 use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
+use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
@@ -19,6 +23,9 @@ use zeroize::Zeroizing;
 /// First desktop, until the view has measured itself and asks for its own size.
 pub const DEFAULT_WIDTH: u16 = 1280;
 pub const DEFAULT_HEIGHT: u16 = 720;
+
+/// The most events one fast-path input packet can carry. A long paste needs several.
+const MAX_FAST_PATH_EVENTS: usize = 255;
 
 /// One decoded desktop. Pixels are BGRA, top to bottom, with a full alpha byte.
 #[derive(Clone)]
@@ -37,6 +44,8 @@ pub enum RdpEvent {
         height: u16,
     },
     Failed(String),
+    /// Text copied on the remote, for the local clipboard.
+    RemoteClipboard(String),
     Closed {
         message: String,
         is_transient: bool,
@@ -52,7 +61,8 @@ pub enum RdpButton {
 }
 
 /// One thing to send. Several of these in one [`RdpConnection::send`] leave as
-/// one fast-path packet, so a modifier and its key stay together.
+/// one fast-path packet, up to [`MAX_FAST_PATH_EVENTS`], so a modifier and its
+/// key stay together.
 #[derive(Clone)]
 pub enum RdpInput {
     Move {
@@ -100,6 +110,87 @@ pub fn split_account(raw: &str) -> (String, String) {
     (user.to_string(), domain.to_string())
 }
 
+/// The smallest and largest fixed desktop side a host can save.
+pub const MIN_FIXED_SIDE: u16 = 200;
+pub const MAX_FIXED_SIDE: u16 = 8192;
+
+/// How an RDP host's desktop is shaped. Saved with the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RdpSettings {
+    #[serde(default)]
+    pub resolution: RdpResolution,
+    #[serde(default)]
+    pub color_depth: RdpColorDepth,
+    #[serde(default)]
+    pub scale: RdpScale,
+    /// Play the remote session's sound here.
+    #[serde(default)]
+    pub audio: bool,
+    /// Share text copied on either side.
+    #[serde(default)]
+    pub clipboard: bool,
+}
+
+impl RdpSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode")]
+pub enum RdpResolution {
+    /// The desktop follows the tab, and is resized when the tab is.
+    #[default]
+    FitWindow,
+    /// The desktop keeps this size and is scaled to fit the tab.
+    Fixed { width: u16, height: u16 },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpColorDepth {
+    #[default]
+    Bits32,
+    Bits24,
+    Bits16,
+    Bits15,
+}
+
+impl RdpColorDepth {
+    pub fn bits(self) -> u32 {
+        match self {
+            Self::Bits32 => 32,
+            Self::Bits24 => 24,
+            Self::Bits16 => 16,
+            Self::Bits15 => 15,
+        }
+    }
+}
+
+/// How large the remote session draws text and controls. The server may
+/// ignore it: Windows follows it, xrdp leaves it to the desktop it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpScale {
+    #[default]
+    Percent100,
+    Percent125,
+    Percent150,
+    Percent200,
+}
+
+impl RdpScale {
+    pub fn percent(self) -> u32 {
+        match self {
+            Self::Percent100 => 100,
+            Self::Percent125 => 125,
+            Self::Percent150 => 150,
+            Self::Percent200 => 200,
+        }
+    }
+}
+
 /// Where an RDP session dials, and the account that signs in.
 pub struct RdpTarget {
     pub host: String,
@@ -109,26 +200,42 @@ pub struct RdpTarget {
     pub password: Zeroizing<String>,
     pub width: u16,
     pub height: u16,
+    pub color_depth: RdpColorDepth,
+    pub scale: RdpScale,
+    pub audio: bool,
+    pub clipboard: bool,
 }
 
 impl RdpTarget {
+    /// A fixed resolution is the first desktop. Fitting the window starts at
+    /// the default and resizes once the view has measured itself.
     pub fn new(
         host: String,
         port: u16,
         account: &str,
         password: Zeroizing<String>,
-        width: u16,
-        height: u16,
+        settings: RdpSettings,
     ) -> Self {
         let (username, domain) = split_account(account);
+        let (width, height) = match settings.resolution {
+            RdpResolution::FitWindow => (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+            RdpResolution::Fixed { width, height } => (
+                width.clamp(MIN_FIXED_SIDE, MAX_FIXED_SIDE),
+                height.clamp(MIN_FIXED_SIDE, MAX_FIXED_SIDE),
+            ),
+        };
         Self {
             host,
             port,
             username,
             domain,
             password,
-            width: width.max(1),
-            height: height.max(1),
+            width,
+            height,
+            color_depth: settings.color_depth,
+            scale: settings.scale,
+            audio: settings.audio,
+            clipboard: settings.clipboard,
         }
     }
 }
@@ -150,6 +257,9 @@ pub struct RdpConnection {
     send: Arc<RdpSend>,
     event_rx: async_channel::Receiver<RdpEvent>,
     frame_rx: watch::Receiver<Option<RdpFrame>>,
+    /// Sent again with every resize, or the server falls back to 100%.
+    scale: RdpScale,
+    clipboard: Option<SharedClipboard>,
 }
 
 impl RdpConnection {
@@ -157,9 +267,18 @@ impl RdpConnection {
         let (event_tx, event_rx) = async_channel::bounded(8);
         let (frame_tx, frame_rx) = watch::channel(None);
         let (output_tx, output_rx) = mpsc::channel(2);
-        let built = build_client(&target, output_tx);
-        let input = match &built {
-            Ok(client) => client.input_sender(),
+        let mut built = build_client(&target, output_tx);
+        let mut clipboard = None;
+        let input = match &mut built {
+            Ok(client) => {
+                let input = client.input_sender();
+                if target.clipboard {
+                    let shared = SharedClipboard::new(input.clone(), event_tx.clone());
+                    client.set_clipboard_backend(Box::new(shared.clone()));
+                    clipboard = Some(shared);
+                }
+                input
+            }
             Err(error) => {
                 tracing::warn!(host = %target.host, port = target.port, error, "rdp config rejected");
                 let _ = event_tx.try_send(RdpEvent::Failed(error.clone()));
@@ -187,6 +306,21 @@ impl RdpConnection {
             send: Arc::new(RdpSend { input }),
             event_rx,
             frame_rx,
+            scale: target.scale,
+            clipboard,
+        }
+    }
+
+    /// Whether this session shares the clipboard.
+    pub fn shares_clipboard(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// Put local text on the remote clipboard. Text the remote already has is
+    /// skipped, so this is cheap to call whenever the view is touched.
+    pub fn offer_clipboard(&self, text: String) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.offer(text);
         }
     }
 
@@ -263,14 +397,17 @@ impl RdpConnection {
                 RdpInput::Close => close = true,
             }
         }
-        if !fast_path.is_empty() {
-            let _ = self.send.input.send(RdpInputEvent::FastPath(fast_path));
+        for packet in fast_path.chunks(MAX_FAST_PATH_EVENTS) {
+            let _ = self
+                .send
+                .input
+                .send(RdpInputEvent::FastPath(SmallVec::from_slice(packet)));
         }
         if let Some((width, height)) = resize {
             let _ = self.send.input.send(RdpInputEvent::Resize {
                 width,
                 height,
-                scale_factor: 100,
+                scale_factor: self.scale.percent(),
                 physical_size: None,
             });
         }
@@ -365,9 +502,19 @@ fn build_client(
         .with_platform(MajorPlatformType::UNSPECIFIED)
         .with_desktop_width(target.width)
         .with_desktop_height(target.height)
-        .with_desktop_scale_factor(100)
+        .with_desktop_scale_factor(target.scale.percent())
+        .with_color_depth(target.color_depth.bits())
+        .with_sound(target.audio)
+        .with_clipboard(if target.clipboard {
+            ClipboardType::Enable
+        } else {
+            ClipboardType::Disable
+        })
         .with_credssp(true)
         .with_tls(true)
+        // xrdp without a readable TLS certificate answers with standard RDP security
+        // whatever the client offers.
+        .with_standard_security(true)
         .with_autologon(true)
         // The view draws its own pointer. The server's sprite would sit on
         // top of it inside the framebuffer.

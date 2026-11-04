@@ -34,7 +34,7 @@ use gpui_component::{
     spinner::Spinner,
     v_flex, ActiveTheme as _, Sizable as _, StyledExt as _, WindowExt as _,
 };
-use gssh::rdp::{RdpConnection, RdpEvent, RdpTarget, DEFAULT_HEIGHT, DEFAULT_WIDTH};
+use gssh::rdp::{RdpConnection, RdpEvent, RdpResolution, RdpSettings, RdpTarget};
 use gssh::ssh::connection::{Connection, ForwardSpec};
 use gssh::ssh::shell::ShellHandle;
 use gssh::ssh::{
@@ -958,13 +958,14 @@ async fn run_rdp_loop(
     this: WeakEntity<ServerSession>,
     cx: &mut AsyncApp,
     route: Arc<Mutex<SshRoute>>,
+    settings: RdpSettings,
     retry_rx: async_channel::Receiver<()>,
     target_id: String,
     mut connect_started: Instant,
 ) {
     let mut attempt: u32 = 0;
     loop {
-        let Some(target) = rdp_target_from_route(&route) else {
+        let Some(target) = rdp_target_from_route(&route, settings) else {
             let _ = this.update(cx, |session, cx| {
                 session.give_up(
                     ConnectFailure {
@@ -1047,7 +1048,7 @@ async fn run_rdp_loop(
     }
 }
 
-fn rdp_target_from_route(route: &Arc<Mutex<SshRoute>>) -> Option<RdpTarget> {
+fn rdp_target_from_route(route: &Arc<Mutex<SshRoute>>, settings: RdpSettings) -> Option<RdpTarget> {
     let route = route.lock().expect("route mutex");
     let gssh::ssh::AuthCredential::Password(password) = &route.target.credential else {
         return None;
@@ -1057,8 +1058,7 @@ fn rdp_target_from_route(route: &Arc<Mutex<SshRoute>>) -> Option<RdpTarget> {
         route.target.port,
         &route.target.username,
         password.clone(),
-        DEFAULT_WIDTH,
-        DEFAULT_HEIGHT,
+        settings,
     ))
 }
 
@@ -1085,7 +1085,10 @@ async fn drive_rdp(
                         "rdp session ready"
                     );
                     if session.desktop.is_none() {
-                        let desktop = cx.new(|cx| desktop::DesktopView::new(conn.clone(), cx));
+                        let follows_window =
+                            session.conn_info.rdp.resolution == RdpResolution::FitWindow;
+                        let desktop = cx
+                            .new(|cx| desktop::DesktopView::new(conn.clone(), follows_window, cx));
                         session.desktop = Some(desktop);
                     }
                     session.has_connected_once = true;
@@ -1113,6 +1116,9 @@ async fn drive_rdp(
                     is_password_rejected: is_logon_failure(&detail),
                     is_transient: !is_logon_failure(&detail) && !is_classic_rdp_security(&detail),
                 }));
+            }
+            RdpEvent::RemoteClipboard(text) => {
+                cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
             }
             RdpEvent::Closed {
                 message,
@@ -1372,10 +1378,20 @@ impl ServerSession {
             (None, Some(telnet), task)
         } else if conn_info.kind == ConnectionKind::Rdp {
             let route = route.clone();
+            let settings = conn_info.rdp;
             let retry_rx = retry_rx.clone();
             let target_id = server_id.clone();
             let task = cx.spawn(async move |this, cx| {
-                run_rdp_loop(this, cx, route, retry_rx, target_id, connect_started).await;
+                run_rdp_loop(
+                    this,
+                    cx,
+                    route,
+                    settings,
+                    retry_rx,
+                    target_id,
+                    connect_started,
+                )
+                .await;
             });
             (None, None, task)
         } else {

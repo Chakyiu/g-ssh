@@ -6,6 +6,8 @@ pub struct Connection {
     pub port: u16,
     pub username: String,
     pub kind: ConnectionKind,
+    /// Only read for an RDP host.
+    pub rdp: crate::rdp::RdpSettings,
 }
 
 /// How a saved host is reached. Missing from older connection files, which

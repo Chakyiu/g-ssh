@@ -33,6 +33,8 @@ pub(crate) struct DesktopView {
     /// The picture just replaced, dropped from the atlas on the next paint.
     retired: Option<Arc<RenderImage>>,
     frame: Option<RdpFrame>,
+    /// The desktop is resized with the tab. A fixed one is only scaled.
+    follows_window: bool,
     /// What the server is showing, once a frame has said so.
     asked: Option<(u16, u16)>,
     pending_size: Option<(u16, u16)>,
@@ -72,7 +74,7 @@ impl HeldKey {
 }
 
 impl DesktopView {
-    pub(crate) fn new(conn: RdpConnection, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(conn: RdpConnection, follows_window: bool, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let mut view = Self {
             focus_handle,
@@ -81,6 +83,7 @@ impl DesktopView {
             image: None,
             retired: None,
             frame: None,
+            follows_window,
             asked: None,
             pending_size: None,
             resize_task: None,
@@ -150,7 +153,7 @@ impl DesktopView {
     }
 
     fn note_layout(&mut self, bounds: Bounds<Pixels>, window: &Window, cx: &mut Context<Self>) {
-        if self.conn.is_none() {
+        if self.conn.is_none() || !self.follows_window {
             return;
         }
         let scale = window.scale_factor();
@@ -182,6 +185,17 @@ impl DesktopView {
         }
     }
 
+    /// Hand the local clipboard text to the remote before a click or a
+    /// shortcut that may paste it there.
+    fn offer_clipboard(&self, cx: &gpui::App) {
+        let Some(conn) = self.conn.as_ref().filter(|conn| conn.shares_clipboard()) else {
+            return;
+        };
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            conn.offer_clipboard(text);
+        }
+    }
+
     fn remote_point(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
         let frame = self.frame.as_ref()?;
         let bounds = self.layout.get();
@@ -210,6 +224,7 @@ impl DesktopView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
+        self.offer_clipboard(cx);
         self.pointer_button(event.button, event.position, true);
         cx.stop_propagation();
     }
@@ -275,6 +290,7 @@ impl DesktopView {
         }
         let mut inputs = Vec::new();
         if is_modifier_key(&event.keystroke.key) {
+            self.offer_clipboard(cx);
             inputs.extend(self.sync_mods(&event.keystroke, true));
             self.send(&inputs);
             cx.stop_propagation();
@@ -342,7 +358,8 @@ impl DesktopView {
         }
     }
 
-    /// Local clipboard, typed in. The remote clipboard is a later channel.
+    /// Local clipboard, typed in, which works in any remote app. A shared
+    /// clipboard also gets the text, for the remote's own paste.
     fn try_paste(&mut self, keystroke: &Keystroke, cx: &Context<Self>) -> bool {
         if keystroke.key != "v" || !is_secondary(&keystroke.modifiers) || keystroke.modifiers.shift
         {
@@ -351,6 +368,9 @@ impl DesktopView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return true;
         };
+        if let Some(conn) = self.conn.as_ref() {
+            conn.offer_clipboard(text.clone());
+        }
         let mut inputs = self.sync_mods(keystroke, false);
         if let Some(held) = self.held.take() {
             inputs.insert(0, held.release());

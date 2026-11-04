@@ -1707,6 +1707,7 @@ mod tests {
             forwards: Vec::new(),
             startup_snippet: None,
             snippets: Vec::new(),
+            rdp: Default::default(),
             sort_order: 0,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,

@@ -783,6 +783,10 @@ pub struct ServerEntry {
     pub startup_snippet: Option<Uuid>,
     #[serde(default)]
     pub snippets: Vec<HostSnippet>,
+    /// Desktop size and colours for an RDP host. Omitted while it is the
+    /// default, so the other kinds and an older record stay the same bytes.
+    #[serde(default, skip_serializing_if = "crate::rdp::RdpSettings::is_default")]
+    pub rdp: crate::rdp::RdpSettings,
     /// Place in the host's folder. `0` means it has never been placed, so it
     /// sorts by name after the hosts that have a place. Omitted from the file
     /// and from sync while it is `0`, so an older record stays the same bytes.

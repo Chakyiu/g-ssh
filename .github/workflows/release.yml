@@ -50,6 +50,7 @@ jobs:
       - uses: actions/checkout@v7
 
       # Wayland, X11, Vulkan, and fontconfig. gpui links these on Linux.
+      # ALSA is for RDP audio.
       - name: Install Linux libraries
         if: runner.os == 'Linux'
         run: |
@@ -62,7 +63,8 @@ jobs:
             libx11-xcb-dev libxcb1-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libssl-dev \
-            libvulkan-dev
+            libvulkan-dev \
+            libasound2-dev
 
       # With no arguments rustup installs the compiler pinned in rust-toolchain.toml.
       - name: Install Rust

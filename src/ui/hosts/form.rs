@@ -13,7 +13,6 @@ use gpui::{
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
-    dialog::DialogHeader,
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     radio::{Radio, RadioGroup},
@@ -25,6 +24,9 @@ use crate::ui::dialog_max_height;
 use crate::ui::menu::AnchoredToTrigger;
 
 use crate::ui::VaultState;
+use gssh::rdp::{
+    RdpColorDepth, RdpResolution, RdpScale, RdpSettings, MAX_FIXED_SIDE, MIN_FIXED_SIDE,
+};
 use gssh::ssh::connection::{is_loopback_bind, ForwardKind};
 use gssh::ssh::target::{find_saved_jump_host, parse_host_field};
 use gssh::vault::{
@@ -36,6 +38,17 @@ pub enum FormMode {
     Add,
     Edit { id: Uuid, created_at: i64 },
 }
+
+/// Matches [`MIN_FIXED_SIDE`] and [`MAX_FIXED_SIDE`].
+const DESKTOP_SIZE_HINT: &str = "A fixed desktop is 200 to 8192 pixels a side.";
+
+/// Common desktop sizes, one click from the Width and Height fields.
+const DESKTOP_PRESETS: [(u16, u16, &str); 4] = [
+    (1280, 720, "1280 × 720"),
+    (1920, 1080, "1920 × 1080"),
+    (2560, 1440, "2560 × 1440"),
+    (3840, 2160, "3840 × 2160"),
+];
 
 // Boxing would move the entry's credentials onto the heap for no real gain:
 // the event is emitted once per save.
@@ -68,6 +81,82 @@ enum FormState {
     EditingForward,
 }
 
+/// One page of the connection editor. The rail lists only the pages the
+/// current connection type can use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormPage {
+    Connection,
+    Authentication,
+    JumpHost,
+    Tunnels,
+    Session,
+}
+
+impl FormPage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection",
+            Self::Authentication => "Authentication",
+            Self::JumpHost => "Jump Host",
+            Self::Tunnels => "Tunnels",
+            Self::Session => "Session",
+        }
+    }
+
+    fn group(self) -> &'static str {
+        match self {
+            Self::Connection | Self::Authentication => "Terminal",
+            Self::JumpHost => "Common",
+            Self::Tunnels | Self::Session => "Advanced",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Connection => 0,
+            Self::Authentication => 1,
+            Self::JumpHost => 2,
+            Self::Tunnels => 3,
+            Self::Session => 4,
+        }
+    }
+
+    fn subtitle(self, kind: ConnectionKind) -> &'static str {
+        match self {
+            Self::Connection => "Basic identification and network endpoint for this session.",
+            Self::Authentication => "How this session signs in.",
+            Self::JumpHost => "Reach this host through another connection.",
+            Self::Tunnels => "Ports opened through this connection.",
+            Self::Session if kind == ConnectionKind::Rdp => {
+                "Desktop size and colours for this session."
+            }
+            Self::Session => "What is sent to the terminal after every connect.",
+        }
+    }
+
+    fn available_for(self, kind: ConnectionKind) -> bool {
+        match self {
+            Self::Connection => true,
+            Self::Authentication => kind != ConnectionKind::Telnet,
+            Self::JumpHost | Self::Tunnels => kind.uses_ssh(),
+            Self::Session => kind.uses_ssh() || kind == ConnectionKind::Rdp,
+        }
+    }
+
+    fn for_kind(kind: ConnectionKind) -> Vec<Self> {
+        [
+            Self::Connection,
+            Self::Authentication,
+            Self::JumpHost,
+            Self::Tunnels,
+            Self::Session,
+        ]
+        .into_iter()
+        .filter(|page| page.available_for(kind))
+        .collect()
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum PemSource {
     File,
@@ -90,6 +179,15 @@ pub struct ServerFormView {
     user_input: Entity<InputState>,
     pass_input: Entity<InputState>,
 
+    /// RDP: keep the desktop at the size below instead of following the tab.
+    rdp_fixed_size: bool,
+    rdp_width: Entity<InputState>,
+    rdp_height: Entity<InputState>,
+    rdp_color_depth: RdpColorDepth,
+    rdp_scale: RdpScale,
+    rdp_audio: bool,
+    rdp_clipboard: bool,
+
     vault_state: Entity<VaultState>,
     selected_key_id: Option<Uuid>,
     key_dropdown_open: bool,
@@ -105,9 +203,9 @@ pub struct ServerFormView {
     startup_command_id: Option<Uuid>,
     /// Carried through, so that a save keeps the ones made in the server panel.
     host_snippets: Vec<HostSnippet>,
-    /// The jump host, the startup snippet and the forwards are folded away
-    /// unless the host uses one of them.
-    is_advanced_open: bool,
+    /// The rail's current page.
+    page: FormPage,
+    kind_dropdown_open: bool,
 
     /// Folder path as typed/picked ("infra / web"); empty = ungrouped.
     /// Resolved to group ids on submit, creating missing folders.
@@ -287,12 +385,30 @@ impl ServerFormView {
                 .default_value(SharedString::from(password))
         });
 
+        let rdp = prefill.as_ref().map(|e| e.rdp).unwrap_or_default();
+        let (rdp_fixed_size, width, height) = match rdp.resolution {
+            RdpResolution::FitWindow => (false, 1920, 1080),
+            RdpResolution::Fixed { width, height } => (true, width, height),
+        };
+        let rdp_width = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("1920")
+                .default_value(SharedString::from(width.to_string()))
+        });
+        let rdp_height = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("1080")
+                .default_value(SharedString::from(height.to_string()))
+        });
+
         for input in [
             &name_input,
             &host_input,
             &port_input,
             &user_input,
             &pass_input,
+            &rdp_width,
+            &rdp_height,
         ] {
             cx.subscribe(input, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::PressEnter { .. })
@@ -374,6 +490,13 @@ impl ServerFormView {
             port_input,
             user_input,
             pass_input,
+            rdp_fixed_size,
+            rdp_width,
+            rdp_height,
+            rdp_color_depth: rdp.color_depth,
+            rdp_scale: rdp.scale,
+            rdp_audio: rdp.audio,
+            rdp_clipboard: rdp.clipboard,
             vault_state,
             selected_key_id,
             key_dropdown_open: false,
@@ -383,9 +506,8 @@ impl ServerFormView {
             startup_command,
             startup_command_id,
             host_snippets,
-            is_advanced_open: prefill.as_ref().is_some_and(|e| {
-                e.jump_host.is_some() || e.startup_snippet.is_some() || !e.forwards.is_empty()
-            }),
+            page: FormPage::Connection,
+            kind_dropdown_open: false,
             startup_dropdown_open: false,
             group_input,
             tag_names,
@@ -513,7 +635,7 @@ impl ServerFormView {
             return false;
         }
         if self.kind == ConnectionKind::Rdp {
-            return !self.pass_input.read(cx).value().is_empty();
+            return !self.pass_input.read(cx).value().is_empty() && self.rdp_settings(cx).is_some();
         }
 
         match self.auth_mode {
@@ -522,6 +644,31 @@ impl ServerFormView {
             // The agent supplies the keys; nothing to fill in here.
             AuthMode::Agent => true,
         }
+    }
+
+    /// The display settings as typed, or `None` while a fixed size is out of range.
+    fn rdp_settings(&self, cx: &App) -> Option<RdpSettings> {
+        let resolution = if self.rdp_fixed_size {
+            let side = |input: &Entity<InputState>| {
+                strip_whitespace(&input.read(cx).value())
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|side| (MIN_FIXED_SIDE..=MAX_FIXED_SIDE).contains(side))
+            };
+            RdpResolution::Fixed {
+                width: side(&self.rdp_width)?,
+                height: side(&self.rdp_height)?,
+            }
+        } else {
+            RdpResolution::FitWindow
+        };
+        Some(RdpSettings {
+            resolution,
+            color_depth: self.rdp_color_depth,
+            scale: self.rdp_scale,
+            audio: self.rdp_audio,
+            clipboard: self.rdp_clipboard,
+        })
     }
 
     /// Move the tag input's text into the chip list (deduplicated,
@@ -785,6 +932,16 @@ impl ServerFormView {
         };
 
         let (startup_snippet, snippets) = self.startup_and_snippets(cx);
+        let rdp = if self.kind == ConnectionKind::Rdp {
+            let Some(rdp) = self.rdp_settings(cx) else {
+                self.error = Some(DESKTOP_SIZE_HINT.to_string());
+                cx.notify();
+                return;
+            };
+            rdp
+        } else {
+            RdpSettings::default()
+        };
         let now = unix_now();
         let entry = match &self.mode {
             FormMode::Add => ServerEntry {
@@ -808,6 +965,7 @@ impl ServerFormView {
                 forwards: self.forwards_to_save(),
                 startup_snippet,
                 snippets,
+                rdp,
                 sort_order: 0,
                 created_at: now,
                 updated_at: now,
@@ -835,6 +993,7 @@ impl ServerFormView {
                 forwards: self.forwards_to_save(),
                 startup_snippet,
                 snippets,
+                rdp,
                 sort_order: 0,
                 created_at: *created_at,
                 updated_at: now,
@@ -860,6 +1019,9 @@ impl ServerFormView {
         self.kind = kind;
         if kind == ConnectionKind::Rdp {
             self.auth_mode = AuthMode::Password;
+        }
+        if !self.page.available_for(kind) {
+            self.page = FormPage::Connection;
         }
         self.close_dropdowns(cx);
         cx.notify();
@@ -1039,7 +1201,6 @@ impl Render for ServerFormView {
         let list_hover = crate::theme::field();
         let inner_radius = px(6.);
 
-        let is_edit = matches!(self.mode, FormMode::Edit { .. });
         let is_valid = self.is_valid(cx);
         let footer_message = self
             .error
@@ -1114,8 +1275,7 @@ impl Render for ServerFormView {
         let group_field = v_flex()
             .gap(px(6.))
             .capture_key_down(cx.listener(Self::on_group_key))
-            .child(field_label("Group", cx))
-            .child(Input::new(&self.group_input))
+            .child(Input::new(&self.group_input).appearance(false))
             .when(group_focused && !group_suggestions.is_empty(), |el| {
                 el.child(
                     v_flex()
@@ -1207,9 +1367,8 @@ impl Render for ServerFormView {
         let tags_field = v_flex()
             .gap(px(6.))
             .capture_key_down(cx.listener(Self::on_tag_key))
-            .child(field_label("Tags", cx))
             .when(!self.tag_names.is_empty(), |el| el.child(chips))
-            .child(Input::new(&self.tag_input))
+            .child(Input::new(&self.tag_input).appearance(false))
             .when(
                 tag_focused
                     && (!tag_suggestions.is_empty() || (!tag_text.is_empty() && !exact_match)),
@@ -1269,10 +1428,9 @@ impl Render for ServerFormView {
             );
 
         let auth_body: gpui::AnyElement = match self.auth_mode {
-            AuthMode::Password => {
-                labeled("Password", cx, Input::new(&self.pass_input).mask_toggle())
-                    .into_any_element()
-            }
+            AuthMode::Password => Input::new(&self.pass_input)
+                .mask_toggle()
+                .into_any_element(),
 
             AuthMode::PrivateKey => {
                 let display_label = match self.selected_key_id {
@@ -1293,7 +1451,6 @@ impl Render for ServerFormView {
 
                 v_flex()
                     .gap(px(6.))
-                    .child(field_label("SSH key", cx))
                     .child(dropdown_trigger(
                         "key-dropdown-btn",
                         display_label,
@@ -1363,20 +1520,7 @@ impl Render for ServerFormView {
                 cx.notify();
             },
         );
-        let kind_switch = segmented(
-            "connection-kind",
-            &[
-                (ConnectionKind::Ssh, "SSH"),
-                (ConnectionKind::Sftp, "SFTP"),
-                (ConnectionKind::Telnet, "Telnet"),
-                (ConnectionKind::Rdp, "RDP"),
-            ],
-            self.kind,
-            cx,
-            |this, kind, window, cx| this.pick_kind(kind, window, cx),
-        );
         let is_telnet = self.kind == ConnectionKind::Telnet;
-        let is_rdp = self.kind == ConnectionKind::Rdp;
         let kind_note = match self.kind {
             ConnectionKind::Ssh => None,
             ConnectionKind::Sftp => {
@@ -1388,180 +1532,307 @@ impl Render for ServerFormView {
             }
         };
 
-        // User @ host : port, the order ssh writes it in. A pasted
-        // `user@host:port` in the host field is split across the three.
-        // Telnet has no user until the remote login asks.
-        let address_row = h_flex()
-            .gap(px(8.))
-            .items_end()
-            .when(!is_telnet, |row| {
-                row.child(
-                    labeled("User", cx, Input::new(&self.user_input))
-                        .w(px(150.))
-                        .flex_shrink(1.),
-                )
-                .child(address_separator("@"))
-            })
-            .child(
-                labeled("Host", cx, Input::new(&self.host_input))
-                    .flex_1()
-                    .min_w(px(120.)),
-            )
-            .child(address_separator(":"))
-            .child(
-                labeled("Port", cx, Input::new(&self.port_input))
-                    .w(px(76.))
-                    .flex_none(),
-            );
-
-        let advanced_summary = self.advanced_summary(cx);
-        let is_advanced_open = self.is_advanced_open;
-        let advanced_toggle = h_flex()
-            .id("advanced-toggle")
-            .w_full()
-            .h(px(32.))
-            .gap(px(8.))
-            .items_center()
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.is_advanced_open = !this.is_advanced_open;
-                // A panel left open would hang where its field used to be.
-                this.close_dropdowns(cx);
-            }))
-            .child(
-                Icon::new(if is_advanced_open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(px(14.))
-                .text_color(muted_fg),
-            )
-            .child(section_title("Advanced", cx))
-            .when(!is_advanced_open, |el| {
-                el.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(12.))
-                        .text_color(crate::theme::text_dim())
-                        .child(advanced_summary),
-                )
-            });
-
-        let fields = v_flex()
-            .id("server-form-fields")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            // An open panel stays where its field was and is not clipped by
-            // the dialog, so it closes rather than float over the header.
-            .on_scroll(cx.listener(|this, _, _, cx| this.close_dropdowns(cx)))
-            .px(px(16.))
-            .pt(px(4.))
-            .pb(px(16.))
-            .gap(px(20.))
-            .child(
-                v_flex()
-                    .gap(px(12.))
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(section_title("Connection", cx))
-                            .child(kind_switch),
-                    )
-                    .when_some(kind_note, |column, note| {
-                        column.child(div().text_size(px(12.)).text_color(muted_fg).child(note))
-                    })
-                    .child(address_row)
-                    .child(labeled("Name", cx, Input::new(&self.name_input))),
-            )
-            .when(self.kind.uses_ssh(), |column| {
-                column.child(
-                    v_flex()
-                        .gap(px(12.))
-                        .child(
-                            h_flex()
-                                .justify_between()
+        let active = if self.page.available_for(self.kind) {
+            self.page
+        } else {
+            FormPage::Connection
+        };
+        let mut kind_popup: Option<AnyElement> = None;
+        let page_body: AnyElement = match active {
+            FormPage::Connection => {
+                let kind_anchor: Rc<Cell<Point<Pixels>>> = Rc::new(Cell::new(Point::default()));
+                let kind_trigger: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
+                if self.kind_dropdown_open {
+                    const KINDS: [(ConnectionKind, &str); 4] = [
+                        (ConnectionKind::Ssh, "SSH"),
+                        (ConnectionKind::Sftp, "SFTP"),
+                        (ConnectionKind::Telnet, "Telnet"),
+                        (ConnectionKind::Rdp, "RDP"),
+                    ];
+                    let items: Vec<AnyElement> = KINDS
+                        .into_iter()
+                        .enumerate()
+                        .map(|(ix, (kind, name))| {
+                            let picked = kind == self.kind;
+                            div()
+                                .id(("kind-option", ix))
+                                .h(px(30.))
+                                .px(px(8.))
+                                .flex()
                                 .items_center()
-                                .child(section_title("Authentication", cx))
-                                .child(auth_switch),
-                        )
-                        .child(auth_body),
-                )
-            })
-            .when(is_rdp, |column| {
-                column.child(
-                    v_flex()
-                        .gap(px(12.))
-                        .child(section_title("Authentication", cx))
-                        .child(labeled(
-                            "Password",
-                            cx,
-                            Input::new(&self.pass_input).mask_toggle(),
-                        )),
-                )
-            })
-            .child(
+                                .rounded(px(6.))
+                                .text_size(px(13.))
+                                .text_color(if picked { fg } else { muted_fg })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::field()))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.pick_kind(kind, window, cx);
+                                    this.kind_dropdown_open = false;
+                                    cx.notify();
+                                }))
+                                .child(name)
+                                .into_any_element()
+                        })
+                        .collect();
+                    kind_popup = Some(dropdown_panel(
+                        "kind-dropdown-popup",
+                        &kind_anchor,
+                        &kind_trigger,
+                        items,
+                        cx,
+                        |this, cx| {
+                            this.kind_dropdown_open = false;
+                            cx.notify();
+                        },
+                    ));
+                }
                 v_flex()
-                    .gap(px(12.))
-                    .child(section_title("Organize", cx))
+                    .gap(px(16.))
+                    .child(form_row(
+                        "Display Name",
+                        cx,
+                        Input::new(&self.name_input).appearance(false),
+                    ))
+                    .child(form_row("Group", cx, group_field))
                     .child(
                         h_flex()
-                            .gap(px(12.))
-                            .items_start()
-                            .child(group_field.flex_1().min_w_0())
-                            .child(tags_field.flex_1().min_w_0()),
-                    ),
-            )
-            .when(self.kind.uses_ssh(), |column| {
-                column.child(v_flex().gap(px(12.)).child(advanced_toggle).when(
-                    is_advanced_open,
-                    |el| {
-                        el.child(
-                            h_flex()
-                                .gap(px(12.))
-                                .items_start()
-                                .child(div().flex_1().min_w_0().child(jump_field))
-                                .child(div().flex_1().min_w_0().child(startup_field)),
-                        )
-                        .when(self.startup == Startup::Command, |el| {
-                            el.child(self.render_startup_command(cx))
-                        })
-                        .child(self.render_forwards_section(cx))
-                    },
-                ))
-            });
+                            .items_center()
+                            .gap(px(FORM_ROW_GAP))
+                            .child(form_label("Connection Type", cx))
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(16.))
+                                    .child(div().w(px(220.)).flex_none().child(dropdown_trigger(
+                                        "kind-dropdown-btn",
+                                        self.kind.label().to_string(),
+                                        fg,
+                                        &kind_anchor,
+                                        &kind_trigger,
+                                        cx,
+                                        |this, cx| {
+                                            this.kind_dropdown_open = !this.kind_dropdown_open;
+                                            this.key_dropdown_open = false;
+                                            this.jump_dropdown_open = false;
+                                            this.startup_dropdown_open = false;
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(muted_fg)
+                                            .child("Port:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(72.))
+                                            .flex_none()
+                                            .child(Input::new(&self.port_input)),
+                                    ),
+                            ),
+                    )
+                    .when_some(kind_note, |column, note| column.child(form_note(note, cx)))
+                    .child(form_row(
+                        "Computer Name",
+                        cx,
+                        Input::new(&self.host_input).appearance(false),
+                    ))
+                    .when(!is_telnet, |column| {
+                        column.child(form_row(
+                            "Username",
+                            cx,
+                            Input::new(&self.user_input).appearance(false),
+                        ))
+                    })
+                    .child(form_row("Tags", cx, tags_field))
+                    .into_any_element()
+            }
+            FormPage::Authentication => {
+                let mut column = v_flex().gap(px(14.));
+                if self.kind.uses_ssh() {
+                    column = column.child(form_row("Method", cx, auth_switch));
+                }
+                if self.kind.uses_ssh() && matches!(self.auth_mode, AuthMode::Agent) {
+                    column = column.child(
+                        div()
+                            .pl(px(FORM_LABEL_W + FORM_ROW_GAP))
+                            .max_w(px(520.))
+                            .child(auth_body),
+                    );
+                } else {
+                    let label = if matches!(self.auth_mode, AuthMode::PrivateKey) {
+                        "SSH key"
+                    } else {
+                        "Password"
+                    };
+                    column = column.child(form_row(label, cx, auth_body));
+                }
+                column.into_any_element()
+            }
+            FormPage::JumpHost => v_flex()
+                .gap(px(14.))
+                .child(form_row("Jump host", cx, jump_field))
+                .into_any_element(),
+            FormPage::Tunnels => self.render_forwards_section(cx),
+            FormPage::Session => {
+                let mut column = v_flex().gap(px(14.));
+                if self.kind.uses_ssh() {
+                    column = column.child(form_row("Startup", cx, startup_field));
+                    if self.startup == Startup::Command {
+                        column = column.child(
+                            div()
+                                .pl(px(FORM_LABEL_W + FORM_ROW_GAP))
+                                .max_w(px(460.))
+                                .child(self.render_startup_command(cx)),
+                        );
+                    }
+                }
+                if self.kind == ConnectionKind::Rdp {
+                    column = column.child(self.render_rdp_display(cx));
+                }
+                column.into_any_element()
+            }
+        };
+
+        let mut rail = v_flex()
+            .id("connection-nav")
+            .w(px(200.))
+            .h_full()
+            .flex_none()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(crate::theme::border())
+            .px(px(8.))
+            .pt(px(6.))
+            .pb(px(12.))
+            .gap(px(2.));
+        let mut previous_group: Option<&'static str> = None;
+        for page in FormPage::for_kind(self.kind) {
+            if previous_group != Some(page.group()) {
+                let first = previous_group.is_none();
+                previous_group = Some(page.group());
+                rail = rail.child(
+                    div()
+                        .px(px(10.))
+                        .pt(px(if first { 8. } else { 16. }))
+                        .pb(px(4.))
+                        .text_size(px(12.))
+                        .text_color(muted_fg)
+                        .child(page.group()),
+                );
+            }
+            let is_active = page == active;
+            rail = rail.child(
+                div()
+                    .id(("connection-page", page.index()))
+                    .h(px(32.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
+                    .text_size(px(13.5))
+                    .cursor_pointer()
+                    .when(is_active, |el| {
+                        el.bg(crate::theme::accent())
+                            .text_color(crate::theme::accent_ink())
+                    })
+                    .when(!is_active, |el| {
+                        el.text_color(fg).hover(|s| s.bg(crate::theme::field()))
+                    })
+                    .child(page.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.page = page;
+                        this.close_dropdowns(cx);
+                        cx.notify();
+                    })),
+            );
+        }
 
         let footer_note = footer_message.or_else(|| {
             self.missing_hint(cx)
                 .map(|hint| (hint.to_string(), crate::theme::text_dim()))
         });
+        let panel_h = dialog_max_height(window).min(px(560.));
 
+        // TODO security: input widget internals not zeroizable, see SECURITY.md
         v_flex()
-            .max_h(dialog_max_height(window))
+            .id("connection-settings")
+            .w_full()
+            .h(panel_h)
             .child(
-                div().flex_none().px(px(16.)).pt(px(14.)).pb(px(12.)).child(
-                    DialogHeader::new().child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child(if is_edit { "Edit host" } else { "New host" }),
-                    ),
-                ),
+                div()
+                    .flex_none()
+                    .h(px(52.))
+                    .px(px(20.))
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(crate::theme::border())
+                    .text_size(px(16.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(fg)
+                    .child("Terminal Connection Settings"),
             )
-            .child(fields)
             .child(
-                // TODO security: input widget internals not zeroizable, see SECURITY.md
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .items_stretch()
+                    .overflow_hidden()
+                    .child(rail)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .px(px(28.))
+                                    .pt(px(22.))
+                                    .pb(px(18.))
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(fg)
+                                            .child(active.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(muted_fg)
+                                            .child(active.subtitle(self.kind)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("server-form-fields")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    // An open panel stays where its field was and is not
+                                    // clipped by the dialog, so it closes on scroll.
+                                    .on_scroll(
+                                        cx.listener(|this, _, _, cx| this.close_dropdowns(cx)),
+                                    )
+                                    .px(px(28.))
+                                    .pb(px(24.))
+                                    .child(page_body),
+                            ),
+                    ),
+            )
+            .child(
                 h_flex()
                     .flex_none()
-                    .gap(px(8.))
-                    .justify_between()
+                    .h(px(56.))
+                    .px(px(20.))
+                    .gap(px(24.))
                     .items_center()
-                    .px(px(16.))
-                    .py(px(12.))
                     .border_t_1()
                     .border_color(crate::theme::border())
                     .child(
@@ -1574,90 +1845,169 @@ impl Render for ServerFormView {
                             }),
                     )
                     .child(
-                        h_flex()
-                            .gap(px(8.))
-                            .child(Button::new("form-cancel").ghost().child("Cancel").on_click(
-                                cx.listener(|_, _, _, cx| {
-                                    cx.emit(FormEvent::Cancelled);
-                                }),
-                            ))
-                            .child(
-                                Button::new("form-submit")
-                                    .primary()
-                                    .child(if is_edit { "Save" } else { "Add host" })
-                                    .disabled(!is_valid)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit(cx);
-                                    })),
-                            ),
+                        Button::new("form-cancel")
+                            .text()
+                            .child("Discard changes")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(FormEvent::Cancelled);
+                            })),
+                    )
+                    .child(
+                        Button::new("form-submit")
+                            .text()
+                            .child("Apply & Close")
+                            .disabled(!is_valid)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit(cx);
+                            })),
                     ),
             )
             .children(popup)
             .children(jump_popup)
             .children(startup_popup)
+            .children(kind_popup)
             .into_any_element()
     }
 }
 
 impl ServerFormView {
+    /// Desktop size and colours for an RDP host.
+    fn render_rdp_display(&self, cx: &Context<Self>) -> impl IntoElement {
+        let resolution_switch = segmented(
+            "rdp-resolution",
+            &[(false, "Fit window"), (true, "Fixed size")],
+            self.rdp_fixed_size,
+            cx,
+            |this, fixed, _, cx| {
+                this.rdp_fixed_size = fixed;
+                cx.notify();
+            },
+        );
+        let depth_switch = segmented(
+            "rdp-color-depth",
+            &[
+                (RdpColorDepth::Bits32, "32-bit"),
+                (RdpColorDepth::Bits24, "24-bit"),
+                (RdpColorDepth::Bits16, "16-bit"),
+                (RdpColorDepth::Bits15, "15-bit"),
+            ],
+            self.rdp_color_depth,
+            cx,
+            |this, depth, _, cx| {
+                this.rdp_color_depth = depth;
+                cx.notify();
+            },
+        );
+        let scale_switch = segmented(
+            "rdp-scale",
+            &[
+                (RdpScale::Percent100, "100%"),
+                (RdpScale::Percent125, "125%"),
+                (RdpScale::Percent150, "150%"),
+                (RdpScale::Percent200, "200%"),
+            ],
+            self.rdp_scale,
+            cx,
+            |this, scale, _, cx| {
+                this.rdp_scale = scale;
+                cx.notify();
+            },
+        );
+        let note = if self.rdp_fixed_size {
+            "The desktop keeps this size and is scaled to fit the tab."
+        } else {
+            "The desktop is resized with the tab."
+        };
+        let presets =
+            h_flex()
+                .gap(px(6.))
+                .flex_wrap()
+                .children(DESKTOP_PRESETS.iter().enumerate().map(
+                    |(ix, &(width, height, label))| {
+                        Button::new(("rdp-preset", ix))
+                            .ghost()
+                            .xsmall()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.rdp_width.update(cx, |input, cx| {
+                                    input.set_value(width.to_string(), window, cx)
+                                });
+                                this.rdp_height.update(cx, |input, cx| {
+                                    input.set_value(height.to_string(), window, cx)
+                                });
+                                cx.notify();
+                            }))
+                    },
+                ));
+
+        v_flex()
+            .gap(px(14.))
+            .child(form_row("Resolution", cx, resolution_switch))
+            .child(form_note(note, cx))
+            .when(self.rdp_fixed_size, |column| {
+                column
+                    .child(form_row(
+                        "Size",
+                        cx,
+                        h_flex()
+                            .gap(px(8.))
+                            .items_center()
+                            .child(div().w(px(110.)).child(Input::new(&self.rdp_width)))
+                            .child(address_separator("×"))
+                            .child(div().w(px(110.)).child(Input::new(&self.rdp_height))),
+                    ))
+                    .child(div().pl(px(FORM_LABEL_W + FORM_ROW_GAP)).child(presets))
+            })
+            .child(form_row("Colors", cx, depth_switch))
+            .child(form_row("Scale", cx, scale_switch))
+            .child(
+                v_flex()
+                    .pl(px(FORM_LABEL_W + FORM_ROW_GAP))
+                    .gap(px(8.))
+                    .child(
+                        Checkbox::new("rdp-audio")
+                            .checked(self.rdp_audio)
+                            .label("Play remote audio on this Mac")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.rdp_audio = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("rdp-clipboard")
+                            .checked(self.rdp_clipboard)
+                            .label("Share copied text with the remote")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.rdp_clipboard = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     fn close_dropdowns(&mut self, cx: &mut Context<Self>) {
-        if self.key_dropdown_open || self.jump_dropdown_open || self.startup_dropdown_open {
+        if self.key_dropdown_open
+            || self.jump_dropdown_open
+            || self.startup_dropdown_open
+            || self.kind_dropdown_open
+        {
             self.key_dropdown_open = false;
             self.jump_dropdown_open = false;
             self.startup_dropdown_open = false;
+            self.kind_dropdown_open = false;
             cx.notify();
         }
     }
 
-    /// What the folded "Advanced" section holds, in one line.
-    fn advanced_summary(&self, cx: &App) -> String {
-        let vault = self.vault_state.read(cx).manager();
-        // The same lookup as the jump field, so the two never disagree.
-        let edited_id = match self.mode {
-            FormMode::Edit { id, .. } => Some(id),
-            FormMode::Add => None,
-        };
-        let jump = match self.selected_jump_id {
-            None => "Direct connection".to_string(),
-            Some(id) => vault
-                .map(|vm| vm.list_jump_candidates(edited_id))
-                .and_then(|candidates| candidates.into_iter().find(|c| c.id == id))
-                .map(|candidate| {
-                    let name = if candidate.label.is_empty() {
-                        candidate.host
-                    } else {
-                        candidate.label
-                    };
-                    format!("Through {name}")
-                })
-                .unwrap_or_else(|| "Through a removed host".to_string()),
-        };
-        let forwards = match self.forwards.len() {
-            0 => "no forwards".to_string(),
-            1 => "1 forward".to_string(),
-            n => format!("{n} forwards"),
-        };
-        let startup = match self.startup {
-            Startup::None => "no startup snippet".to_string(),
-            Startup::Command => "runs a command".to_string(),
-            Startup::Shared(id) => vault
-                .and_then(|vm| vm.list_snippets().ok())
-                .and_then(|snippets| snippets.into_iter().find(|s| s.id == id))
-                .map(|snippet| format!("runs {}", snippet.name))
-                .unwrap_or_else(|| "a removed snippet".to_string()),
-        };
-        format!("{jump} · {forwards} · {startup}")
-    }
-
-    /// Why "Add host" is greyed out, while it is.
+    /// Why Apply is greyed out, while it is.
     fn missing_hint(&self, cx: &App) -> Option<&'static str> {
         if strip_whitespace(&self.host_input.read(cx).value()).is_empty() {
-            return Some("Enter the host.");
+            return Some("Enter the computer name.");
         }
         if self.kind != ConnectionKind::Telnet
             && strip_whitespace(&self.user_input.read(cx).value()).is_empty()
         {
-            return Some("Enter the user.");
+            return Some("Enter the username.");
         }
         let port = strip_whitespace(&self.port_input.read(cx).value());
         if port.parse::<u16>().map(|p| p < 1).unwrap_or(true) {
@@ -1670,7 +2020,7 @@ impl ServerFormView {
             return Some("Enter the password.");
         }
         if self.kind == ConnectionKind::Rdp {
-            return None;
+            return self.rdp_settings(cx).is_none().then_some(DESKTOP_SIZE_HINT);
         }
         match self.auth_mode {
             AuthMode::Password if self.pass_input.read(cx).value().is_empty() => {
@@ -2018,7 +2368,6 @@ impl ServerFormView {
 
         let jump_field = v_flex()
             .gap(px(6.))
-            .child(field_label("Jump host", cx))
             .child(dropdown_trigger(
                 "jump-dropdown-btn",
                 jump_label,
@@ -2132,7 +2481,6 @@ impl ServerFormView {
 
         let field = v_flex()
             .gap(px(6.))
-            .child(field_label("Run on connect", cx))
             .child(dropdown_trigger(
                 "startup-dropdown-btn",
                 label,
@@ -2336,15 +2684,13 @@ impl ServerFormView {
             .gap(px(6.))
             .child(
                 h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(field_label("Port forwarding", cx))
+                    .justify_end()
                     .child(
                         Button::new("forward-add-link")
                             .ghost()
                             .small()
                             .icon(IconName::Plus)
-                            .child("Add forward")
+                            .child("Add tunnel")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.enter_add_forward(window, cx);
                             })),
@@ -2678,27 +3024,45 @@ fn field_label(text: &'static str, cx: &App) -> impl IntoElement {
 
 const COMMAND_OPTION: &str = "Command for this host";
 
-/// A field with its label above it.
-fn labeled(label: &'static str, cx: &App, field: impl IntoElement) -> gpui::Div {
-    v_flex()
-        .gap(px(6.))
-        .child(field_label(label, cx))
-        .child(field)
+/// Width of the right-aligned label column, and the gap before the value.
+const FORM_LABEL_W: f32 = 148.;
+const FORM_ROW_GAP: f32 = 20.;
+
+/// One settings row: the label on the left, the value beside it.
+fn form_row(label: &'static str, cx: &App, field: impl IntoElement) -> gpui::Div {
+    h_flex()
+        .items_start()
+        .gap(px(FORM_ROW_GAP))
+        .child(form_label(label, cx))
+        .child(div().flex_1().max_w(px(440.)).min_w_0().child(field))
+}
+
+fn form_label(text: &'static str, cx: &App) -> impl IntoElement {
+    div()
+        .w(px(FORM_LABEL_W))
+        .h(px(32.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_end()
+        .text_size(px(13.))
+        .text_color(cx.theme().muted_foreground)
+        .child(format!("{text}:"))
+}
+
+/// A caption lined up with the values, not the labels.
+fn form_note(text: impl Into<SharedString>, cx: &App) -> gpui::Div {
+    div()
+        .pl(px(FORM_LABEL_W + FORM_ROW_GAP))
+        .text_size(px(12.))
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
 }
 
 /// Title of a view that takes the form's place, after its Back button.
 fn sub_view_title(text: &'static str, cx: &App) -> impl IntoElement {
     div()
         .text_size(px(15.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(cx.theme().foreground)
-        .child(text)
-}
-
-/// Heading of one part of the form.
-fn section_title(text: &'static str, cx: &App) -> impl IntoElement {
-    div()
-        .text_size(px(13.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(cx.theme().foreground)
         .child(text)

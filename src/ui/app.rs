@@ -2820,6 +2820,9 @@ impl AppView {
         let form_for_dialog = form.clone();
         window.open_dialog(&mut *cx, move |dialog, _, _| {
             dialog_chrome(dialog)
+                .p_0()
+                .close_button(false)
+                .bg(crate::theme::modal_surface())
                 .w(dialog_form())
                 .child(form_for_dialog.clone())
         });
@@ -3351,6 +3354,7 @@ fn quick_connect_entry(
         forwards: Vec::new(),
         startup_snippet: None,
         snippets: Vec::new(),
+        rdp: Default::default(),
         sort_order: 0,
         created_at: now,
         updated_at: now,
@@ -3432,6 +3436,7 @@ fn connection_info(entry: &ServerEntry) -> Connection {
         port: entry.port,
         username: entry.username.clone(),
         kind: entry.kind,
+        rdp: entry.rdp,
     }
 }
 

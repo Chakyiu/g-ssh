@@ -504,6 +504,7 @@ fn connection_file(
             forwards: entry.forwards.clone(),
             startup_snippet: entry.startup_snippet,
             snippets: entry.snippets.clone(),
+            rdp: entry.rdp,
             sort_order: entry.sort_order,
             created_at: entry.created_at,
             updated_at: entry.updated_at,
@@ -581,6 +582,7 @@ fn entry_from_file(
             forwards: file.forwards,
             startup_snippet: file.startup_snippet,
             snippets: file.snippets,
+            rdp: file.rdp,
             sort_order: file.sort_order,
             created_at: file.created_at,
             updated_at: file.updated_at,
@@ -626,6 +628,9 @@ struct ConnectionFile {
     startup_snippet: Option<Uuid>,
     #[serde(default)]
     snippets: Vec<HostSnippet>,
+    /// See [`super::model::ServerEntry::rdp`].
+    #[serde(default, skip_serializing_if = "crate::rdp::RdpSettings::is_default")]
+    rdp: crate::rdp::RdpSettings,
     /// See [`super::model::ServerEntry::sort_order`].
     #[serde(default, skip_serializing_if = "is_unset_order")]
     sort_order: i64,
@@ -716,5 +721,39 @@ mod tests {
         telnet.port = 23;
         let written = serde_json::to_string(&telnet).unwrap();
         assert!(written.contains("\"kind\":\"telnet\""), "{written}");
+    }
+
+    #[test]
+    fn rdp_settings_are_omitted_at_the_default_and_kept_otherwise() {
+        use crate::rdp::{RdpColorDepth, RdpResolution, RdpScale, RdpSettings};
+
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000001",
+            "label": "desk",
+            "host": "desk.example.com",
+            "port": 3389,
+            "kind": "rdp",
+            "username": "me",
+            "auth": { "method": "agent" }
+        }"#;
+        let mut file: ConnectionFile = serde_json::from_str(json).unwrap();
+        assert!(file.rdp.is_default());
+        let written = serde_json::to_string(&file).unwrap();
+        assert!(!written.contains("\"rdp\":"), "{written}");
+
+        let settings = RdpSettings {
+            resolution: RdpResolution::Fixed {
+                width: 1920,
+                height: 1080,
+            },
+            color_depth: RdpColorDepth::Bits16,
+            scale: RdpScale::Percent150,
+            audio: true,
+            clipboard: true,
+        };
+        file.rdp = settings;
+        let written = serde_json::to_string(&file).unwrap();
+        let read: ConnectionFile = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.rdp, settings);
     }
 }

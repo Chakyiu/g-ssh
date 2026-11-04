@@ -126,9 +126,15 @@ members = [".", "core", "updater"]
 # third_party/picky is published 7.0.0-rc.29 (stable RustCrypto) with its
 # version kept at 7.0.0-rc.25 so the pin matches. third_party/sspi is 0.21.3
 # without the unused macOS pins that forced those same pre-releases.
+#
+# third_party/ironrdp-connector and third_party/ironrdp-client are 0.10.0 and
+# 0.1.0 with standard RDP security (RC4) added, for servers such as xrdp that
+# fall back to it when they have no TLS certificate.
 [patch.crates-io]
 picky = { path = "third_party/picky" }
 sspi = { path = "third_party/sspi" }
+ironrdp-connector = { path = "third_party/ironrdp-connector" }
+ironrdp-client = { path = "third_party/ironrdp-client" }
 
 # Style lints that the UI code trips on purpose: gpui handlers take many
 # arguments, and events carry whole entries.
