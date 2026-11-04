@@ -4,6 +4,12 @@
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// The short git commit of the build, or "unknown". Set by build.rs.
 pub const COMMIT: &str = env!("GSSH_GIT_COMMIT");
+/// Where the source and the release page live.
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+/// Who wrote it, from the `authors` of Cargo.toml.
+pub const AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
+/// The `license` of Cargo.toml, which is the file in the repository root.
+pub const LICENSE: &str = env!("CARGO_PKG_LICENSE");
 
 /// "0.1.0 (abc1234)", as the About page shows it.
 pub fn label() -> String {

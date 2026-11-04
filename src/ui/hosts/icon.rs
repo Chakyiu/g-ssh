@@ -6,6 +6,7 @@ use gpui::prelude::*;
 use gpui::{div, svg, AnyElement, Hsla};
 
 use crate::theme;
+use gssh::vault::ConnectionKind;
 
 /// The tile in the host list. Denser lists, like the palette, pass less.
 pub const TILE_SIZE: f32 = 28.;
@@ -67,6 +68,26 @@ pub fn distro_mark(os: &str) -> Option<DistroMark> {
         .iter()
         .find(|(name, _)| os.contains(name))
         .map(|(_, mark)| *mark)
+}
+
+/// The mark for how a host is reached: a terminal for SSH, a folder for
+/// SFTP, a network for Telnet.
+pub fn connection_icon(kind: ConnectionKind) -> &'static str {
+    match kind {
+        ConnectionKind::Ssh => "icons/square-terminal.svg",
+        ConnectionKind::Sftp => "icons/folder-open.svg",
+        ConnectionKind::Telnet => "icons/network.svg",
+    }
+}
+
+/// A host's type as a small mark, quiet enough for a row's trailing slot.
+pub fn connection_mark(kind: ConnectionKind, size: f32, color: Hsla) -> AnyElement {
+    svg()
+        .path(connection_icon(kind))
+        .flex_none()
+        .size(px(size))
+        .text_color(color)
+        .into_any_element()
 }
 
 /// `ring` is the colour behind the tile: the status dot is cut out of the
@@ -250,6 +271,20 @@ mod tests {
                 "{name}: {} is missing",
                 mark.icon
             );
+        }
+    }
+
+    /// The same for the three connection marks, which the host rows draw.
+    #[test]
+    fn every_connection_mark_is_in_the_assets() {
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for kind in [
+            ConnectionKind::Ssh,
+            ConnectionKind::Sftp,
+            ConnectionKind::Telnet,
+        ] {
+            let icon = connection_icon(kind);
+            assert!(assets.join(icon).exists(), "{kind:?}: {icon} is missing");
         }
     }
 }

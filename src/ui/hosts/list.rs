@@ -436,7 +436,6 @@ impl ServersView {
             entry.label.clone()
         };
         let addr = host_line(&entry);
-        let kind_label: gpui::SharedString = entry.kind.label().into();
         // Detected OS (filled on connect); nothing shows until then.
         let os = entry.os.clone().filter(|os| !os.trim().is_empty());
         let tag_names = entry.tag_names.clone();
@@ -544,7 +543,8 @@ impl ServersView {
                     .child(Icon::new(IconName::User).size(px(11.)))
                     .child(team)
             }))
-            // Trailing slot: how the host is reached, or the menu on hover.
+            // Trailing slot: the mark of how the host is reached, or the menu
+            // on hover.
             .child(
                 div()
                     .relative()
@@ -555,19 +555,12 @@ impl ServersView {
                     .items_center()
                     .child(
                         div()
+                            .id(("srow-kind", ix))
                             .flex_none()
-                            .px(px(5.))
-                            .py(px(1.))
-                            .rounded(px(4.))
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_size(px(10.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(text_dim)
-                            .whitespace_nowrap()
                             .when(is_menu_open, |el| el.invisible())
                             .group_hover(group_id.clone(), |s| s.invisible())
-                            .child(kind_label),
+                            .tooltip(move |window, cx| Tooltip::new(kind.label()).build(window, cx))
+                            .child(crate::ui::hosts::icon::connection_mark(kind, 15., text_dim)),
                     )
                     .child(
                         div()

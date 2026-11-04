@@ -282,14 +282,19 @@ impl Sidebar {
             )
             // Trailing slot: the subtitle normally, the row controls on hover.
             // The controls sit on top so the two never fight for width. A
-            // closed host shows its type as a small badge; the live states
-            // stay plain words.
+            // closed host shows the mark of how it is reached; the live
+            // states stay plain words.
             .child(
                 div()
                     .flex_none()
                     .group_hover(group_id.clone(), |s| s.invisible())
                     .when(is_active || hint.is_some(), |el| el.invisible())
-                    .child(subtitle_badge(status, subtitle)),
+                    .child(subtitle_badge(
+                        ("sidebar-host-kind", ui_idx),
+                        status,
+                        entry.kind,
+                        subtitle,
+                    )),
             )
             .child(
                 h_flex()
@@ -1084,34 +1089,37 @@ fn section_label(text: &'static str) -> AnyElement {
 }
 
 /// What a sidebar row says after its name. A host that is not connected
-/// shows its type (`SSH`, `SFTP`, `Telnet`) in a boxed badge, so the column
-/// reads as a set of labels; a live session keeps plain words, since
-/// "connecting…" is too long for a badge.
-fn subtitle_badge(status: HostStatus, subtitle: SharedString) -> AnyElement {
-    let text = div()
+/// shows the mark of how it is reached, so the column reads as a set of
+/// icons; a live session keeps plain words, since "connecting…" has no icon.
+/// The mark has no tooltip of its own: the row's hover card already names the
+/// type, and two tooltips on one row would race.
+fn subtitle_badge(
+    id: (&'static str, usize),
+    status: HostStatus,
+    kind: ConnectionKind,
+    subtitle: SharedString,
+) -> AnyElement {
+    if status == HostStatus::Offline {
+        return div()
+            .id(id)
+            .flex_none()
+            .child(crate::ui::hosts::icon::connection_mark(
+                kind,
+                13.,
+                theme::text_dim(),
+            ))
+            .into_any_element();
+    }
+    div()
+        .flex_none()
         .min_w_0()
         .max_w(px(88.))
         .truncate()
         .whitespace_nowrap()
-        .text_color(theme::text_dim());
-    if status == HostStatus::Offline {
-        text.flex()
-            .flex_none()
-            .px(px(5.))
-            .py(px(1.))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(theme::border())
-            .text_size(px(10.))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .child(subtitle)
-            .into_any_element()
-    } else {
-        text.flex_none()
-            .text_size(px(11.5))
-            .child(subtitle)
-            .into_any_element()
-    }
+        .text_size(px(11.5))
+        .text_color(theme::text_dim())
+        .child(subtitle)
+        .into_any_element()
 }
 
 impl Sidebar {
@@ -1142,13 +1150,14 @@ impl Sidebar {
         let status = opened
             .map(|(_, status)| status)
             .unwrap_or(HostStatus::Offline);
-        // A live session says what it is doing; a closed one says how it is
-        // reached. A dropped connection says nothing: the dot is enough.
+        // A live session says what it is doing; a closed one shows the mark
+        // of how it is reached, drawn from its type. A dropped connection
+        // says nothing: the dot is enough.
         let sub: SharedString = match status {
             HostStatus::Connecting => "connecting…".into(),
             HostStatus::Disconnected => SharedString::default(),
             HostStatus::Connected => SharedString::default(),
-            HostStatus::Offline => entry.kind.label().into(),
+            HostStatus::Offline => SharedString::default(),
         };
         let shortcut = opened.and_then(|(index, _)| hints::tab_key(index));
         div()
@@ -1414,11 +1423,10 @@ impl Render for Sidebar {
                 content.push(section_label("Recent"));
             }
             for entry in &recents {
-                let sub: SharedString = entry.kind.label().into();
                 content.push(self.host_row(
                     ui_idx,
                     entry,
-                    sub,
+                    SharedString::default(),
                     HostStatus::Offline,
                     true,
                     false,

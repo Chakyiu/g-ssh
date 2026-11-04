@@ -2288,9 +2288,17 @@ impl SettingsView {
     }
 
     fn render_about(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let fg = theme.foreground;
-        let muted_fg = theme.muted_foreground;
+        // Copied out: `theme` borrows the app, and opening the update block
+        // needs it alone.
+        let (fg, muted_fg, link, link_hover) = {
+            let theme = cx.theme();
+            (
+                theme.foreground,
+                theme.muted_foreground,
+                theme.link,
+                theme.link_hover,
+            )
+        };
 
         let version = crate::version::label();
         let updates = crate::updates::platform().map(|_| self.render_update_check(cx));
@@ -2299,7 +2307,7 @@ impl SettingsView {
             .unwrap_or_else(|| "not available".to_string());
 
         // min_h, not h: a long log path wraps onto a second line.
-        let kv = |label: &'static str, value: String| {
+        let kv_row = |label: &'static str, value: AnyElement| {
             h_flex()
                 .min_h(px(22.))
                 .items_center()
@@ -2312,17 +2320,24 @@ impl SettingsView {
                         .text_color(muted_fg)
                         .child(label),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(13.))
-                        .text_color(fg)
-                        .child(value),
-                )
+                .child(div().flex_1().min_w_0().child(value))
+        };
+        let kv = |label: &'static str, value: String| {
+            kv_row(
+                label,
+                div()
+                    .text_size(px(13.))
+                    .text_color(fg)
+                    .child(value)
+                    .into_any_element(),
+            )
         };
 
         v_flex()
+            .id("about-scroll")
+            .size_full()
+            .min_h_0()
+            .overflow_y_scroll()
             .px(px(20.))
             .pb(px(20.))
             .gap(px(12.))
@@ -2330,6 +2345,20 @@ impl SettingsView {
             .child(
                 v_flex()
                     .child(kv("Version", version))
+                    .child(kv("Author", crate::version::AUTHOR.to_string()))
+                    .child(kv("License", crate::version::LICENSE.to_string()))
+                    .child(kv_row(
+                        "Repository",
+                        div()
+                            .id("about-repository")
+                            .text_size(px(13.))
+                            .text_color(link)
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(link_hover))
+                            .on_click(|_, _, cx| cx.open_url(crate::version::REPOSITORY))
+                            .child(crate::version::REPOSITORY)
+                            .into_any_element(),
+                    ))
                     .child(kv("Log file", log_file)),
             )
             .children(updates)
