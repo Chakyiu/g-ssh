@@ -46,9 +46,9 @@ pub fn dialog_wide() -> gpui::Pixels {
     scale::px(480.)
 }
 
-/// The connection editor: a nav rail beside one settings page.
+/// The connection editor: the same card width as Settings.
 pub fn dialog_form() -> gpui::Pixels {
-    scale::px(860.)
+    scale::px(980.)
 }
 
 /// The four-layer shadow Zed gives its modals, shared by dialogs, the palette
