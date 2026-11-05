@@ -2588,9 +2588,25 @@ impl ServerFormView {
         v_flex()
             .gap(px(6.))
             .child(Textarea::new(&self.startup_command).h(px(76.)))
+            .child(h_flex().gap(px(6.)).flex_wrap().children(
+                STARTUP_SPECIALS.iter().enumerate().map(|(ix, token)| {
+                    let token = *token;
+                    Button::new(("startup-special", ix))
+                        .ghost()
+                        .xsmall()
+                        .child(token)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.startup_command.update(cx, |input, cx| {
+                                let next = append_special(&input.value(), token);
+                                input.set_value(next, window, cx);
+                            });
+                        }))
+                }),
+            ))
             .child(caption(
-                "Sent to the terminal after every connect. It belongs to this host \
-                 and also shows under Snippets in the server panel.",
+                "Typed into the terminal after every connect. {sleep 1} waits one second, \
+                 {sleep 500ms} waits 500 milliseconds, and {enter}, {tab}, {esc} or {ctrl-c} \
+                 sends that key. It belongs to this host and also shows under Snippets.",
                 cx,
             ))
     }
@@ -3021,6 +3037,20 @@ fn field_label(text: &'static str, cx: &App) -> impl IntoElement {
 }
 
 const COMMAND_OPTION: &str = "Command for this host";
+
+/// Inserted from the chips under the session command. Each one is a special
+/// [`crate::ui::terminal::script`] understands when the command is typed.
+const STARTUP_SPECIALS: &[&str] = &["{sleep 1}", "{enter}", "{tab}", "{esc}", "{ctrl-c}"];
+
+/// Put `token` on its own line when the command already has text.
+fn append_special(current: &str, token: &str) -> String {
+    let mut text = current.to_string();
+    if !text.is_empty() && !text.ends_with(['\n', ' ']) {
+        text.push('\n');
+    }
+    text.push_str(token);
+    text
+}
 
 /// One settings field: a muted label above the control.
 fn labeled(label: &'static str, cx: &App, control: impl IntoElement) -> gpui::Div {

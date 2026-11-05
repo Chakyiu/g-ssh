@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::ui::scale::px;
 use gpui::prelude::*;
@@ -21,7 +21,7 @@ use crate::theme;
 use crate::ui::app::ToggleSettings;
 use crate::ui::hints;
 use crate::ui::hosts::sharing;
-use crate::ui::menu::{ContextMenu, ContextMenuItem, PopoverMenu};
+use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
 use gssh::vault::{ConnectionKind, ProxyChoice, ServerEntrySummary};
@@ -93,13 +93,7 @@ pub struct Sidebar {
     /// Open sessions in tab order. A `Vec`, not a map, so rows don't jump as
     /// sessions come and go.
     sessions: Vec<(String, HostStatus)>,
-    /// Which host's "more" menu is open (at most one).
-    open_menu_for: Option<Uuid>,
-    /// The menu the last outside click closed, and when. `on_mouse_down_out`
-    /// runs before the button's own handler and clears `open_menu_for`, so
-    /// without this a click on the button of an open menu would reopen it.
-    menu_dismissed_at: Option<(Uuid, Instant)>,
-    /// Right-click on a host: open a terminal or SFTP tab.
+    /// Right-click on a host opens its actions at the cursor.
     host_menu: Option<(Uuid, Point<Pixels>)>,
     /// Folder paths the user folded shut. A path absent here is open, so a
     /// new folder shows its hosts without a saved preference.
@@ -126,8 +120,6 @@ impl Sidebar {
             vault_state,
             active_server_id: None,
             sessions: Vec::new(),
-            open_menu_for: None,
-            menu_dismissed_at: None,
             host_menu: None,
             collapsed_groups: HashSet::new(),
             dragging_host: None,
@@ -280,15 +272,18 @@ impl Sidebar {
                             .child(Icon::new(IconName::User).size(px(10.)))
                     })),
             )
-            // Trailing slot: the subtitle normally, the row controls on hover.
-            // The controls sit on top so the two never fight for width. A
-            // closed host shows the mark of how it is reached; the live
-            // states stay plain words.
+            // Trailing slot: the subtitle, unless a shortcut hint or the
+            // close button needs that space. The close button sits on top so
+            // the two never fight for width.
             .child(
                 div()
                     .flex_none()
-                    .group_hover(group_id.clone(), |s| s.invisible())
-                    .when(is_active || hint.is_some(), |el| el.invisible())
+                    .when(show_close, |el| {
+                        el.group_hover(group_id.clone(), |s| s.invisible())
+                    })
+                    .when((show_close && is_active) || hint.is_some(), |el| {
+                        el.invisible()
+                    })
                     .child(subtitle_badge(
                         ("sidebar-host-kind", ui_idx),
                         status,
@@ -296,46 +291,47 @@ impl Sidebar {
                         subtitle,
                     )),
             )
-            .child(
-                h_flex()
-                    .absolute()
-                    .right(px(4.))
-                    .flex_none()
-                    .gap(px(1.))
-                    .items_center()
-                    .when_some(hint.clone(), |row, keys| row.child(hints::badge(keys)))
-                    .when(show_close && hint.is_none(), |row| {
-                        row.child(
-                            div()
-                                .id(("sidebar-host-close", ui_idx))
-                                .size(px(16.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .text_color(text_dim)
-                                .invisible()
-                                .when(is_active, |el| el.visible())
-                                .group_hover(group_id.clone(), |s| s.visible())
-                                .hover(|s| s.bg(bg_element_hover).text_color(text))
-                                .active(|s| s.bg(bg_element_active).text_color(theme::red_error()))
-                                .tooltip(|window, cx| {
-                                    Tooltip::new("Close session").build(window, cx)
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |_, _: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.emit(SidebarEvent::CloseServer(entry_id));
-                                    }),
-                                )
-                                .child(Icon::new(IconName::Close).size(px(10.))),
-                        )
-                    })
-                    .when(hint.is_none(), |row| {
-                        row.child(self.host_more_menu(ui_idx, entry_id, show_close, entry.kind, cx))
-                    }),
-            )
+            .when(hint.is_some() || show_close, |row| {
+                row.child(
+                    h_flex()
+                        .absolute()
+                        .right(px(4.))
+                        .flex_none()
+                        .gap(px(1.))
+                        .items_center()
+                        .when_some(hint.clone(), |row, keys| row.child(hints::badge(keys)))
+                        .when(show_close && hint.is_none(), |row| {
+                            row.child(
+                                div()
+                                    .id(("sidebar-host-close", ui_idx))
+                                    .size(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .text_color(text_dim)
+                                    .invisible()
+                                    .when(is_active, |el| el.visible())
+                                    .group_hover(group_id.clone(), |s| s.visible())
+                                    .hover(|s| s.bg(bg_element_hover).text_color(text))
+                                    .active(|s| {
+                                        s.bg(bg_element_active).text_color(theme::red_error())
+                                    })
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("Close session").build(window, cx)
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.emit(SidebarEvent::CloseServer(entry_id));
+                                        }),
+                                    )
+                                    .child(Icon::new(IconName::Close).size(px(10.))),
+                            )
+                        }),
+                )
+            })
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(SidebarEvent::OpenServer(entry_id));
             }))
@@ -367,178 +363,6 @@ impl Sidebar {
             None => row,
         }
         .into_any_element()
-    }
-
-    /// The "more" trigger and its dropdown for a host row. The [`PopoverMenu`]
-    /// drops below the trigger and never covers it, so a second click on the
-    /// trigger closes the menu.
-    fn host_more_menu(
-        &self,
-        ui_idx: usize,
-        entry_id: Uuid,
-        has_session: bool,
-        kind: ConnectionKind,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let bg_element_hover = theme.list_hover;
-        let bg_element_active = theme.list_active;
-        let text = theme.foreground;
-        let text_dim = theme::text_dim();
-
-        let is_menu_open = self.open_menu_for == Some(entry_id);
-        let is_active = self.active_server_id.as_deref() == Some(entry_id.to_string().as_str());
-        let group_id: SharedString = format!("{SIDEBAR_GROUP}-{ui_idx}").into();
-
-        // The trigger button. Open/pressed both get a solid highlight so the
-        // control clearly reacts; the row owns hover/visibility reveal.
-        let trigger = div()
-            .id(("sidebar-host-more-btn", ui_idx))
-            .size(px(16.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(3.))
-            .text_color(if is_menu_open { text } else { text_dim })
-            .when(is_menu_open, |el| el.bg(bg_element_active).visible())
-            .when(!is_menu_open, |el| {
-                el.invisible()
-                    .when(is_active, |el| el.visible())
-                    .group_hover(group_id.clone(), |s| s.visible())
-                    .hover(|s| s.bg(bg_element_hover).text_color(text))
-                    // Pressed feedback before the menu paints.
-                    .active(|s| s.bg(bg_element_active).text_color(text))
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    // The menu's outside-click dismiss fires in the capture phase,
-                    // before this bubble-phase handler, and clears `open_menu_for`.
-                    // If it just closed *this* row's menu, treat the click as a
-                    // toggle-off and stay closed; otherwise open this row's menu
-                    // (covers both first-open and switching between rows).
-                    let toggled_off = this.menu_dismissed_at.take().is_some_and(|(id, at)| {
-                        id == entry_id && at.elapsed() < Duration::from_millis(200)
-                    });
-                    if toggled_off || this.open_menu_for == Some(entry_id) {
-                        this.open_menu_for = None;
-                    } else {
-                        this.open_menu_for = Some(entry_id);
-                    }
-                    cx.notify();
-                }),
-            )
-            .child(Icon::new(IconName::Ellipsis).size(px(12.)));
-
-        let sharing_items: Vec<ContextMenuItem> =
-            sharing::menu_choices(&self.vault_state, entry_id, cx)
-                .into_iter()
-                .enumerate()
-                .map(|(choice_ix, (label, target))| {
-                    ContextMenuItem::new(
-                        ("sidebar-menu-share", choice_ix),
-                        label,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_menu_for = None;
-                            sharing::set_shared(&this.vault_state, entry_id, target, cx);
-                            cx.notify();
-                        }),
-                    )
-                })
-                .collect();
-
-        let mut menu = PopoverMenu::new(("sidebar-host-more", ui_idx), is_menu_open, trigger)
-            .anchor(Anchor::TopRight);
-        menu = match kind {
-            ConnectionKind::Telnet | ConnectionKind::Rdp => menu,
-            ConnectionKind::Sftp => menu.item(
-                ContextMenuItem::new(
-                    "sidebar-menu-terminal",
-                    "Open terminal",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::OpenTerminal(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/square-terminal.svg"),
-            ),
-            ConnectionKind::Ssh => menu.item(
-                ContextMenuItem::new(
-                    "sidebar-menu-sftp",
-                    "Open SFTP",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::OpenSftp(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/folder-open.svg"),
-            ),
-        };
-        menu = menu
-            .item(
-                ContextMenuItem::new(
-                    "sidebar-menu-edit",
-                    "Edit",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::EditServerRequested(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/pen-line.svg"),
-            )
-            .item(
-                ContextMenuItem::new(
-                    "sidebar-menu-duplicate",
-                    "Duplicate",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::DuplicateServerRequested(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/clipboard-copy.svg"),
-            );
-
-        if has_session {
-            menu = menu.item(
-                ContextMenuItem::new(
-                    "sidebar-menu-close",
-                    "Close session",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::CloseServer(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/x.svg"),
-            );
-        }
-
-        menu.items(sharing_items)
-            .item(
-                ContextMenuItem::new(
-                    "sidebar-menu-delete",
-                    "Delete",
-                    cx.listener(move |this, _, _, cx| {
-                        this.open_menu_for = None;
-                        cx.emit(SidebarEvent::DeleteServerRequested(entry_id));
-                        cx.notify();
-                    }),
-                )
-                .icon("icons/trash.svg")
-                .danger(),
-            )
-            .on_dismiss(cx.listener(move |this, _, _, cx| {
-                // Record which menu we just closed so the trigger's bubble-phase
-                // handler can tell a toggle-off from a row switch (see trigger).
-                this.menu_dismissed_at = Some((entry_id, Instant::now()));
-                this.open_menu_for = None;
-                cx.notify();
-            }))
     }
 }
 
@@ -912,7 +736,6 @@ impl Sidebar {
                             this.dragging_host = Some(entry_id);
                             this.drop_slot = None;
                             this.host_menu = None;
-                            this.open_menu_for = None;
                             cx.notify();
                         })
                         .ok();
@@ -1542,6 +1365,10 @@ impl Sidebar {
     fn render_host_menu(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let (entry_id, position) = self.host_menu?;
         let kind = self.kind_of(entry_id, cx);
+        let has_session = self
+            .sessions
+            .iter()
+            .any(|(id, _)| id == &entry_id.to_string());
         let mut items = Vec::new();
         if kind == ConnectionKind::Rdp {
             items.push(
@@ -1611,6 +1438,18 @@ impl Sidebar {
         }
         items.push(
             ContextMenuItem::new(
+                "host-menu-edit",
+                "Edit",
+                cx.listener(move |this, _, _, cx| {
+                    this.host_menu = None;
+                    cx.emit(SidebarEvent::EditServerRequested(entry_id));
+                    cx.notify();
+                }),
+            )
+            .icon("icons/pen-line.svg"),
+        );
+        items.push(
+            ContextMenuItem::new(
                 "host-menu-duplicate",
                 "Duplicate",
                 cx.listener(move |this, _, _, cx| {
@@ -1620,6 +1459,49 @@ impl Sidebar {
                 }),
             )
             .icon("icons/clipboard-copy.svg"),
+        );
+        if has_session {
+            items.push(
+                ContextMenuItem::new(
+                    "host-menu-close",
+                    "Close session",
+                    cx.listener(move |this, _, _, cx| {
+                        this.host_menu = None;
+                        cx.emit(SidebarEvent::CloseServer(entry_id));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/x.svg"),
+            );
+        }
+        items.extend(
+            sharing::menu_choices(&self.vault_state, entry_id, cx)
+                .into_iter()
+                .enumerate()
+                .map(|(choice_ix, (label, target))| {
+                    ContextMenuItem::new(
+                        ("host-menu-share", choice_ix),
+                        label,
+                        cx.listener(move |this, _, _, cx| {
+                            this.host_menu = None;
+                            sharing::set_shared(&this.vault_state, entry_id, target, cx);
+                            cx.notify();
+                        }),
+                    )
+                }),
+        );
+        items.push(
+            ContextMenuItem::new(
+                "host-menu-delete",
+                "Delete",
+                cx.listener(move |this, _, _, cx| {
+                    this.host_menu = None;
+                    cx.emit(SidebarEvent::DeleteServerRequested(entry_id));
+                    cx.notify();
+                }),
+            )
+            .icon("icons/trash.svg")
+            .danger(),
         );
         Some(
             ContextMenu::new(

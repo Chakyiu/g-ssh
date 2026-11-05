@@ -10,6 +10,7 @@ pub mod element;
 pub mod keymap;
 pub mod link;
 pub mod mouse;
+pub mod script;
 pub mod search;
 pub mod suggestions;
 pub mod tabs;

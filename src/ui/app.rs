@@ -38,6 +38,7 @@ use crate::ui::sftp::browser::TransferKind;
 use crate::ui::sftp::conflict::transfer_conflict_dialog;
 use crate::ui::sftp::picker::{AppPicker, AppPickerEvent};
 use crate::ui::sync::SyncService;
+use crate::ui::terminal::script::{script_steps, ScriptStep};
 use crate::ui::updates::consent::{UpdateConsentEvent, UpdateConsentView};
 use crate::ui::updates::dialog::{UpdateView, UpdateViewEvent};
 use crate::ui::updates::service::{Download, UpdateService};
@@ -3311,12 +3312,18 @@ impl Render for AppView {
     }
 }
 
-/// Type a script into a shell and press enter for it.
+/// Type a script into a shell. `{sleep 1}` and the other specials in
+/// [`script_steps`] are handled here; the rest is keystrokes, and Enter is
+/// pressed when the text would otherwise sit on the line.
 fn send_script(shell: gssh::ssh::shell::ShellHandle, content: String, cx: &mut Context<AppView>) {
-    let mut bytes = content.into_bytes();
-    bytes.push(b'\r');
-    cx.spawn(async move |_, _| {
-        shell.send_input(bytes).await;
+    let steps = script_steps(&content);
+    cx.spawn(async move |_, cx| {
+        for step in steps {
+            match step {
+                ScriptStep::Type(bytes) => shell.send_input(bytes).await,
+                ScriptStep::Sleep(duration) => cx.background_executor().timer(duration).await,
+            }
+        }
     })
     .detach();
 }
