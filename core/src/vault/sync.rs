@@ -1623,6 +1623,7 @@ mod tests {
             startup_snippet: None,
             snippets: Vec::new(),
             rdp: Default::default(),
+            vnc: Default::default(),
             sort_order: 0,
             created_at: 1,
             updated_at: 1,

@@ -1,5 +1,7 @@
-//! The remote desktop for an RDP host. IronRDP decodes the framebuffer; this
-//! paints it and sends the pointer and the keys back.
+//! The remote desktop of an RDP or a VNC host. The session decodes the
+//! framebuffer; this paints it and sends the pointer and the keys back.
+
+mod keysym;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -9,14 +11,17 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, point, px, Bounds, Context, Corners, FocusHandle, Focusable, KeyDownEvent,
-    KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, RenderImage, ScrollDelta, ScrollEvent, Task, Window,
+    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, Subscription, Task, Window,
 };
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
+use tokio::sync::watch;
 
 use crate::ui::keyboard::is_secondary;
-use gssh::rdp::{RdpButton, RdpConnection, RdpFrame, RdpInput};
+use gssh::desktop::{DesktopFrame, PointerButton};
+use gssh::rdp::{RdpConnection, RdpInput};
+use gssh::vnc::{VncConnection, VncInput};
 
 /// Below this the server rejects the desktop. Above it, so does the display
 /// control path IronRDP adjusts toward.
@@ -24,24 +29,101 @@ const MIN_DESKTOP: f32 = 200.;
 const MAX_DESKTOP: f32 = 4096.;
 /// Wait out a drag of the window edge before asking the server to resize.
 const RESIZE_SETTLE: Duration = Duration::from_millis(400);
+/// Trackpad travel that makes one VNC wheel notch, the distance the RDP path
+/// counts as a line.
+const PIXELS_PER_NOTCH: f32 = 40.;
+
+/// The session a desktop view paints and sends input to.
+#[derive(Clone)]
+pub(crate) enum DesktopLink {
+    Rdp(RdpConnection),
+    Vnc(VncConnection),
+}
+
+impl DesktopLink {
+    fn subscribe_frames(&self) -> watch::Receiver<Option<DesktopFrame>> {
+        match self {
+            Self::Rdp(conn) => conn.subscribe_frames(),
+            Self::Vnc(conn) => conn.subscribe_frames(),
+        }
+    }
+
+    fn shares_clipboard(&self) -> bool {
+        match self {
+            Self::Rdp(conn) => conn.shares_clipboard(),
+            Self::Vnc(conn) => conn.shares_clipboard(),
+        }
+    }
+
+    fn offer_clipboard(&self, text: String) {
+        match self {
+            Self::Rdp(conn) => conn.offer_clipboard(text),
+            Self::Vnc(conn) => conn.offer_clipboard(text),
+        }
+    }
+
+    fn move_pointer(&self, x: u16, y: u16) {
+        match self {
+            Self::Rdp(conn) => conn.send(&[RdpInput::Move { x, y }]),
+            Self::Vnc(conn) => conn.send(&[VncInput::Move { x, y }]),
+        }
+    }
+
+    fn press(&self, x: u16, y: u16, button: PointerButton, pressed: bool) {
+        match self {
+            Self::Rdp(conn) => conn.send(&[RdpInput::Button {
+                x,
+                y,
+                button,
+                pressed,
+            }]),
+            Self::Vnc(conn) => conn.send(&[VncInput::Button {
+                x,
+                y,
+                button,
+                pressed,
+            }]),
+        }
+    }
+
+    fn resize(&self, width: u16, height: u16) {
+        match self {
+            Self::Rdp(conn) => conn.send(&[RdpInput::Resize { width, height }]),
+            Self::Vnc(conn) => conn.send(&[VncInput::Resize { width, height }]),
+        }
+    }
+}
 
 pub(crate) struct DesktopView {
     focus_handle: FocusHandle,
-    conn: Option<RdpConnection>,
+    link: Option<DesktopLink>,
+    /// Keys go out as X11 keysyms instead of RDP scancodes. Fixed for the
+    /// view, so a VNC tab keeps its keyboard while it reconnects.
+    is_vnc: bool,
     layout: Rc<Cell<Bounds<Pixels>>>,
     image: Option<Arc<RenderImage>>,
     /// The picture just replaced, dropped from the atlas on the next paint.
     retired: Option<Arc<RenderImage>>,
-    frame: Option<RdpFrame>,
+    frame: Option<DesktopFrame>,
     /// The desktop is resized with the tab. A fixed one is only scaled.
     follows_window: bool,
-    /// What the server is showing, once a frame has said so.
+    /// What the server is showing, once a frame has said so. For VNC, the
+    /// size last asked for: a server may settle on another size, and asking
+    /// again would only repeat.
     asked: Option<(u16, u16)>,
     pending_size: Option<(u16, u16)>,
     resize_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
     mods: HeldMods,
     held: Option<HeldKey>,
+    /// VNC keys down, with the keysym each went down as. A key is let go as
+    /// that keysym, even if shift has changed since.
+    vnc_keys: Vec<(String, u32)>,
+    /// Wheel travel not yet sent as a whole VNC notch, across and down.
+    wheel_rest: (f32, f32),
+    /// Lets go of held VNC keys when the view or the window loses the
+    /// keyboard, so a key-up that goes elsewhere does not leave them down.
+    focus_watch: Vec<Subscription>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,11 +156,12 @@ impl HeldKey {
 }
 
 impl DesktopView {
-    pub(crate) fn new(conn: RdpConnection, follows_window: bool, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(link: DesktopLink, follows_window: bool, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let mut view = Self {
             focus_handle,
-            conn: None,
+            link: None,
+            is_vnc: matches!(link, DesktopLink::Vnc(_)),
             layout: Rc::new(Cell::new(Bounds::default())),
             image: None,
             retired: None,
@@ -90,18 +173,28 @@ impl DesktopView {
             frame_task: None,
             mods: HeldMods::default(),
             held: None,
+            vnc_keys: Vec::new(),
+            wheel_rest: (0., 0.),
+            focus_watch: Vec::new(),
         };
-        view.follow(conn, cx);
+        view.follow(link, cx);
         view
     }
 
     /// The session reconnected. Frames and input follow the new connection,
     /// and the picture already on screen stays until the next one arrives.
-    pub(crate) fn follow(&mut self, conn: RdpConnection, cx: &mut Context<Self>) {
-        self.conn = Some(conn.clone());
+    pub(crate) fn follow(&mut self, link: DesktopLink, cx: &mut Context<Self>) {
+        self.link = Some(link.clone());
         self.mods = HeldMods::default();
         self.held = None;
-        let mut frames = conn.subscribe_frames();
+        self.vnc_keys.clear();
+        self.wheel_rest = (0., 0.);
+        if self.is_vnc {
+            // A new connection has not been asked for a size yet.
+            self.asked = None;
+            self.pending_size = None;
+        }
+        let mut frames = link.subscribe_frames();
         self.frame_task = Some(cx.spawn(async move |this, cx| loop {
             let frame = frames.borrow_and_update().clone();
             if let Some(frame) = frame {
@@ -120,14 +213,15 @@ impl DesktopView {
 
     /// The session gave up. The last picture stays; the connection does not.
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
-        self.conn = None;
+        self.link = None;
         self.resize_task = None;
         self.frame_task = None;
         self.pending_size = None;
+        self.vnc_keys.clear();
         cx.notify();
     }
 
-    fn show_frame(&mut self, frame: RdpFrame, cx: &mut Context<Self>) {
+    fn show_frame(&mut self, frame: DesktopFrame, cx: &mut Context<Self>) {
         if self
             .frame
             .as_ref()
@@ -138,7 +232,7 @@ impl DesktopView {
         let Some(image) = raster(&frame) else {
             return;
         };
-        if self.pending_size.is_none() {
+        if self.pending_size.is_none() && !self.is_vnc {
             self.asked = Some((
                 u16::try_from(frame.width).unwrap_or(u16::MAX),
                 u16::try_from(frame.height).unwrap_or(u16::MAX),
@@ -153,12 +247,30 @@ impl DesktopView {
     }
 
     fn note_layout(&mut self, bounds: Bounds<Pixels>, window: &Window, cx: &mut Context<Self>) {
-        if self.conn.is_none() || !self.follows_window {
+        if !self.follows_window {
             return;
         }
-        let scale = window.scale_factor();
-        let width = desktop_pixels(bounds.size.width.as_f32() * scale);
-        let height = desktop_pixels(bounds.size.height.as_f32() * scale);
+        let (width, height) = match &self.link {
+            None => return,
+            Some(DesktopLink::Rdp(_)) => {
+                let scale = window.scale_factor();
+                (
+                    desktop_pixels(bounds.size.width.as_f32() * scale),
+                    desktop_pixels(bounds.size.height.as_f32() * scale),
+                )
+            }
+            // Points, not device pixels: VNC has no scale setting, and a
+            // desktop of twice the pixels would draw everything half as large.
+            Some(DesktopLink::Vnc(conn)) => {
+                if !conn.resizes_remote() {
+                    return;
+                }
+                (
+                    desktop_pixels(bounds.size.width.as_f32()),
+                    desktop_pixels(bounds.size.height.as_f32()),
+                )
+            }
+        };
         if self.asked == Some((width, height)) || self.pending_size == Some((width, height)) {
             return;
         }
@@ -173,26 +285,43 @@ impl DesktopView {
                     return;
                 }
                 view.asked = Some((width, height));
-                view.send(&[RdpInput::Resize { width, height }]);
+                if let Some(link) = &view.link {
+                    link.resize(width, height);
+                }
             })
             .ok();
         }));
     }
 
-    fn send(&self, inputs: &[RdpInput]) {
-        if let Some(conn) = &self.conn {
+    fn send_rdp(&self, inputs: &[RdpInput]) {
+        if let Some(DesktopLink::Rdp(conn)) = &self.link {
             conn.send(inputs);
+        }
+    }
+
+    fn send_vnc(&self, inputs: &[VncInput]) {
+        if let Some(DesktopLink::Vnc(conn)) = &self.link {
+            conn.send(inputs);
+        }
+    }
+
+    /// False while a view-only VNC host is connected. Its keys stay with the
+    /// app, so its shortcuts still work.
+    fn accepts_input(&self) -> bool {
+        match &self.link {
+            Some(DesktopLink::Vnc(conn)) => conn.accepts_input(),
+            _ => true,
         }
     }
 
     /// Hand the local clipboard text to the remote before a click or a
     /// shortcut that may paste it there.
     fn offer_clipboard(&self, cx: &gpui::App) {
-        let Some(conn) = self.conn.as_ref().filter(|conn| conn.shares_clipboard()) else {
+        let Some(link) = self.link.as_ref().filter(|link| link.shares_clipboard()) else {
             return;
         };
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            conn.offer_clipboard(text);
+            link.offer_clipboard(text);
         }
     }
 
@@ -238,13 +367,20 @@ impl DesktopView {
         let Some((x, y)) = self.remote_point(event.position) else {
             return;
         };
-        self.send(&[RdpInput::Move { x, y }]);
+        if let Some(link) = &self.link {
+            link.move_pointer(x, y);
+        }
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         let Some((x, y)) = self.remote_point(event.position) else {
             return;
         };
+        if self.is_vnc {
+            self.vnc_scroll(event.delta, x, y);
+            cx.stop_propagation();
+            return;
+        }
         // A positive GPUI delta scrolls content downward, which is a wheel
         // toward the user: a negative RDP rotation.
         let (horizontal, raw) = match event.delta {
@@ -259,7 +395,7 @@ impl DesktopView {
         if units == 0 {
             return;
         }
-        self.send(&[RdpInput::Wheel {
+        self.send_rdp(&[RdpInput::Wheel {
             x,
             y,
             units,
@@ -268,22 +404,67 @@ impl DesktopView {
         cx.stop_propagation();
     }
 
+    /// VNC scrolls in whole notches. A trackpad's small steps add up here
+    /// until they make one. A positive delta moves the content down, which
+    /// is a notch toward the top.
+    fn vnc_scroll(&mut self, delta: ScrollDelta, x: u16, y: u16) {
+        let (across, down) = match delta {
+            ScrollDelta::Lines(delta) => (delta.x, delta.y),
+            ScrollDelta::Pixels(delta) => (
+                delta.x.as_f32() / PIXELS_PER_NOTCH,
+                delta.y.as_f32() / PIXELS_PER_NOTCH,
+            ),
+        };
+        self.wheel_rest.0 += across;
+        self.wheel_rest.1 += down;
+        let mut inputs = Vec::new();
+        for (rest, horizontal) in [
+            (&mut self.wheel_rest.1, false),
+            (&mut self.wheel_rest.0, true),
+        ] {
+            let steps = rest.trunc();
+            if steps != 0. {
+                *rest -= steps;
+                inputs.push(VncInput::Wheel {
+                    x,
+                    y,
+                    steps: steps.clamp(-127., 127.) as i16,
+                    horizontal,
+                });
+            }
+        }
+        self.send_vnc(&inputs);
+    }
+
     fn pointer_button(&mut self, button: MouseButton, position: Point<Pixels>, pressed: bool) {
-        let Some(button) = rdp_button(button) else {
+        let Some(button) = pointer_button(button) else {
             return;
         };
         let Some((x, y)) = self.remote_point(position) else {
             return;
         };
-        self.send(&[RdpInput::Button {
-            x,
-            y,
-            button,
-            pressed,
-        }]);
+        if let Some(link) = &self.link {
+            link.press(x, y, button, pressed);
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_vnc {
+            self.vnc_key_down(event, cx);
+        } else {
+            self.rdp_key_down(event, cx);
+        }
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_vnc {
+            self.vnc_key_up(event, cx);
+        } else {
+            self.rdp_key_up(event, cx);
+        }
+    }
+
+    fn rdp_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.try_paste(&event.keystroke, cx) {
             cx.stop_propagation();
             return;
@@ -292,7 +473,7 @@ impl DesktopView {
         if is_modifier_key(&event.keystroke.key) {
             self.offer_clipboard(cx);
             inputs.extend(self.sync_mods(&event.keystroke, true));
-            self.send(&inputs);
+            self.send_rdp(&inputs);
             cx.stop_propagation();
             return;
         }
@@ -306,7 +487,7 @@ impl DesktopView {
                     pressed: true,
                 });
                 self.held = Some(HeldKey::Scan { code, extended });
-                self.send(&inputs);
+                self.send_rdp(&inputs);
                 cx.stop_propagation();
             }
             return;
@@ -328,7 +509,7 @@ impl DesktopView {
                 if let Some(unit) = units[..count].last().copied() {
                     self.held = Some(HeldKey::Unicode(unit));
                 }
-                self.send(&inputs);
+                self.send_rdp(&inputs);
                 cx.stop_propagation();
                 return;
             }
@@ -341,19 +522,19 @@ impl DesktopView {
                 pressed: true,
             });
             self.held = Some(HeldKey::Scan { code, extended });
-            self.send(&inputs);
+            self.send_rdp(&inputs);
             cx.stop_propagation();
         }
     }
 
-    fn on_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn rdp_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
         let mut inputs = Vec::new();
         if let Some(held) = self.held.take() {
             inputs.push(held.release());
         }
         inputs.extend(self.sync_mods(&event.keystroke, true));
         if !inputs.is_empty() {
-            self.send(&inputs);
+            self.send_rdp(&inputs);
             cx.stop_propagation();
         }
     }
@@ -368,8 +549,8 @@ impl DesktopView {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return true;
         };
-        if let Some(conn) = self.conn.as_ref() {
-            conn.offer_clipboard(text.clone());
+        if let Some(link) = self.link.as_ref() {
+            link.offer_clipboard(text.clone());
         }
         let mut inputs = self.sync_mods(keystroke, false);
         if let Some(held) = self.held.take() {
@@ -414,7 +595,7 @@ impl DesktopView {
                 pressed: false,
             });
         }
-        self.send(&inputs);
+        self.send_rdp(&inputs);
         true
     }
 
@@ -438,6 +619,147 @@ impl DesktopView {
             sync_one(false, &mut self.mods.shift, 0x2A, false, &mut inputs);
         }
         inputs
+    }
+
+    /// The modifiers go along as held, shift included: a VNC server reads a
+    /// shifted keysym with shift down as the character it names.
+    fn vnc_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        if self.vnc_paste(keystroke, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if is_modifier_key(&keystroke.key) {
+            self.offer_clipboard(cx);
+            let inputs = self.vnc_sync_mods(&keystroke.modifiers);
+            self.send_vnc(&inputs);
+            cx.stop_propagation();
+            return;
+        }
+        let Some(keysym) = keysym::for_keystroke(keystroke) else {
+            return;
+        };
+        let mut inputs = self.vnc_sync_mods(&keystroke.modifiers);
+        // A key already down is repeating, as the keysym it went down as.
+        let keysym = match self.vnc_keys.iter().find(|(key, _)| *key == keystroke.key) {
+            Some(&(_, held)) => held,
+            None => {
+                self.vnc_keys.push((keystroke.key.clone(), keysym));
+                keysym
+            }
+        };
+        inputs.push(VncInput::Key {
+            keysym,
+            pressed: true,
+        });
+        self.send_vnc(&inputs);
+        cx.stop_propagation();
+    }
+
+    fn vnc_key_up(&mut self, event: &KeyUpEvent, cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            return;
+        }
+        let mut inputs = Vec::new();
+        if let Some(index) = self
+            .vnc_keys
+            .iter()
+            .position(|(key, _)| *key == event.keystroke.key)
+        {
+            let (_, keysym) = self.vnc_keys.remove(index);
+            inputs.push(VncInput::Key {
+                keysym,
+                pressed: false,
+            });
+        }
+        inputs.extend(self.vnc_sync_mods(&event.keystroke.modifiers));
+        if !inputs.is_empty() {
+            self.send_vnc(&inputs);
+            cx.stop_propagation();
+        }
+    }
+
+    /// Local clipboard, typed in, as the RDP path does. Every key and
+    /// modifier is let go first: the command key behind the paste would
+    /// otherwise turn each character into a shortcut.
+    fn vnc_paste(&mut self, keystroke: &Keystroke, cx: &Context<Self>) -> bool {
+        if keystroke.key != "v" || !is_secondary(&keystroke.modifiers) || keystroke.modifiers.shift
+        {
+            return false;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return true;
+        };
+        if let Some(link) = self.link.as_ref() {
+            link.offer_clipboard(text.clone());
+        }
+        let mut inputs = self.vnc_release_keys();
+        for ch in text.replace("\r\n", "\n").chars() {
+            let keysym = match ch {
+                '\n' | '\r' => keysym::RETURN,
+                '\t' => keysym::TAB,
+                ch if ch.is_control() => continue,
+                ch => keysym::for_char(ch),
+            };
+            for pressed in [true, false] {
+                inputs.push(VncInput::Key { keysym, pressed });
+            }
+        }
+        self.send_vnc(&inputs);
+        true
+    }
+
+    fn vnc_sync_mods(&mut self, want: &Modifiers) -> Vec<VncInput> {
+        let mut inputs = Vec::new();
+        for (wanted, held, keysym) in [
+            (want.control, &mut self.mods.control, keysym::CONTROL_L),
+            (want.alt, &mut self.mods.alt, keysym::ALT_L),
+            (want.platform, &mut self.mods.meta, keysym::SUPER_L),
+            (want.shift, &mut self.mods.shift, keysym::SHIFT_L),
+        ] {
+            if *held != wanted {
+                *held = wanted;
+                inputs.push(VncInput::Key {
+                    keysym,
+                    pressed: wanted,
+                });
+            }
+        }
+        inputs
+    }
+
+    /// Every VNC key and modifier this view holds down, let go.
+    fn vnc_release_keys(&mut self) -> Vec<VncInput> {
+        let mut inputs: Vec<VncInput> = self
+            .vnc_keys
+            .drain(..)
+            .map(|(_, keysym)| VncInput::Key {
+                keysym,
+                pressed: false,
+            })
+            .collect();
+        inputs.extend(self.vnc_sync_mods(&Modifiers::default()));
+        inputs
+    }
+
+    fn watch_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_vnc || !self.focus_watch.is_empty() {
+            return;
+        }
+        let blur = cx.on_blur(&self.focus_handle, window, |view, _, _| {
+            let inputs = view.vnc_release_keys();
+            view.send_vnc(&inputs);
+        });
+        let activation = cx.observe_window_activation(window, |view, window, _| {
+            if !window.is_window_active() {
+                let inputs = view.vnc_release_keys();
+                view.send_vnc(&inputs);
+            }
+        });
+        self.focus_watch = vec![blur, activation];
     }
 }
 
@@ -464,6 +786,7 @@ impl Render for DesktopView {
         if let Some(old) = self.retired.take() {
             let _ = window.drop_image(old);
         }
+        self.watch_focus(window, cx);
         let bounds = self.layout.get();
         if bounds.size.width > px(0.) && bounds.size.height > px(0.) {
             self.note_layout(bounds, window, cx);
@@ -472,7 +795,7 @@ impl Render for DesktopView {
         let image = self.image.clone();
         let frame = self.frame.as_ref().map(|frame| (frame.width, frame.height));
         div()
-            .id("rdp-desktop")
+            .id("remote-desktop")
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(gpui::rgb(0x000000))
@@ -508,7 +831,7 @@ impl Render for DesktopView {
     }
 }
 
-fn raster(frame: &RdpFrame) -> Option<Arc<RenderImage>> {
+fn raster(frame: &DesktopFrame) -> Option<Arc<RenderImage>> {
     let buffer = RgbaImage::from_raw(frame.width, frame.height, frame.bgra.as_ref().clone())?;
     Some(Arc::new(RenderImage::new(smallvec![Frame::new(buffer)])))
 }
@@ -538,11 +861,11 @@ fn letterbox(bounds: Bounds<Pixels>, width: u32, height: u32) -> Option<Bounds<P
     })
 }
 
-fn rdp_button(button: MouseButton) -> Option<RdpButton> {
+fn pointer_button(button: MouseButton) -> Option<PointerButton> {
     match button {
-        MouseButton::Left => Some(RdpButton::Left),
-        MouseButton::Right => Some(RdpButton::Right),
-        MouseButton::Middle => Some(RdpButton::Middle),
+        MouseButton::Left => Some(PointerButton::Left),
+        MouseButton::Right => Some(PointerButton::Right),
+        MouseButton::Middle => Some(PointerButton::Middle),
         MouseButton::Navigate(_) => None,
     }
 }

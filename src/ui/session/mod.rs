@@ -43,6 +43,7 @@ use gssh::ssh::{
 };
 use gssh::telnet::{TelnetConnection, TelnetEvent, TelnetTarget};
 use gssh::vault::ConnectionKind;
+use gssh::vnc::{VncConnection, VncEvent, VncSettings, VncTarget};
 use zeroize::Zeroizing;
 
 pub struct DisconnectedState {
@@ -951,21 +952,28 @@ async fn drive_telnet(
     SessionOutcome::Ended(None)
 }
 
-/// The RDP counterpart of the Telnet reconnect loop. Each try dials again,
-/// with the password the route holds now, so a retype on the error card is
-/// the one that is sent.
-async fn run_rdp_loop(
+/// What a remote desktop session dials with, besides the route.
+#[derive(Clone, Copy)]
+enum DesktopProtocol {
+    Rdp(RdpSettings),
+    Vnc(VncSettings),
+}
+
+/// The RDP and VNC counterpart of the Telnet reconnect loop. Each try dials
+/// again, with the password the route holds now, so a retype on the error
+/// card is the one that is sent.
+async fn run_desktop_loop(
     this: WeakEntity<ServerSession>,
     cx: &mut AsyncApp,
     route: Arc<Mutex<SshRoute>>,
-    settings: RdpSettings,
+    protocol: DesktopProtocol,
     retry_rx: async_channel::Receiver<()>,
     target_id: String,
     mut connect_started: Instant,
 ) {
     let mut attempt: u32 = 0;
     loop {
-        let Some(target) = rdp_target_from_route(&route, settings) else {
+        let Some(link) = dial_desktop(&route, protocol) else {
             let _ = this.update(cx, |session, cx| {
                 session.give_up(
                     ConnectFailure {
@@ -979,13 +987,12 @@ async fn run_rdp_loop(
             });
             break;
         };
-        let conn = RdpConnection::spawn(target);
         if this
             .update(cx, |session, cx| {
                 if let Some(desktop) = &session.desktop {
-                    desktop.update(cx, |desktop, cx| desktop.follow(conn.clone(), cx));
+                    desktop.update(cx, |desktop, cx| desktop.follow(link.clone(), cx));
                 }
-                session.rdp = Some(conn.clone());
+                session.desktop_link = Some(link.clone());
                 session.connection = None;
                 session.connection_generation = session.connection_generation.wrapping_add(1);
                 session.reconnecting = (attempt > 0).then_some(attempt);
@@ -998,7 +1005,11 @@ async fn run_rdp_loop(
             break;
         }
 
-        let failure = match drive_rdp(conn, connect_started, &this, cx).await {
+        let outcome = match link {
+            desktop::DesktopLink::Rdp(conn) => drive_rdp(conn, connect_started, &this, cx).await,
+            desktop::DesktopLink::Vnc(conn) => drive_vnc(conn, connect_started, &this, cx).await,
+        };
+        let failure = match outcome {
             SessionOutcome::Gone => break,
             SessionOutcome::Ended(failure) => failure.unwrap_or_else(|| ConnectFailure {
                 entry_id: target_id.clone(),
@@ -1048,18 +1059,69 @@ async fn run_rdp_loop(
     }
 }
 
-fn rdp_target_from_route(route: &Arc<Mutex<SshRoute>>, settings: RdpSettings) -> Option<RdpTarget> {
-    let route = route.lock().expect("route mutex");
-    let gssh::ssh::AuthCredential::Password(password) = &route.target.credential else {
-        return None;
+/// Start a connection from what the route holds now. `None` is an RDP host
+/// without a password; a VNC host may have none.
+fn dial_desktop(
+    route: &Arc<Mutex<SshRoute>>,
+    protocol: DesktopProtocol,
+) -> Option<desktop::DesktopLink> {
+    let (host, port, username, password, proxy) = {
+        let route = route.lock().expect("route mutex");
+        let password = match &route.target.credential {
+            gssh::ssh::AuthCredential::Password(password) => Some(password.clone()),
+            _ => None,
+        };
+        (
+            route.target.host.clone(),
+            route.target.port,
+            route.target.username.clone(),
+            password,
+            route.proxy.clone(),
+        )
     };
-    Some(RdpTarget::new(
-        route.target.host.clone(),
-        route.target.port,
-        &route.target.username,
-        password.clone(),
-        settings,
-    ))
+    Some(match protocol {
+        DesktopProtocol::Rdp(settings) => desktop::DesktopLink::Rdp(RdpConnection::spawn(
+            RdpTarget::new(host, port, &username, password?, settings),
+        )),
+        DesktopProtocol::Vnc(settings) => {
+            desktop::DesktopLink::Vnc(VncConnection::spawn(VncTarget {
+                host,
+                port,
+                proxy,
+                username,
+                password: password.unwrap_or_default(),
+                settings,
+            }))
+        }
+    })
+}
+
+/// The desktop is up: show it, and keep a password typed on the error card
+/// if the user asked to.
+fn desktop_connected(
+    session: &mut ServerSession,
+    link: desktop::DesktopLink,
+    follows_window: bool,
+    elapsed: Duration,
+    cx: &mut Context<ServerSession>,
+) {
+    let is_reconnect = session.has_connected_once;
+    if session.desktop.is_none() {
+        let desktop = cx.new(|cx| desktop::DesktopView::new(link, follows_window, cx));
+        session.desktop = Some(desktop);
+    }
+    session.has_connected_once = true;
+    session.reconnecting = None;
+    session.disconnected = None;
+    session.connect_failure = None;
+    session.is_terminal_focus_pending = true;
+    for (entry_id, password) in std::mem::take(&mut session.passwords_to_save) {
+        cx.emit(ServerSessionEvent::PasswordAccepted { entry_id, password });
+    }
+    cx.emit(ServerSessionEvent::Connected {
+        elapsed: shown_connect_time(elapsed, is_reconnect, false),
+    });
+    cx.notify();
 }
 
 async fn drive_rdp(
@@ -1074,32 +1136,19 @@ async fn drive_rdp(
             RdpEvent::Connected { width, height } => {
                 let elapsed = connect_started.elapsed();
                 let built = this.update(cx, |session, cx| {
-                    let is_reconnect = session.has_connected_once;
                     tracing::info!(
                         target: "g-ssh::rdp",
                         host = %session.conn_info.display_name(),
                         width,
                         height,
                         elapsed_ms = elapsed.as_millis() as u64,
-                        is_reconnect,
+                        is_reconnect = session.has_connected_once,
                         "rdp session ready"
                     );
-                    if session.desktop.is_none() {
-                        let follows_window =
-                            session.conn_info.rdp.resolution == RdpResolution::FitWindow;
-                        let desktop = cx
-                            .new(|cx| desktop::DesktopView::new(conn.clone(), follows_window, cx));
-                        session.desktop = Some(desktop);
-                    }
-                    session.has_connected_once = true;
-                    session.reconnecting = None;
-                    session.disconnected = None;
-                    session.connect_failure = None;
-                    session.is_terminal_focus_pending = true;
-                    cx.emit(ServerSessionEvent::Connected {
-                        elapsed: shown_connect_time(elapsed, is_reconnect, false),
-                    });
-                    cx.notify();
+                    let follows_window =
+                        session.conn_info.rdp.resolution == RdpResolution::FitWindow;
+                    let link = desktop::DesktopLink::Rdp(conn.clone());
+                    desktop_connected(session, link, follows_window, elapsed, cx);
                 });
                 if built.is_err() {
                     return SessionOutcome::Gone;
@@ -1141,6 +1190,73 @@ async fn drive_rdp(
                     },
                     is_password_rejected: false,
                     is_transient: is_transient && !is_classic_rdp_security(&message),
+                }));
+            }
+        }
+    }
+    SessionOutcome::Ended(None)
+}
+
+async fn drive_vnc(
+    conn: VncConnection,
+    connect_started: Instant,
+    this: &WeakEntity<ServerSession>,
+    cx: &mut AsyncApp,
+) -> SessionOutcome {
+    let events = conn.subscribe_events();
+    while let Ok(event) = events.recv().await {
+        match event {
+            VncEvent::Connected {
+                width,
+                height,
+                name,
+            } => {
+                let elapsed = connect_started.elapsed();
+                let built = this.update(cx, |session, cx| {
+                    tracing::info!(
+                        target: "g-ssh::vnc",
+                        host = %session.conn_info.display_name(),
+                        width,
+                        height,
+                        desktop = %name,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        is_reconnect = session.has_connected_once,
+                        "vnc session ready"
+                    );
+                    let follows_window = session.conn_info.vnc.resize_remote;
+                    let link = desktop::DesktopLink::Vnc(conn.clone());
+                    desktop_connected(session, link, follows_window, elapsed, cx);
+                });
+                if built.is_err() {
+                    return SessionOutcome::Gone;
+                }
+            }
+            VncEvent::Failed(failure) => {
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message: failure.message,
+                    is_password_rejected: failure.is_auth,
+                    is_transient: failure.is_transient,
+                }));
+            }
+            VncEvent::RemoteClipboard(text) => {
+                cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+            }
+            VncEvent::Closed {
+                message,
+                is_transient,
+            } => {
+                let Ok(entry_id) = this.update(cx, |session, _| session.server_id.clone()) else {
+                    return SessionOutcome::Gone;
+                };
+                return SessionOutcome::Ended(Some(ConnectFailure {
+                    entry_id,
+                    message,
+                    is_password_rejected: false,
+                    is_transient,
                 }));
             }
         }
@@ -1219,9 +1335,11 @@ pub struct ServerSession {
     pub connection: Option<SshConnection>,
     /// Set for a Telnet host. SSH and SFTP leave this empty.
     pub(crate) telnet: Option<TelnetConnection>,
-    /// Set for an RDP host. The desktop view holds a clone while it is live.
-    rdp: Option<RdpConnection>,
-    /// The remote desktop. Present once an RDP session has shown a frame.
+    /// Set for an RDP or VNC host. The desktop view holds a clone while it
+    /// is live.
+    desktop_link: Option<desktop::DesktopLink>,
+    /// The remote desktop. Present once an RDP or VNC session has shown a
+    /// frame.
     pub(crate) desktop: Option<Entity<desktop::DesktopView>>,
     /// True after a connect has shown a shell or a file browser. A later drop
     /// can then retry, including Telnet, which has no browser to mark it by.
@@ -1337,6 +1455,7 @@ impl ServerSession {
         let idle_label = match conn_info.kind {
             ConnectionKind::Telnet => Some("Telnet"),
             ConnectionKind::Rdp => Some("Remote Desktop"),
+            ConnectionKind::Vnc => Some("VNC"),
             ConnectionKind::Ssh | ConnectionKind::Sftp => None,
         };
         let server_panel = cx.new(|cx| {
@@ -1376,17 +1495,21 @@ impl ServerSession {
                 .await;
             });
             (None, Some(telnet), task)
-        } else if conn_info.kind == ConnectionKind::Rdp {
+        } else if conn_info.kind.is_remote_desktop() {
             let route = route.clone();
-            let settings = conn_info.rdp;
+            let protocol = if conn_info.kind == ConnectionKind::Vnc {
+                DesktopProtocol::Vnc(conn_info.vnc)
+            } else {
+                DesktopProtocol::Rdp(conn_info.rdp)
+            };
             let retry_rx = retry_rx.clone();
             let target_id = server_id.clone();
             let task = cx.spawn(async move |this, cx| {
-                run_rdp_loop(
+                run_desktop_loop(
                     this,
                     cx,
                     route,
-                    settings,
+                    protocol,
                     retry_rx,
                     target_id,
                     connect_started,
@@ -1524,7 +1647,7 @@ impl ServerSession {
             conn_info: stored_conn,
             connection: ssh_conn,
             telnet: telnet_conn,
-            rdp: None,
+            desktop_link: None,
             desktop: None,
             has_connected_once: false,
             browser: None,
@@ -1731,7 +1854,7 @@ impl ServerSession {
         );
         self.connection = None;
         self.telnet = None;
-        self.rdp = None;
+        self.desktop_link = None;
         if let Some(desktop) = &self.desktop {
             desktop.update(cx, |desktop, cx| desktop.disconnect(cx));
         }

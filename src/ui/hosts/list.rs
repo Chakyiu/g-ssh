@@ -266,6 +266,7 @@ impl ServersView {
                 match kind {
                     gssh::vault::ConnectionKind::Telnet => "Copy Telnet command",
                     gssh::vault::ConnectionKind::Rdp => "Copy RDP command",
+                    gssh::vault::ConnectionKind::Vnc => "Copy VNC command",
                     gssh::vault::ConnectionKind::Ssh | gssh::vault::ConnectionKind::Sftp => {
                         "Copy SSH command"
                     }

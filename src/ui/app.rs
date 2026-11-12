@@ -45,7 +45,7 @@ use crate::ui::updates::service::{Download, UpdateService};
 use crate::ui::vault::passphrase::{PassphrasePromptEvent, PassphrasePromptView};
 use crate::ui::workspace::{FrontTab, WorkKind, Workspace, WorkspaceEvent};
 use crate::ui::{dialog_chrome, dialog_form, dialog_narrow, dialog_wide, VaultState};
-use gssh::ssh::connection::Connection;
+use gssh::ssh::connection::{Connection, ResolvedProxy};
 use gssh::ssh::route::{self, CredentialIssue};
 use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
 use gssh::ssh::{AuthCredential, ForwardState, SshHop, SshRoute, TransferOutcome};
@@ -1526,9 +1526,10 @@ impl AppView {
 
         let intent = match entry.kind {
             ConnectionKind::Sftp => ConnectIntent::OpenSftp,
-            ConnectionKind::Ssh | ConnectionKind::Telnet | ConnectionKind::Rdp => {
-                ConnectIntent::OpenTab
-            }
+            ConnectionKind::Ssh
+            | ConnectionKind::Telnet
+            | ConnectionKind::Rdp
+            | ConnectionKind::Vnc => ConnectIntent::OpenTab,
         };
         self.connect_with_prompt(entry, intent, window, cx);
     }
@@ -1761,7 +1762,21 @@ impl AppView {
                 self.set_status(message, cx);
                 return;
             }
-            rdp_route(&entry, password.clone())
+            desktop_route(&entry, password.clone(), None)
+        } else if entry.kind == ConnectionKind::Vnc {
+            // A host saved without a password signs in without one.
+            let password = match &credential {
+                AuthCredential::Password(password) => password.clone(),
+                _ => Zeroizing::new(String::new()),
+            };
+            match self.vnc_proxy(&entry, cx) {
+                Ok(proxy) => desktop_route(&entry, password, proxy),
+                Err(message) => {
+                    self.forget_pending_snippet(entry.id);
+                    self.set_status(message, cx);
+                    return;
+                }
+            }
         } else {
             match self.build_route(&entry, credential, cx) {
                 Ok(route) => route,
@@ -3362,6 +3377,7 @@ fn quick_connect_entry(
         startup_snippet: None,
         snippets: Vec::new(),
         rdp: Default::default(),
+        vnc: Default::default(),
         sort_order: 0,
         created_at: now,
         updated_at: now,
@@ -3372,7 +3388,10 @@ fn quick_connect_entry(
 fn primary_work(kind: ConnectionKind) -> WorkKind {
     match kind {
         ConnectionKind::Sftp => WorkKind::Sftp,
-        ConnectionKind::Ssh | ConnectionKind::Telnet | ConnectionKind::Rdp => WorkKind::Terminal,
+        ConnectionKind::Ssh
+        | ConnectionKind::Telnet
+        | ConnectionKind::Rdp
+        | ConnectionKind::Vnc => WorkKind::Terminal,
     }
 }
 
@@ -3394,9 +3413,14 @@ fn direct_route(entry: &ServerEntry) -> SshRoute {
     }
 }
 
-/// A route the session stores for an RDP host. IronRDP dials from the
-/// password on the target, including a password retyped on the error card.
-fn rdp_route(entry: &ServerEntry, password: Zeroizing<String>) -> SshRoute {
+/// A route the session stores for an RDP or VNC host. Each connect dials
+/// from the password on the target, including a password retyped on the
+/// error card. Only VNC dials through the proxy.
+fn desktop_route(
+    entry: &ServerEntry,
+    password: Zeroizing<String>,
+    proxy: Option<ResolvedProxy>,
+) -> SshRoute {
     SshRoute {
         jumps: Vec::new(),
         target: SshHop {
@@ -3408,7 +3432,7 @@ fn rdp_route(entry: &ServerEntry, password: Zeroizing<String>) -> SshRoute {
             credential: AuthCredential::Password(password),
             expected_host_key: None,
         },
-        proxy: None,
+        proxy,
     }
 }
 
@@ -3419,6 +3443,15 @@ impl AppView {
         let vm = vault.manager()?;
         route::resolved_proxy(vm, entry.id)
             .map(|_| "RDP dials the host directly, and this host uses a proxy.".to_string())
+    }
+
+    /// The proxy a VNC host is dialled through, like a Telnet host's.
+    fn vnc_proxy(&self, entry: &ServerEntry, cx: &App) -> Result<Option<ResolvedProxy>, String> {
+        let vault = self.vault_state.read(cx);
+        let Some(vm) = vault.manager() else {
+            return Err("The vault is locked.".to_string());
+        };
+        Ok(route::resolved_proxy(vm, entry.id))
     }
 
     fn telnet_target(&self, entry: &ServerEntry, cx: &App) -> Result<TelnetTarget, String> {
@@ -3444,6 +3477,7 @@ fn connection_info(entry: &ServerEntry) -> Connection {
         username: entry.username.clone(),
         kind: entry.kind,
         rdp: entry.rdp,
+        vnc: entry.vnc,
     }
 }
 

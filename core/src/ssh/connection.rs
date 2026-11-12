@@ -8,6 +8,8 @@ pub struct Connection {
     pub kind: ConnectionKind,
     /// Only read for an RDP host.
     pub rdp: crate::rdp::RdpSettings,
+    /// Only read for a VNC host.
+    pub vnc: crate::vnc::VncSettings,
 }
 
 /// How a saved host is reached. Missing from older connection files, which
@@ -20,6 +22,7 @@ pub enum ConnectionKind {
     Sftp,
     Telnet,
     Rdp,
+    Vnc,
 }
 
 impl ConnectionKind {
@@ -29,6 +32,7 @@ impl ConnectionKind {
             ConnectionKind::Sftp => "SFTP",
             ConnectionKind::Telnet => "Telnet",
             ConnectionKind::Rdp => "RDP",
+            ConnectionKind::Vnc => "VNC",
         }
     }
 
@@ -36,6 +40,7 @@ impl ConnectionKind {
         match self {
             ConnectionKind::Telnet => 23,
             ConnectionKind::Rdp => 3389,
+            ConnectionKind::Vnc => 5900,
             ConnectionKind::Ssh | ConnectionKind::Sftp => 22,
         }
     }
@@ -44,14 +49,20 @@ impl ConnectionKind {
         *self == ConnectionKind::Ssh
     }
 
-    /// SSH and SFTP both log in over SSH. Telnet and RDP do not.
+    /// SSH and SFTP both log in over SSH. Telnet, RDP and VNC do not.
     pub fn uses_ssh(self) -> bool {
         matches!(self, ConnectionKind::Ssh | ConnectionKind::Sftp)
+    }
+
+    /// RDP and VNC open a remote desktop instead of a terminal.
+    pub fn is_remote_desktop(self) -> bool {
+        matches!(self, ConnectionKind::Rdp | ConnectionKind::Vnc)
     }
 }
 
 /// `user@host` with the port only when it is not the kind's default.
-/// An empty user is left off, which is normal for Telnet. RDP keeps its user.
+/// An empty user is left off, which is normal for Telnet and VNC. RDP keeps
+/// its user.
 pub fn endpoint_label(kind: ConnectionKind, username: &str, host: &str, port: u16) -> String {
     let address = if port == kind.default_port() {
         host.to_string()
@@ -219,6 +230,14 @@ mod tests {
         assert_eq!(
             endpoint_label(ConnectionKind::Rdp, "ada", "desktop", 3390),
             "ada@desktop:3390"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Vnc, "", "screen", 5900),
+            "screen"
+        );
+        assert_eq!(
+            endpoint_label(ConnectionKind::Vnc, "", "screen", 5901),
+            "screen:5901"
         );
     }
 

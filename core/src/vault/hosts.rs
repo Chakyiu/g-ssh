@@ -505,6 +505,7 @@ fn connection_file(
             startup_snippet: entry.startup_snippet,
             snippets: entry.snippets.clone(),
             rdp: entry.rdp,
+            vnc: entry.vnc,
             sort_order: entry.sort_order,
             created_at: entry.created_at,
             updated_at: entry.updated_at,
@@ -583,6 +584,7 @@ fn entry_from_file(
             startup_snippet: file.startup_snippet,
             snippets: file.snippets,
             rdp: file.rdp,
+            vnc: file.vnc,
             sort_order: file.sort_order,
             created_at: file.created_at,
             updated_at: file.updated_at,
@@ -631,6 +633,9 @@ struct ConnectionFile {
     /// See [`super::model::ServerEntry::rdp`].
     #[serde(default, skip_serializing_if = "crate::rdp::RdpSettings::is_default")]
     rdp: crate::rdp::RdpSettings,
+    /// See [`super::model::ServerEntry::vnc`].
+    #[serde(default, skip_serializing_if = "crate::vnc::VncSettings::is_default")]
+    vnc: crate::vnc::VncSettings,
     /// See [`super::model::ServerEntry::sort_order`].
     #[serde(default, skip_serializing_if = "is_unset_order")]
     sort_order: i64,
@@ -755,5 +760,37 @@ mod tests {
         let written = serde_json::to_string(&file).unwrap();
         let read: ConnectionFile = serde_json::from_str(&written).unwrap();
         assert_eq!(read.rdp, settings);
+    }
+
+    #[test]
+    fn vnc_hosts_round_trip_and_omit_default_settings() {
+        use crate::vnc::{VncQuality, VncSettings};
+
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000002",
+            "label": "screen",
+            "host": "screen.example.com",
+            "port": 5900,
+            "kind": "vnc",
+            "username": "",
+            "auth": { "method": "agent" }
+        }"#;
+        let mut file: ConnectionFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.kind, crate::ssh::connection::ConnectionKind::Vnc);
+        assert!(file.vnc.is_default());
+        let written = serde_json::to_string(&file).unwrap();
+        assert!(!written.contains("\"vnc\":"), "{written}");
+
+        let settings = VncSettings {
+            quality: VncQuality::Lossless,
+            resize_remote: true,
+            view_only: false,
+            clipboard: true,
+        };
+        file.vnc = settings;
+        let written = serde_json::to_string(&file).unwrap();
+        assert!(written.contains("\"quality\":\"lossless\""), "{written}");
+        let read: ConnectionFile = serde_json::from_str(&written).unwrap();
+        assert_eq!(read.vnc, settings);
     }
 }

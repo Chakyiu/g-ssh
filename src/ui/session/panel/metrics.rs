@@ -15,7 +15,7 @@ use super::{format_bytes, info_row, note, section_title, share, Reading, ServerP
 use crate::host_stats::SystemInfo;
 use crate::theme;
 use crate::ui::hosts::icon::host_icon;
-use gssh::vault::{AuthMethod, ConnectionKind, ProxyChoice, ServerEntry, VaultManager};
+use gssh::vault::{AuthMethod, ProxyChoice, ServerEntry, VaultManager};
 
 const CHART_HEIGHT: f32 = 48.;
 /// Keeps a line at zero clear of the card's bottom border.
@@ -457,7 +457,7 @@ fn system_rows(info: &SystemInfo) -> Vec<(&'static str, String)> {
 
 /// How g-ssh reaches the host, as the vault has it.
 fn connection_rows(entry: &ServerEntry, vault: &VaultManager) -> Vec<(&'static str, String)> {
-    let endpoint = if entry.kind == ConnectionKind::Telnet && entry.username.is_empty() {
+    let endpoint = if entry.username.is_empty() {
         format!("{}:{}", entry.host, entry.port)
     } else {
         format!("{}@{}:{}", entry.username, entry.host, entry.port)

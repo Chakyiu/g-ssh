@@ -1370,7 +1370,7 @@ impl Sidebar {
             .iter()
             .any(|(id, _)| id == &entry_id.to_string());
         let mut items = Vec::new();
-        if kind == ConnectionKind::Rdp {
+        if kind.is_remote_desktop() {
             items.push(
                 ContextMenuItem::new(
                     "host-menu-desktop",
@@ -1381,7 +1381,7 @@ impl Sidebar {
                         cx.notify();
                     }),
                 )
-                .icon("icons/monitor.svg"),
+                .icon(crate::ui::hosts::icon::connection_icon(kind)),
             );
         } else if kind != ConnectionKind::Sftp {
             items.push(

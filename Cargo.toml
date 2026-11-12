@@ -2,7 +2,7 @@
 name = "g-ssh"
 version = "0.3.6"
 edition = "2021"
-description = "SSH, SFTP, Telnet and RDP client"
+description = "SSH, SFTP, Telnet, RDP and VNC client"
 license = "MIT"
 authors = ["chakyiu"]
 repository = "https://github.com/Chakyiu/g-ssh"

@@ -530,6 +530,7 @@ fn write_selected(
                     .and_then(|name| vm.find_snippet_by_name(name)),
                 snippets: Vec::new(),
                 rdp: Default::default(),
+                vnc: Default::default(),
                 sort_order: 0,
                 created_at: now,
                 updated_at: now,

@@ -12,10 +12,10 @@ pub use crate::ssh::connection::{endpoint_label, ConnectionKind};
 pub use crypto::AgentChatKey;
 pub use error::VaultError;
 pub use model::{
-    rdp_command, resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, AgentSettings,
-    AuthMethod, Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef, ProxyDefSummary,
-    ProxyKind, ProxyMode, ProxyRouting, ServerEntry, ServerEntrySummary, Snippet, SnippetBody,
-    SnippetUsage, SshKey, SshKeySummary, Tag, MAX_JUMP_HOSTS,
+    rdp_command, resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, vnc_command,
+    AgentSettings, AuthMethod, Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef,
+    ProxyDefSummary, ProxyKind, ProxyMode, ProxyRouting, ServerEntry, ServerEntrySummary, Snippet,
+    SnippetBody, SnippetUsage, SshKey, SshKeySummary, Tag, MAX_JUMP_HOSTS,
 };
 pub use recovery::RecoveryPhrase;
 
@@ -914,6 +914,9 @@ impl VaultManager {
         if entry.kind == crate::ssh::connection::ConnectionKind::Rdp {
             return Ok(crate::vault::rdp_command(entry));
         }
+        if entry.kind == crate::ssh::connection::ConnectionKind::Vnc {
+            return Ok(crate::vault::vnc_command(entry));
+        }
         let chain = resolve_jump_chain(entry, &self.payload.entries).unwrap_or_else(|e| {
             // A broken chain cannot be written as -J; the direct command beats copying nothing.
             tracing::warn!(error = %e, host = %entry.host, "jump chain is broken, copying the direct ssh command");
@@ -1708,6 +1711,7 @@ mod tests {
             startup_snippet: None,
             snippets: Vec::new(),
             rdp: Default::default(),
+            vnc: Default::default(),
             sort_order: 0,
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
@@ -3103,6 +3107,19 @@ mod tests {
     fn ssh_command_does_not_let_a_host_pass_as_an_option() {
         let db = host_entry("", "-oProxyCommand=id", 2222);
         assert_eq!(ssh_command(&[&db]), "ssh -p 2222 -- '-oProxyCommand=id'");
+    }
+
+    #[test]
+    fn vnc_command_opens_screen_sharing_on_a_mac_and_vncviewer_elsewhere() {
+        let screen = host_entry("", "screen", 5900);
+        let other_port = host_entry("ada", "screen", 5901);
+        if cfg!(target_os = "macos") {
+            assert_eq!(vnc_command(&screen), "open 'vnc://screen'");
+            assert_eq!(vnc_command(&other_port), "open 'vnc://ada@screen:5901'");
+        } else {
+            assert_eq!(vnc_command(&screen), "vncviewer screen");
+            assert_eq!(vnc_command(&other_port), "vncviewer screen::5901");
+        }
     }
 
     #[test]

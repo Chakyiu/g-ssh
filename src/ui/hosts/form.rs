@@ -33,6 +33,7 @@ use gssh::vault::{
     AuthMethod, ConnectionKind, HostSnippet, PortForward, ServerEntry, ServerEntrySummary,
     VaultError,
 };
+use gssh::vnc::{VncQuality, VncSettings};
 
 pub enum FormMode {
     Add,
@@ -109,7 +110,9 @@ impl FormPage {
             Self::Authentication => "icons/lock.svg",
             Self::JumpHost => "icons/corner-left-up.svg",
             Self::Tunnels => "icons/arrow-right-left.svg",
-            Self::Session if kind == ConnectionKind::Rdp => "icons/monitor.svg",
+            Self::Session if kind.is_remote_desktop() => {
+                crate::ui::hosts::icon::connection_icon(kind)
+            }
             Self::Session => "icons/square-terminal.svg",
         };
         Icon::empty().path(path)
@@ -134,6 +137,9 @@ impl FormPage {
             Self::Session if kind == ConnectionKind::Rdp => {
                 "Desktop size and colours for this session."
             }
+            Self::Session if kind == ConnectionKind::Vnc => {
+                "Picture quality, input and clipboard for this session."
+            }
             Self::Session => "What is sent to the terminal after every connect.",
         }
     }
@@ -143,7 +149,7 @@ impl FormPage {
             Self::Connection => true,
             Self::Authentication => kind != ConnectionKind::Telnet,
             Self::JumpHost | Self::Tunnels => kind.uses_ssh(),
-            Self::Session => kind.uses_ssh() || kind == ConnectionKind::Rdp,
+            Self::Session => kind.uses_ssh() || kind.is_remote_desktop(),
         }
     }
 
@@ -191,6 +197,11 @@ pub struct ServerFormView {
     rdp_scale: RdpScale,
     rdp_audio: bool,
     rdp_clipboard: bool,
+
+    vnc_quality: VncQuality,
+    vnc_resize_remote: bool,
+    vnc_view_only: bool,
+    vnc_clipboard: bool,
 
     vault_state: Entity<VaultState>,
     selected_key_id: Option<Uuid>,
@@ -404,6 +415,7 @@ impl ServerFormView {
                 .placeholder("1080")
                 .default_value(SharedString::from(height.to_string()))
         });
+        let vnc = prefill.as_ref().map(|e| e.vnc).unwrap_or_default();
 
         for input in [
             &name_input,
@@ -501,6 +513,10 @@ impl ServerFormView {
             rdp_scale: rdp.scale,
             rdp_audio: rdp.audio,
             rdp_clipboard: rdp.clipboard,
+            vnc_quality: vnc.quality,
+            vnc_resize_remote: vnc.resize_remote,
+            vnc_view_only: vnc.view_only,
+            vnc_clipboard: vnc.clipboard,
             vault_state,
             selected_key_id,
             key_dropdown_open: false,
@@ -632,7 +648,8 @@ impl ServerFormView {
         if port_str.parse::<u16>().map(|p| p < 1).unwrap_or(true) {
             return false;
         }
-        if self.kind == ConnectionKind::Telnet {
+        // A VNC server may have no password, and only a Mac needs a user.
+        if self.kind == ConnectionKind::Telnet || self.kind == ConnectionKind::Vnc {
             return true;
         }
         if user.is_empty() {
@@ -673,6 +690,15 @@ impl ServerFormView {
             audio: self.rdp_audio,
             clipboard: self.rdp_clipboard,
         })
+    }
+
+    fn vnc_settings(&self) -> VncSettings {
+        VncSettings {
+            quality: self.vnc_quality,
+            resize_remote: self.vnc_resize_remote,
+            view_only: self.vnc_view_only,
+            clipboard: self.vnc_clipboard,
+        }
     }
 
     /// Move the tag input's text into the chip list (deduplicated,
@@ -906,7 +932,7 @@ impl ServerFormView {
             .unwrap_or(22);
         let username = strip_whitespace(&self.user_input.read(cx).value());
 
-        let auth = if self.kind == ConnectionKind::Rdp {
+        let auth = if self.kind.is_remote_desktop() {
             AuthMethod::Password(self.pass_input.read(cx).value().to_string())
         } else {
             match self.auth_mode {
@@ -946,6 +972,11 @@ impl ServerFormView {
         } else {
             RdpSettings::default()
         };
+        let vnc = if self.kind == ConnectionKind::Vnc {
+            self.vnc_settings()
+        } else {
+            VncSettings::default()
+        };
         let now = unix_now();
         let entry = match &self.mode {
             FormMode::Add => ServerEntry {
@@ -970,6 +1001,7 @@ impl ServerFormView {
                 startup_snippet,
                 snippets,
                 rdp,
+                vnc,
                 sort_order: 0,
                 created_at: now,
                 updated_at: now,
@@ -998,6 +1030,7 @@ impl ServerFormView {
                 startup_snippet,
                 snippets,
                 rdp,
+                vnc,
                 sort_order: 0,
                 created_at: *created_at,
                 updated_at: now,
@@ -1021,7 +1054,7 @@ impl ServerFormView {
                 .update(cx, |input, cx| input.set_value(next, window, cx));
         }
         self.kind = kind;
-        if kind == ConnectionKind::Rdp {
+        if kind.is_remote_desktop() {
             self.auth_mode = AuthMode::Password;
         }
         if !self.page.available_for(kind) {
@@ -1528,6 +1561,9 @@ impl Render for ServerFormView {
             ConnectionKind::Rdp => {
                 Some("Opens the remote desktop. A domain goes in front of the user, as CORP\\ada.")
             }
+            ConnectionKind::Vnc => Some(
+                "Opens the remote screen. Leave the username empty unless the server is a Mac, which signs in with its own account.",
+            ),
         };
 
         let active = if self.page.available_for(self.kind) {
@@ -1541,11 +1577,12 @@ impl Render for ServerFormView {
                 let kind_anchor: Rc<Cell<Point<Pixels>>> = Rc::new(Cell::new(Point::default()));
                 let kind_trigger: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
                 if self.kind_dropdown_open {
-                    const KINDS: [(ConnectionKind, &str); 4] = [
+                    const KINDS: [(ConnectionKind, &str); 5] = [
                         (ConnectionKind::Ssh, "SSH"),
                         (ConnectionKind::Sftp, "SFTP"),
                         (ConnectionKind::Telnet, "Telnet"),
                         (ConnectionKind::Rdp, "RDP"),
+                        (ConnectionKind::Vnc, "VNC"),
                     ];
                     let items: Vec<AnyElement> = KINDS
                         .into_iter()
@@ -1659,6 +1696,12 @@ impl Render for ServerFormView {
                     };
                     column = column.child(labeled(label, cx, auth_body));
                 }
+                if self.kind == ConnectionKind::Vnc {
+                    column = column.child(caption(
+                        "Leave it empty for a server without a password. With a username, this is that account's password on the Mac.",
+                        cx,
+                    ));
+                }
                 column.into_any_element()
             }
             FormPage::JumpHost => v_flex()
@@ -1677,6 +1720,9 @@ impl Render for ServerFormView {
                 }
                 if self.kind == ConnectionKind::Rdp {
                     column = column.child(self.render_rdp_display(cx));
+                }
+                if self.kind == ConnectionKind::Vnc {
+                    column = column.child(self.render_vnc_display(cx));
                 }
                 column.into_any_element()
             }
@@ -1993,6 +2039,70 @@ impl ServerFormView {
             )
     }
 
+    /// Picture, input and clipboard for a VNC host.
+    fn render_vnc_display(&self, cx: &Context<Self>) -> impl IntoElement {
+        let quality_switch = segmented(
+            "vnc-quality",
+            &[
+                (VncQuality::Lossless, "Lossless"),
+                (VncQuality::High, "High"),
+                (VncQuality::Low, "Low"),
+            ],
+            self.vnc_quality,
+            cx,
+            |this, quality, _, cx| {
+                this.vnc_quality = quality;
+                cx.notify();
+            },
+        );
+        let quality_note = match self.vnc_quality {
+            VncQuality::Lossless => "Every pixel exact. Best on a fast network.",
+            VncQuality::High => "Photos and video are sent as JPEG where the server can.",
+            VncQuality::Low => "Stronger compression, for a slow link.",
+        };
+        let resize_note = if self.vnc_resize_remote {
+            "The remote desktop is resized with the tab where the server allows it, as TigerVNC does. On other servers it is scaled to fit."
+        } else {
+            "The remote desktop keeps its size and is scaled to fit the tab."
+        };
+        v_flex()
+            .gap(px(14.))
+            .child(labeled("Quality", cx, quality_switch))
+            .child(caption(quality_note, cx))
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(
+                        Checkbox::new("vnc-resize")
+                            .checked(self.vnc_resize_remote)
+                            .label("Resize the remote desktop with the tab")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.vnc_resize_remote = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(caption(resize_note, cx))
+                    .child(
+                        Checkbox::new("vnc-clipboard")
+                            .checked(self.vnc_clipboard)
+                            .label("Share copied text with the remote")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.vnc_clipboard = *checked;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("vnc-view-only")
+                            .checked(self.vnc_view_only)
+                            .label("View only: send no keys or clicks")
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.vnc_view_only = *checked;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     fn close_dropdowns(&mut self, cx: &mut Context<Self>) {
         if self.key_dropdown_open
             || self.jump_dropdown_open
@@ -2012,16 +2122,15 @@ impl ServerFormView {
         if strip_whitespace(&self.host_input.read(cx).value()).is_empty() {
             return Some("Enter the computer name.");
         }
-        if self.kind != ConnectionKind::Telnet
-            && strip_whitespace(&self.user_input.read(cx).value()).is_empty()
-        {
+        let needs_user = !matches!(self.kind, ConnectionKind::Telnet | ConnectionKind::Vnc);
+        if needs_user && strip_whitespace(&self.user_input.read(cx).value()).is_empty() {
             return Some("Enter the username.");
         }
         let port = strip_whitespace(&self.port_input.read(cx).value());
         if port.parse::<u16>().map(|p| p < 1).unwrap_or(true) {
             return Some("The port is a number from 1 to 65535.");
         }
-        if self.kind == ConnectionKind::Telnet {
+        if matches!(self.kind, ConnectionKind::Telnet | ConnectionKind::Vnc) {
             return None;
         }
         if self.kind == ConnectionKind::Rdp && self.pass_input.read(cx).value().is_empty() {

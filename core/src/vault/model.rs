@@ -455,6 +455,35 @@ pub fn rdp_command(entry: &ServerEntry) -> String {
     command
 }
 
+/// `open vnc://` on a Mac, which starts Screen Sharing, and `vncviewer`
+/// elsewhere. vncviewer takes `host::port`, since `host:1` is a display
+/// number. The port is left off at 5900.
+pub fn vnc_command(entry: &ServerEntry) -> String {
+    let is_default_port = entry.port == crate::ssh::connection::ConnectionKind::Vnc.default_port();
+    if cfg!(target_os = "macos") {
+        let user = if entry.username.is_empty() {
+            String::new()
+        } else {
+            format!("{}@", entry.username)
+        };
+        let port = if is_default_port {
+            String::new()
+        } else {
+            format!(":{}", entry.port)
+        };
+        return format!(
+            "open {}",
+            shell_quote(&format!("vnc://{user}{}{port}", entry.host))
+        );
+    }
+    let address = if is_default_port {
+        entry.host.clone()
+    } else {
+        format!("{}::{}", entry.host, entry.port)
+    };
+    format!("vncviewer {}", shell_quote(&address))
+}
+
 /// `telnet host [port]`. The port is left off when it is 23.
 pub fn telnet_command(entry: &ServerEntry) -> String {
     let host = shell_quote(&entry.host);
@@ -787,6 +816,9 @@ pub struct ServerEntry {
     /// default, so the other kinds and an older record stay the same bytes.
     #[serde(default, skip_serializing_if = "crate::rdp::RdpSettings::is_default")]
     pub rdp: crate::rdp::RdpSettings,
+    /// Picture and input for a VNC host, omitted at the default like `rdp`.
+    #[serde(default, skip_serializing_if = "crate::vnc::VncSettings::is_default")]
+    pub vnc: crate::vnc::VncSettings,
     /// Place in the host's folder. `0` means it has never been placed, so it
     /// sorts by name after the hosts that have a place. Omitted from the file
     /// and from sync while it is `0`, so an older record stays the same bytes.

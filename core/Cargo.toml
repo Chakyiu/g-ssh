@@ -2,7 +2,7 @@
 name = "core"
 version = "0.1.2"
 edition = "2021"
-description = "The part of g-ssh without UI: SSH, SFTP, Telnet, RDP, terminal emulator, vault and sync"
+description = "The part of g-ssh without UI: SSH, SFTP, Telnet, RDP, VNC, terminal emulator, vault and sync"
 license = "MIT"
 publish = false
 
@@ -60,6 +60,18 @@ ironrdp-pdu = "0.9"
 ironrdp-cliprdr = "0.7"
 ironrdp-core = "0.2"
 smallvec = "1"
+# VNC. DES answers the classic password challenge; Diffie-Hellman, MD5 and
+# AES answer a Mac's own sign-in. ZRLE, Tight and the clipboard are zlib, and
+# Tight sends photos as JPEG. TCP keepalive notices a link that died quietly.
+des = "0.9"
+aes = "0.9"
+md-5 = "0.11"
+num-bigint = "0.4"
+flate2 = { version = "1.1", default-features = false, features = [
+    "rust_backend",
+] }
+zune-jpeg = "0.5"
+socket2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

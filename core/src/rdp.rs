@@ -9,6 +9,7 @@ mod clipboard;
 
 use std::sync::Arc;
 
+use crate::desktop::{DesktopFrame, PointerButton};
 use clipboard::SharedClipboard;
 use ironrdp_client::config::{ClipboardType, ConfigBuilder, Destination};
 use ironrdp_client::rdp::{RdpClient, RdpInputEvent, RdpOutputEvent};
@@ -27,14 +28,6 @@ pub const DEFAULT_HEIGHT: u16 = 720;
 /// The most events one fast-path input packet can carry. A long paste needs several.
 const MAX_FAST_PATH_EVENTS: usize = 255;
 
-/// One decoded desktop. Pixels are BGRA, top to bottom, with a full alpha byte.
-#[derive(Clone)]
-pub struct RdpFrame {
-    pub width: u32,
-    pub height: u32,
-    pub bgra: Arc<Vec<u8>>,
-}
-
 /// What the session loop hears. Frames travel on [`RdpConnection::subscribe_frames`]
 /// so a slow view never queues a stack of full desktops.
 pub enum RdpEvent {
@@ -52,14 +45,6 @@ pub enum RdpEvent {
     },
 }
 
-/// A button on the remote pointer.
-#[derive(Clone, Copy)]
-pub enum RdpButton {
-    Left,
-    Right,
-    Middle,
-}
-
 /// One thing to send. Several of these in one [`RdpConnection::send`] leave as
 /// one fast-path packet, up to [`MAX_FAST_PATH_EVENTS`], so a modifier and its
 /// key stay together.
@@ -72,7 +57,7 @@ pub enum RdpInput {
     Button {
         x: u16,
         y: u16,
-        button: RdpButton,
+        button: PointerButton,
         pressed: bool,
     },
     /// `units` is a signed wheel delta. 120 is one notch.
@@ -256,7 +241,7 @@ impl Drop for RdpSend {
 pub struct RdpConnection {
     send: Arc<RdpSend>,
     event_rx: async_channel::Receiver<RdpEvent>,
-    frame_rx: watch::Receiver<Option<RdpFrame>>,
+    frame_rx: watch::Receiver<Option<DesktopFrame>>,
     /// Sent again with every resize, or the server falls back to 100%.
     scale: RdpScale,
     clipboard: Option<SharedClipboard>,
@@ -328,7 +313,7 @@ impl RdpConnection {
         self.event_rx.clone()
     }
 
-    pub fn subscribe_frames(&self) -> watch::Receiver<Option<RdpFrame>> {
+    pub fn subscribe_frames(&self) -> watch::Receiver<Option<DesktopFrame>> {
         self.frame_rx.clone()
     }
 
@@ -347,9 +332,9 @@ impl RdpConnection {
                     pressed,
                 } => {
                     let mut flags = match button {
-                        RdpButton::Left => PointerFlags::LEFT_BUTTON,
-                        RdpButton::Right => PointerFlags::RIGHT_BUTTON,
-                        RdpButton::Middle => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+                        PointerButton::Left => PointerFlags::LEFT_BUTTON,
+                        PointerButton::Right => PointerFlags::RIGHT_BUTTON,
+                        PointerButton::Middle => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
                     };
                     if *pressed {
                         flags |= PointerFlags::DOWN;
@@ -429,7 +414,7 @@ fn mouse(x: u16, y: u16, flags: PointerFlags, units: i16) -> FastPathInputEvent 
 async fn pump_output(
     mut output_rx: mpsc::Receiver<RdpOutputEvent>,
     event_tx: async_channel::Sender<RdpEvent>,
-    frame_tx: watch::Sender<Option<RdpFrame>>,
+    frame_tx: watch::Sender<Option<DesktopFrame>>,
     host: String,
     port: u16,
 ) {
@@ -528,7 +513,7 @@ fn build_client(
 }
 
 /// IronRDP packs each pixel as `0x00RRGGBB`. The view wants BGRA.
-fn bgra_frame(buffer: &[u32], width: u16, height: u16) -> Option<RdpFrame> {
+fn bgra_frame(buffer: &[u32], width: u16, height: u16) -> Option<DesktopFrame> {
     let pixels = usize::from(width) * usize::from(height);
     if buffer.len() < pixels || pixels == 0 {
         return None;
@@ -540,7 +525,7 @@ fn bgra_frame(buffer: &[u32], width: u16, height: u16) -> Option<RdpFrame> {
         let blue = *pixel as u8;
         bgra.extend_from_slice(&[blue, green, red, 255]);
     }
-    Some(RdpFrame {
+    Some(DesktopFrame {
         width: u32::from(width),
         height: u32::from(height),
         bgra: Arc::new(bgra),

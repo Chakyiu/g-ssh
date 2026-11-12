@@ -393,6 +393,7 @@ mod tests {
                 username: "deploy".to_string(),
                 kind: gssh::vault::ConnectionKind::Ssh,
                 rdp: Default::default(),
+                vnc: Default::default(),
             },
             route: Arc::new(Mutex::new(SshRoute {
                 jumps: Vec::new(),
