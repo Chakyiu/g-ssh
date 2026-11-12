@@ -44,6 +44,8 @@ pub struct TermEmulator {
     current_match: Option<GridSelectionRange>,
     /// Folder the shell has reported. Empty until an OSC directory report arrives.
     directories: DirectoryReports,
+    /// Recognizes the shell `clear` sequence when it arrives in pieces.
+    clear_sequence: ClearSequence,
 }
 
 struct SimpleDims {
@@ -82,14 +84,35 @@ impl TermEmulator {
             search: String::new(),
             current_match: None,
             directories: DirectoryReports::default(),
+            clear_sequence: ClearSequence::default(),
         }
     }
 
     pub fn advance(&mut self, bytes: &[u8]) {
         self.directories.feed(bytes);
         let history_before = self.term.history_size();
-        self.processor.advance(&mut self.term, bytes);
-        self.follow_scrolled_lines(history_before);
+        // `clear` sends ESC [ 3 J, ESC [ H, ESC [ 2 J. The first wipes the
+        // scrollback; alacritty then implements ESC [ 2 J by scrolling the
+        // screen back into it, so scrolling up still shows that screen. Drop
+        // the scrollback again once that second clear has been applied, and
+        // not before, so output later in the same chunk can scroll normally.
+        let cuts = self.clear_sequence.cuts(bytes);
+        if cuts.is_empty() {
+            self.processor.advance(&mut self.term, bytes);
+            self.follow_scrolled_lines(history_before);
+            return;
+        }
+
+        let mut start = 0;
+        for cut in cuts {
+            self.processor.advance(&mut self.term, &bytes[start..cut]);
+            self.term.clear_screen(ClearMode::Saved);
+            start = cut;
+        }
+        if start < bytes.len() {
+            self.processor.advance(&mut self.term, &bytes[start..]);
+        }
+        self.current_match = None;
     }
 
     /// The folder the shell last reported, when it reports one.
@@ -636,6 +659,187 @@ fn to_snapshot_color(color: Color) -> SnapshotColor {
     }
 }
 
+/// Byte scanner for the shell `clear` sequence, which may be split across reads.
+///
+/// Armed by `ESC [ 3 J` (erase scrollback). Cursor-only controls may follow.
+/// The next `ESC [ 2 J` (erase screen) is reported so the caller can drop the
+/// scrollback that erase just recreated. Anything else disarms it. Bytes inside
+/// a title or directory report are skipped; ESC ends that report, as the
+/// parser does, so a clear after it still counts.
+#[derive(Default)]
+struct ClearSequence {
+    armed: bool,
+    phase: ClearPhase,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ClearPhase {
+    #[default]
+    Ground,
+    Esc,
+    Csi {
+        param: u16,
+        any_semi: bool,
+        skip: bool,
+    },
+    /// OSC, DCS, PM, or APC. `esc` is set when the previous byte was ESC,
+    /// so a following `\` (ST) can end the string.
+    String {
+        esc: bool,
+    },
+}
+
+impl ClearSequence {
+    /// Offsets just past each `ESC [ 2 J` that completes a `clear`.
+    fn cuts(&mut self, bytes: &[u8]) -> Vec<usize> {
+        let mut cuts = Vec::new();
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.feed(byte, index + 1, &mut cuts);
+        }
+        cuts
+    }
+
+    fn feed(&mut self, byte: u8, end: usize, cuts: &mut Vec<usize>) {
+        match self.phase {
+            ClearPhase::Ground => {
+                if byte == 0x1b {
+                    self.phase = ClearPhase::Esc;
+                } else if self.armed {
+                    self.armed = false;
+                }
+            }
+            ClearPhase::Esc => self.feed_esc(byte),
+            ClearPhase::Csi {
+                param,
+                any_semi,
+                skip,
+            } => {
+                self.feed_csi(byte, param, any_semi, skip, end, cuts);
+            }
+            ClearPhase::String { esc } => self.feed_string(byte, esc),
+        }
+    }
+
+    fn feed_esc(&mut self, byte: u8) {
+        match byte {
+            b'[' => {
+                self.phase = ClearPhase::Csi {
+                    param: 0,
+                    any_semi: false,
+                    skip: false,
+                };
+            }
+            b']' | b'P' | b'X' | b'^' | b'_' => {
+                self.armed = false;
+                self.phase = ClearPhase::String { esc: false };
+            }
+            0x1b => {
+                self.armed = false;
+            }
+            _ => {
+                self.armed = false;
+                self.phase = ClearPhase::Ground;
+            }
+        }
+    }
+
+    fn feed_csi(
+        &mut self,
+        byte: u8,
+        mut param: u16,
+        any_semi: bool,
+        skip: bool,
+        end: usize,
+        cuts: &mut Vec<usize>,
+    ) {
+        match byte {
+            b'0'..=b'9' if !skip => {
+                param = param
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as u16);
+                self.phase = ClearPhase::Csi {
+                    param,
+                    any_semi,
+                    skip,
+                };
+            }
+            b';' if !skip => {
+                self.phase = ClearPhase::Csi {
+                    param: 0,
+                    any_semi: true,
+                    skip,
+                };
+            }
+            0x1b => self.phase = ClearPhase::Esc,
+            0x18 | 0x1a => {
+                self.armed = false;
+                self.phase = ClearPhase::Ground;
+            }
+            final_byte @ 0x40..=0x7e => {
+                self.finish_csi(final_byte, param, any_semi, skip, end, cuts);
+            }
+            _ => {
+                self.phase = ClearPhase::Csi {
+                    param,
+                    any_semi,
+                    skip: true,
+                };
+            }
+        }
+    }
+
+    fn finish_csi(
+        &mut self,
+        final_byte: u8,
+        param: u16,
+        any_semi: bool,
+        skip: bool,
+        end: usize,
+        cuts: &mut Vec<usize>,
+    ) {
+        self.phase = ClearPhase::Ground;
+        if skip {
+            self.armed = false;
+            return;
+        }
+        if final_byte == b'J' && !any_semi && param == 3 {
+            self.armed = true;
+            return;
+        }
+        if self.armed && final_byte == b'J' && !any_semi && param == 2 {
+            cuts.push(end);
+            self.armed = false;
+            return;
+        }
+        let cursor = matches!(
+            final_byte,
+            b'A' | b'B' | b'C' | b'D' | b'E' | b'F' | b'G' | b'H' | b'f' | b'd'
+        );
+        if !(self.armed && cursor) {
+            self.armed = false;
+        }
+    }
+
+    fn feed_string(&mut self, byte: u8, esc: bool) {
+        if esc {
+            match byte {
+                b'\\' => self.phase = ClearPhase::Ground,
+                0x1b => self.phase = ClearPhase::Esc,
+                _ => {
+                    self.phase = ClearPhase::Esc;
+                    self.feed_esc(byte);
+                }
+            }
+            return;
+        }
+        if byte == 0x07 || byte == 0x9c {
+            self.phase = ClearPhase::Ground;
+        } else if byte == 0x1b {
+            self.phase = ClearPhase::String { esc: true };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +950,103 @@ mod tests {
             .iter()
             .flatten()
             .all(|cell| cell.c == ' '));
+    }
+
+    #[test]
+    fn shell_clear_drops_the_screen_from_the_scrollback() {
+        // What `/usr/bin/clear` sends for TERM=xterm-256color: erase the
+        // scrollback, home the cursor, then erase the screen.
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        assert!(emulator.snapshot().history_size > 0);
+
+        emulator.advance(b"\x1b[3J\x1b[H\x1b[2J");
+
+        let snapshot = emulator.snapshot();
+        assert_eq!(snapshot.history_size, 0);
+        assert!(snapshot.cells.iter().flatten().all(|cell| cell.c == ' '));
+        assert_eq!(emulator.set_search("tail".to_string()), 0);
+        assert_eq!(emulator.set_search("old".to_string()), 0);
+    }
+
+    #[test]
+    fn shell_clear_keeps_the_prompt_that_follows_it() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b[3J\x1b[H\x1b[2J$ ");
+
+        assert_eq!(emulator.snapshot().history_size, 0);
+        assert_eq!(emulator.snapshot().cells[0][0].c, '$');
+        assert_eq!(emulator.set_search("tail".to_string()), 0);
+    }
+
+    #[test]
+    fn shell_clear_split_across_reads_still_drops_the_scrollback() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b[3");
+        emulator.advance(b"J\x1b[");
+        emulator.advance(b"H\x1b[2J");
+
+        assert_eq!(emulator.snapshot().history_size, 0);
+        assert_eq!(emulator.set_search("tail".to_string()), 0);
+    }
+
+    #[test]
+    fn output_after_a_shell_clear_can_scroll_again() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b[3J\x1b[H\x1b[2J");
+        for _ in 0..10 {
+            emulator.advance(b"kept\r\n");
+        }
+
+        assert!(emulator.snapshot().history_size > 0);
+        assert_eq!(emulator.set_search("old".to_string()), 0);
+        assert!(emulator.set_search("kept".to_string()) > 0);
+    }
+
+    #[test]
+    fn erase_scrollback_alone_leaves_the_screen() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b[3J");
+
+        assert_eq!(emulator.snapshot().history_size, 0);
+        assert!(emulator.set_search("tail".to_string()) > 0);
+        assert_eq!(emulator.set_search("old".to_string()), 0);
+    }
+
+    #[test]
+    fn text_between_the_clears_stays_in_the_scrollback() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f"]);
+        emulator.advance(b"\x1b[3Jhello\x1b[H\x1b[2J");
+
+        assert!(emulator.set_search("hello".to_string()) > 0);
+    }
+
+    #[test]
+    fn bracket_text_inside_a_title_is_not_a_clear() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        let before = emulator.snapshot().history_size;
+        emulator.advance(b"\x1b]0;[3J[H[2J\x07");
+
+        assert_eq!(emulator.snapshot().history_size, before);
+        assert!(emulator.set_search("tail".to_string()) > 0);
+    }
+
+    #[test]
+    fn escape_ends_a_title_and_the_following_clear_still_runs() {
+        // ESC inside an OSC ends the title, so the clear that follows is real.
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b]0;title\x1b[3J\x1b[H\x1b[2J");
+
+        assert_eq!(emulator.snapshot().history_size, 0);
+        assert_eq!(emulator.set_search("tail".to_string()), 0);
+    }
+
+    #[test]
+    fn shell_clear_accepts_padded_parameters() {
+        let mut emulator = emulator_with(&["old", "b", "c", "d", "e", "f", "g", "tail"]);
+        emulator.advance(b"\x1b[03J\x1b[1;1H\x1b[02J");
+
+        assert_eq!(emulator.snapshot().history_size, 0);
+        assert_eq!(emulator.set_search("tail".to_string()), 0);
     }
 
     #[test]
