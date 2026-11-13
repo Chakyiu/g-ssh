@@ -59,6 +59,7 @@ ironrdp-client = { version = "0.1", features = ["rustls", "sound", "clipboard"] 
 ironrdp-pdu = "0.9"
 ironrdp-cliprdr = "0.7"
 ironrdp-core = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 smallvec = "1"
 # VNC. DES answers the classic password challenge; Diffie-Hellman, MD5 and
 # AES answer a Mac's own sign-in. ZRLE, Tight and the clipboard are zlib, and
