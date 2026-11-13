@@ -125,16 +125,23 @@ members = [".", "core", "updater"]
 # pre-releases cannot be selected beside the stable crates russh already uses.
 # third_party/picky is published 7.0.0-rc.29 (stable RustCrypto) with its
 # version kept at 7.0.0-rc.25 so the pin matches. third_party/sspi is 0.21.3
-# without the unused macOS pins that forced those same pre-releases.
+# without the unused macOS pins that forced those same pre-releases, and with
+# sspi-rs #719 backported, so a Microsoft account signs in as
+# `MicrosoftAccount\user@example.com`.
 #
 # third_party/ironrdp-connector and third_party/ironrdp-client are 0.10.0 and
 # 0.1.0 with standard RDP security (RC4) added, for servers such as xrdp that
 # fall back to it when they have no TLS certificate.
+#
+# third_party/ironrdp-session is 0.11.0 with bulk-compressed slow-path output
+# decompressed, through one decompressor that Fast-Path output shares. xrdp
+# compresses both. Upstream does the same from 0.12.0.
 [patch.crates-io]
 picky = { path = "third_party/picky" }
 sspi = { path = "third_party/sspi" }
 ironrdp-connector = { path = "third_party/ironrdp-connector" }
 ironrdp-client = { path = "third_party/ironrdp-client" }
+ironrdp-session = { path = "third_party/ironrdp-session" }
 
 # Style lints that the UI code trips on purpose: gpui handlers take many
 # arguments, and events carry whole entries.
