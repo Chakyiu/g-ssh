@@ -46,6 +46,10 @@ use gssh::vault::ConnectionKind;
 use gssh::vnc::{VncConnection, VncEvent, VncSettings, VncTarget};
 use zeroize::Zeroizing;
 
+pub(crate) fn init(cx: &mut gpui::App) {
+    desktop::init(cx);
+}
+
 pub struct DisconnectedState {
     pub host: String,
     pub preserved: PreservedFiles,

@@ -68,7 +68,10 @@ impl SharedClipboard {
             .local
             .is_some();
         let formats = if has_text {
-            vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+            vec![
+                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
+            ]
         } else {
             Vec::new()
         };
@@ -118,6 +121,16 @@ impl CliprdrBackend for TextBackend {
         self.shared.advertise();
     }
 
+    fn on_format_list_response(&mut self, ok: bool) {
+        if ok {
+            return;
+        }
+        // offer() skips text it already stored. Forgetting it lets the next
+        // click or paste advertise again after the remote rejected the list.
+        let mut texts = self.shared.texts.lock().unwrap_or_else(|e| e.into_inner());
+        texts.local = None;
+    }
+
     fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -144,7 +157,10 @@ impl CliprdrBackend for TextBackend {
             .clone();
         let response = match local {
             Some(text) if request.format == ClipboardFormatId::CF_UNICODETEXT => {
-                FormatDataResponse::new_unicode_string(&text)
+                FormatDataResponse::new_unicode_string(&clipboard_text(&text))
+            }
+            Some(text) if request.format == ClipboardFormatId::CF_TEXT => {
+                FormatDataResponse::new_string(&clipboard_text(&text))
             }
             _ => FormatDataResponse::new_error(),
         };
@@ -192,6 +208,25 @@ impl CliprdrBackend for TextBackend {
     fn on_lock(&mut self, _: LockDataId) {}
 
     fn on_unlock(&mut self, _: LockDataId) {}
+}
+
+/// Windows clipboard text uses CRLF. A lone CR or LF becomes one break, and a
+/// break that is already CRLF stays one.
+fn clipboard_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' || ch == '\n' {
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\r');
+            out.push('\n');
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// `CF_TEXT` is the sender's code page. UTF-8 is the common case on xrdp.
@@ -243,5 +278,47 @@ mod tests {
     #[test]
     fn ansi_text_stops_at_the_terminator() {
         assert_eq!(ansi_text(b"hello\0junk"), "hello");
+    }
+
+    #[test]
+    fn clipboard_text_uses_windows_line_breaks() {
+        assert_eq!(clipboard_text("a\nb"), "a\r\nb");
+        assert_eq!(clipboard_text("a\r\nb"), "a\r\nb");
+        assert_eq!(clipboard_text("a\rb"), "a\r\nb");
+    }
+
+    #[test]
+    fn a_rejected_format_list_is_offered_again() {
+        let (shared, mut rx) = shared();
+        shared.offer("ada".into());
+        assert!(offered(&mut rx));
+        let mut backend = TextBackend {
+            shared: shared.clone(),
+            requested: None,
+        };
+        backend.on_format_list_response(false);
+        shared.offer("ada".into());
+        assert!(offered(&mut rx));
+    }
+
+    #[test]
+    fn an_ansi_request_is_answered_with_the_text() {
+        let (shared, mut rx) = shared();
+        shared.offer("a\nb".into());
+        assert!(offered(&mut rx));
+        let mut backend = TextBackend {
+            shared,
+            requested: None,
+        };
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_TEXT,
+        });
+        match rx.try_recv() {
+            Ok(RdpInputEvent::Clipboard(ClipboardMessage::SendFormatData(response))) => {
+                assert!(!response.is_error());
+                assert_eq!(response.to_string().expect("ansi text"), "a\r\nb");
+            }
+            _ => panic!("expected format data"),
+        }
     }
 }

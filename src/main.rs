@@ -81,6 +81,7 @@ fn main() {
         gpui_component::init(cx);
         crate::ui::terminal::view::init(cx);
         crate::ui::sftp::keys::init(cx);
+        crate::ui::session::init(cx);
         crate::ui::app::init(cx);
         crate::ui::settings::init(cx);
 

@@ -10,10 +10,26 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, Bounds, Context, Corners, FocusHandle, Focusable, KeyDownEvent,
-    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, Subscription, Task, Window,
+    actions, canvas, div, point, px, App, Bounds, Context, Corners, FocusHandle, Focusable,
+    KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent,
+    Subscription, Task, Window,
 };
+
+actions!(remote_desktop, [Tab, ShiftTab]);
+
+/// Deeper than the window root, so Tab reaches the remote instead of walking
+/// the app's focus order.
+const KEY_CONTEXT: &str = "RemoteDesktop";
+
+pub(crate) fn init(cx: &mut App) {
+    // The root binds Tab to move focus, and that binding wins unless a
+    // deeper context claims the key.
+    cx.bind_keys([
+        KeyBinding::new("tab", Tab, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", ShiftTab, Some(KEY_CONTEXT)),
+    ]);
+}
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
 use tokio::sync::watch;
@@ -115,6 +131,9 @@ pub(crate) struct DesktopView {
     resize_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
     mods: HeldMods,
+    /// Set for the key-up that follows a paste. That event still reports the
+    /// shortcut modifiers held, and must not press them again.
+    mods_released_for_paste: bool,
     held: Option<HeldKey>,
     /// VNC keys down, with the keysym each went down as. A key is let go as
     /// that keysym, even if shift has changed since.
@@ -131,7 +150,11 @@ struct HeldMods {
     control: bool,
     alt: bool,
     shift: bool,
+    /// The Windows key has been sent and is down.
     meta: bool,
+    /// Command is down here, and the Windows key is not sent yet. A paste can
+    /// then insert text; a lone Command still taps the Windows key on release.
+    meta_pending: bool,
 }
 
 enum HeldKey {
@@ -172,6 +195,7 @@ impl DesktopView {
             resize_task: None,
             frame_task: None,
             mods: HeldMods::default(),
+            mods_released_for_paste: false,
             held: None,
             vnc_keys: Vec::new(),
             wheel_rest: (0., 0.),
@@ -186,6 +210,7 @@ impl DesktopView {
     pub(crate) fn follow(&mut self, link: DesktopLink, cx: &mut Context<Self>) {
         self.link = Some(link.clone());
         self.mods = HeldMods::default();
+        self.mods_released_for_paste = false;
         self.held = None;
         self.vnc_keys.clear();
         self.wheel_rest = (0., 0.);
@@ -464,8 +489,39 @@ impl DesktopView {
         }
     }
 
+    fn on_tab(&mut self, _: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            window.focus_next(cx);
+            return;
+        }
+        self.forward_key("tab", window, cx);
+    }
+
+    fn on_shift_tab(&mut self, _: &ShiftTab, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.accepts_input() {
+            window.focus_prev(cx);
+            return;
+        }
+        self.forward_key("shift-tab", window, cx);
+    }
+
+    fn forward_key(&mut self, source: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(keystroke) = Keystroke::parse(source) else {
+            return;
+        };
+        self.on_key_down(
+            &KeyDownEvent {
+                keystroke,
+                is_held: false,
+                prefer_character_input: false,
+            },
+            window,
+            cx,
+        );
+    }
+
     fn rdp_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.try_paste(&event.keystroke, cx) {
+        if self.try_paste(event, cx) {
             cx.stop_propagation();
             return;
         }
@@ -480,6 +536,7 @@ impl DesktopView {
         let named = event.keystroke.key.chars().count() != 1;
         if named {
             if let Some((code, extended)) = scancode(&event.keystroke.key) {
+                inputs.extend(press_queued_platform(&mut self.mods));
                 inputs.extend(self.sync_mods(&event.keystroke, true));
                 inputs.push(RdpInput::Scan {
                     code,
@@ -497,6 +554,7 @@ impl DesktopView {
             || event.keystroke.modifiers.platform;
         if !chord {
             if let Some(ch) = typed_char(&event.keystroke) {
+                inputs.extend(press_queued_platform(&mut self.mods));
                 inputs.extend(self.sync_mods(&event.keystroke, false));
                 let mut units = [0u16; 2];
                 let count = ch.encode_utf16(&mut units).len();
@@ -515,6 +573,7 @@ impl DesktopView {
             }
         }
         if let Some((code, extended)) = scancode(&event.keystroke.key.to_ascii_lowercase()) {
+            inputs.extend(press_queued_platform(&mut self.mods));
             inputs.extend(self.sync_mods(&event.keystroke, true));
             inputs.push(RdpInput::Scan {
                 code,
@@ -532,19 +591,31 @@ impl DesktopView {
         if let Some(held) = self.held.take() {
             inputs.push(held.release());
         }
-        inputs.extend(self.sync_mods(&event.keystroke, true));
+        // The paste let the modifiers go. This key-up still reports them held,
+        // and pressing them again would turn the text that just landed into a chord.
+        if self.mods_released_for_paste {
+            self.mods_released_for_paste = false;
+        } else {
+            inputs.extend(self.sync_mods(&event.keystroke, true));
+        }
         if !inputs.is_empty() {
             self.send_rdp(&inputs);
             cx.stop_propagation();
         }
     }
 
-    /// Local clipboard, typed in, which works in any remote app. A shared
-    /// clipboard also gets the text, for the remote's own paste.
-    fn try_paste(&mut self, keystroke: &Keystroke, cx: &Context<Self>) -> bool {
+    /// Local clipboard, typed in, which works in any remote app. The shortcut's
+    /// modifiers are let go first: Cmd or Ctrl held across the characters would
+    /// make each one a shortcut, and the Windows key behind Cmd would open Start.
+    /// A shared clipboard also gets the text, for the remote's own paste.
+    fn try_paste(&mut self, event: &KeyDownEvent, cx: &Context<Self>) -> bool {
+        let keystroke = &event.keystroke;
         if keystroke.key != "v" || !is_secondary(&keystroke.modifiers) || keystroke.modifiers.shift
         {
             return false;
+        }
+        if event.is_held {
+            return true;
         }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return true;
@@ -552,55 +623,24 @@ impl DesktopView {
         if let Some(link) = self.link.as_ref() {
             link.offer_clipboard(text.clone());
         }
-        let mut inputs = self.sync_mods(keystroke, false);
+        // Command is queued as the Windows key and has not been sent. Drop it
+        // so the paste does not open the Start menu.
+        self.mods.meta_pending = false;
+        let mut inputs = Vec::new();
         if let Some(held) = self.held.take() {
-            inputs.insert(0, held.release());
+            inputs.push(held.release());
         }
-        for ch in text.chars() {
-            if ch == '\n' || ch == '\r' {
-                inputs.push(RdpInput::Scan {
-                    code: 0x1C,
-                    extended: false,
-                    pressed: true,
-                });
-                inputs.push(RdpInput::Scan {
-                    code: 0x1C,
-                    extended: false,
-                    pressed: false,
-                });
-                continue;
-            }
-            if ch == '\t' {
-                inputs.push(RdpInput::Scan {
-                    code: 0x0F,
-                    extended: false,
-                    pressed: true,
-                });
-                inputs.push(RdpInput::Scan {
-                    code: 0x0F,
-                    extended: false,
-                    pressed: false,
-                });
-                continue;
-            }
-            let Ok(unit) = u16::try_from(u32::from(ch)) else {
-                continue;
-            };
-            inputs.push(RdpInput::Unicode {
-                unit,
-                pressed: true,
-            });
-            inputs.push(RdpInput::Unicode {
-                unit,
-                pressed: false,
-            });
-        }
+        inputs.extend(self.release_mods());
+        inputs.extend(pasted_text(&text));
+        self.mods_released_for_paste = true;
         self.send_rdp(&inputs);
         true
     }
 
     /// Press or release the modifiers that changed. `shift` is included for a
     /// scancode and left up for a character, which already contains it.
+    /// Command is queued rather than sent: the next real key presses the
+    /// Windows key with itself, and a paste never does.
     fn sync_mods(&mut self, keystroke: &Keystroke, include_shift: bool) -> Vec<RdpInput> {
         let want = &keystroke.modifiers;
         let mut inputs = Vec::new();
@@ -612,12 +652,21 @@ impl DesktopView {
             &mut inputs,
         );
         sync_one(want.alt, &mut self.mods.alt, 0x38, false, &mut inputs);
-        sync_one(want.platform, &mut self.mods.meta, 0x5B, true, &mut inputs);
+        inputs.extend(sync_platform(&mut self.mods, want.platform));
         if include_shift {
             sync_one(want.shift, &mut self.mods.shift, 0x2A, false, &mut inputs);
         } else if self.mods.shift {
             sync_one(false, &mut self.mods.shift, 0x2A, false, &mut inputs);
         }
+        inputs
+    }
+
+    fn release_mods(&mut self) -> Vec<RdpInput> {
+        let mut inputs = Vec::new();
+        sync_one(false, &mut self.mods.control, 0x1D, false, &mut inputs);
+        sync_one(false, &mut self.mods.alt, 0x38, false, &mut inputs);
+        sync_one(false, &mut self.mods.meta, 0x5B, true, &mut inputs);
+        sync_one(false, &mut self.mods.shift, 0x2A, false, &mut inputs);
         inputs
     }
 
@@ -775,6 +824,95 @@ fn sync_one(want: bool, held: &mut bool, code: u8, extended: bool, inputs: &mut 
     });
 }
 
+/// Command went down. Hold the Windows key back until a real key needs it.
+fn sync_platform(mods: &mut HeldMods, want: bool) -> Vec<RdpInput> {
+    if want {
+        if !mods.meta && !mods.meta_pending {
+            mods.meta_pending = true;
+        }
+        return Vec::new();
+    }
+    if mods.meta_pending {
+        mods.meta_pending = false;
+        return vec![platform_scan(true), platform_scan(false)];
+    }
+    let mut inputs = Vec::new();
+    sync_one(false, &mut mods.meta, 0x5B, true, &mut inputs);
+    inputs
+}
+
+/// The Windows key for a queued Command, sent with the key that needs it.
+fn press_queued_platform(mods: &mut HeldMods) -> Vec<RdpInput> {
+    if !mods.meta_pending {
+        return Vec::new();
+    }
+    mods.meta_pending = false;
+    mods.meta = true;
+    vec![platform_scan(true)]
+}
+
+fn platform_scan(pressed: bool) -> RdpInput {
+    RdpInput::Scan {
+        code: 0x5B,
+        extended: true,
+        pressed,
+    }
+}
+
+/// Clipboard text as key presses, with no modifier held. A Windows line break
+/// is one Enter. Characters outside the basic plane go as a surrogate pair.
+fn pasted_text(text: &str) -> Vec<RdpInput> {
+    let mut inputs = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' || ch == '\n' {
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            inputs.push(RdpInput::Scan {
+                code: 0x1C,
+                extended: false,
+                pressed: true,
+            });
+            inputs.push(RdpInput::Scan {
+                code: 0x1C,
+                extended: false,
+                pressed: false,
+            });
+            continue;
+        }
+        if ch == '\t' {
+            inputs.push(RdpInput::Scan {
+                code: 0x0F,
+                extended: false,
+                pressed: true,
+            });
+            inputs.push(RdpInput::Scan {
+                code: 0x0F,
+                extended: false,
+                pressed: false,
+            });
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        let mut units = [0u16; 2];
+        let count = ch.encode_utf16(&mut units).len();
+        for unit in units[..count].iter().copied() {
+            inputs.push(RdpInput::Unicode {
+                unit,
+                pressed: true,
+            });
+            inputs.push(RdpInput::Unicode {
+                unit,
+                pressed: false,
+            });
+        }
+    }
+    inputs
+}
+
 impl Focusable for DesktopView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -797,6 +935,9 @@ impl Render for DesktopView {
         div()
             .id("remote-desktop")
             .track_focus(&self.focus_handle)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::on_tab))
+            .on_action(cx.listener(Self::on_shift_tab))
             .size_full()
             .bg(gpui::rgb(0x000000))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -988,6 +1129,88 @@ mod tests {
         assert_eq!(scancode("up"), Some((0x48, true)));
         assert_eq!(scancode("enter"), Some((0x1C, false)));
         assert_eq!(scancode("c"), Some((0x2E, false)));
+        assert_eq!(scancode("tab"), Some((0x0F, false)));
+    }
+
+    #[test]
+    fn command_waits_for_a_real_key_before_the_windows_key_goes_down() {
+        let mut mods = HeldMods::default();
+        assert!(sync_platform(&mut mods, true).is_empty());
+        assert!(mods.meta_pending);
+        assert!(!mods.meta);
+        let pressed = press_queued_platform(&mut mods);
+        assert!(matches!(
+            pressed.as_slice(),
+            [RdpInput::Scan {
+                code: 0x5B,
+                extended: true,
+                pressed: true,
+            }]
+        ));
+        assert!(mods.meta);
+        assert!(!mods.meta_pending);
+    }
+
+    #[test]
+    fn a_command_tap_is_a_windows_key_tap() {
+        let mut mods = HeldMods::default();
+        assert!(sync_platform(&mut mods, true).is_empty());
+        let tap = sync_platform(&mut mods, false);
+        assert!(matches!(
+            tap.as_slice(),
+            [
+                RdpInput::Scan {
+                    code: 0x5B,
+                    extended: true,
+                    pressed: true,
+                },
+                RdpInput::Scan {
+                    code: 0x5B,
+                    extended: true,
+                    pressed: false,
+                },
+            ]
+        ));
+        assert!(!mods.meta);
+        assert!(!mods.meta_pending);
+    }
+
+    #[test]
+    fn pasted_text_types_letters_one_enter_and_a_tab() {
+        let inputs = pasted_text("a\r\n\t");
+        assert!(matches!(
+            inputs.as_slice(),
+            [
+                RdpInput::Unicode {
+                    unit: 0x61,
+                    pressed: true,
+                },
+                RdpInput::Unicode {
+                    unit: 0x61,
+                    pressed: false,
+                },
+                RdpInput::Scan {
+                    code: 0x1C,
+                    extended: false,
+                    pressed: true,
+                },
+                RdpInput::Scan {
+                    code: 0x1C,
+                    extended: false,
+                    pressed: false,
+                },
+                RdpInput::Scan {
+                    code: 0x0F,
+                    extended: false,
+                    pressed: true,
+                },
+                RdpInput::Scan {
+                    code: 0x0F,
+                    extended: false,
+                    pressed: false,
+                },
+            ]
+        ));
     }
 
     #[test]
