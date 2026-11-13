@@ -41,9 +41,6 @@ pub struct Processor {
     mouse_pos_update: Option<(u16, u16)>,
     enable_server_pointer: bool,
     pointer_software_rendering: bool,
-    /// Bulk decompressor for server-to-client compressed PDUs.
-    /// `None` when compression was not negotiated.
-    bulk_decompressor: Option<BulkCompressor>,
     /// Current 8bpp color palette. Updated by Palette fast-path updates.
     palette: Palette,
     #[cfg(feature = "qoiz")]
@@ -56,11 +53,16 @@ impl Processor {
     }
 
     /// Process input fast path frame and return list of updates.
+    ///
+    /// `bulk_decompressor` is the session's, `None` when compression was not negotiated. The
+    /// server compresses Fast-Path and slow-path output with one history, so both paths must
+    /// decompress through the same one, in the order the frames arrive.
     pub fn process(
         &mut self,
         image: &mut DecodedImage,
         input: &[u8],
         output: &mut WriteBuf,
+        bulk_decompressor: &mut Option<BulkCompressor>,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
@@ -78,7 +80,7 @@ impl Processor {
         // A single FastPath output PDU can contain multiple updates.
         // Loop over all updates within the PDU payload.
         while !input.is_empty() {
-            let update_result = self.process_single_update(&mut input, image, output)?;
+            let update_result = self.process_single_update(&mut input, image, output, bulk_decompressor)?;
             processor_updates.extend(update_result);
         }
 
@@ -91,6 +93,7 @@ impl Processor {
         input: &mut ReadCursor<'_>,
         image: &mut DecodedImage,
         output: &mut WriteBuf,
+        bulk_decompressor: &mut Option<BulkCompressor>,
     ) -> SessionResult<Vec<UpdateKind>> {
         let mut processor_updates = Vec::new();
 
@@ -104,7 +107,7 @@ impl Processor {
                 let bulk_flags =
                     u32::from(flags.bits()) | u32::from(update_pdu.compression_type.map_or(0, |ct| ct.as_u8()));
 
-                if let Some(ref mut decompressor) = self.bulk_decompressor {
+                if let Some(decompressor) = bulk_decompressor.as_mut() {
                     let decompressed = decompressor
                         .decompress(update_pdu.data, bulk_flags)
                         .map_err(|e| reason_err!("FastPath", "bulk decompression failed: {}", e))?;
@@ -598,9 +601,6 @@ pub struct ProcessorBuilder {
     /// `UpdateKind::PointerBitmap` will not be generated. Remote pointer will be drawn
     /// via software rendering on top of the output image.
     pub pointer_software_rendering: bool,
-    /// Bulk decompressor for server-to-client compressed PDUs.
-    /// `None` when compression was not negotiated.
-    pub bulk_decompressor: Option<BulkCompressor>,
 }
 
 impl ProcessorBuilder {
@@ -615,7 +615,6 @@ impl ProcessorBuilder {
             mouse_pos_update: None,
             enable_server_pointer: self.enable_server_pointer,
             pointer_software_rendering: self.pointer_software_rendering,
-            bulk_decompressor: self.bulk_decompressor,
             palette: Palette::system_default(),
             #[cfg(feature = "qoiz")]
             zdctx: zstd_safe::DCtx::default(),

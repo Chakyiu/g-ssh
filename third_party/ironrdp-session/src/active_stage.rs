@@ -33,6 +33,8 @@ fn to_bulk_compression_type(ct: PduCompressionType) -> ironrdp_bulk::Compression
 pub struct ActiveStage {
     x224_processor: x224::Processor,
     fast_path_processor: fast_path::Processor,
+    /// One history for Fast-Path and slow-path output, as the server keeps one for both.
+    bulk_decompressor: Option<BulkCompressor>,
     enable_server_pointer: bool,
 }
 
@@ -80,7 +82,7 @@ impl ActiveStageBuilder {
             let bulk_ct = to_bulk_compression_type(ct);
             match BulkCompressor::new(bulk_ct) {
                 Ok(compressor) => {
-                    info!(compression_type = %bulk_ct, "Bulk decompressor initialized for FastPath");
+                    info!(compression_type = %bulk_ct, "Bulk decompressor initialized");
                     Some(compressor)
                 }
                 Err(e) => {
@@ -96,13 +98,13 @@ impl ActiveStageBuilder {
             share_id,
             enable_server_pointer,
             pointer_software_rendering,
-            bulk_decompressor,
         }
         .build();
 
         ActiveStage {
             x224_processor,
             fast_path_processor,
+            bulk_decompressor,
             enable_server_pointer,
         }
     }
@@ -170,14 +172,16 @@ impl ActiveStage {
         let (mut stage_outputs, processor_updates) = match action {
             Action::FastPath => {
                 let mut output = WriteBuf::new();
-                let processor_updates = self.fast_path_processor.process(image, frame, &mut output)?;
+                let processor_updates =
+                    self.fast_path_processor
+                        .process(image, frame, &mut output, &mut self.bulk_decompressor)?;
                 (
                     vec![ActiveStageOutput::ResponseFrame(output.into_inner())],
                     processor_updates,
                 )
             }
             Action::X224 => {
-                let x224_outputs = self.x224_processor.process(frame)?;
+                let x224_outputs = self.x224_processor.process(frame, &mut self.bulk_decompressor)?;
                 let mut stage_outputs = Vec::new();
                 let mut processor_updates = Vec::new();
 
@@ -225,6 +229,8 @@ impl ActiveStage {
         Ok(stage_outputs)
     }
 
+    /// Replaces the Fast-Path processor, as a Deactivation-Reactivation Sequence does. The bulk
+    /// decompression history stays: the server marks a reset of its own with PACKET_FLUSHED.
     pub fn set_fastpath_processor(&mut self, processor: fast_path::Processor) {
         self.fast_path_processor = processor;
     }
@@ -466,4 +472,185 @@ fn process_slow_path_pointer(
     let mut src = ReadCursor::new(data);
     let pointer = slow_path::decode_slow_path_pointer(&mut src).map_err(SessionError::decode)?;
     fast_path_processor.process_pointer_update(image, pointer)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use ironrdp_bulk::{CompressionType as BulkCompressionType, flags};
+    use ironrdp_core::{Encode as _, encode_vec};
+    use ironrdp_graphics::image_processing::PixelFormat;
+    use ironrdp_pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
+    use ironrdp_pdu::fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
+    use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
+    use ironrdp_pdu::rdp::headers::CompressionFlags;
+    use ironrdp_pdu::x224::X224;
+
+    use super::*;
+
+    const USER_CHANNEL_ID: u16 = 1007;
+    const IO_CHANNEL_ID: u16 = 1003;
+    const SHARE_ID: u32 = 0x0001_03ea;
+    /// Each update is a SIDE × SIDE square.
+    const SIDE: u16 = 16;
+
+    fn stage() -> ActiveStage {
+        ActiveStageBuilder {
+            static_channels: StaticChannelSet::new(),
+            user_channel_id: USER_CHANNEL_ID,
+            io_channel_id: IO_CHANNEL_ID,
+            message_channel_id: None,
+            share_id: SHARE_ID,
+            compression_type: Some(PduCompressionType::K64),
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+        }
+        .build()
+    }
+
+    /// An uncompressed 32 bpp square at (`left`, `top`). Its pixels repeat every 16, so one
+    /// update compresses, and a second one, with its first row, refers back to the first update.
+    fn bitmap_update(left: u16, top: u16) -> Vec<u8> {
+        let pixels: Vec<u8> = (0..SIDE * SIDE)
+            .flat_map(|i| {
+                let level = u8::try_from(i % 16).expect("below 16") * 16;
+                [level, 255 - level, level / 2, 0xff]
+            })
+            .collect();
+        encode_vec(&BitmapUpdateData {
+            rectangles: vec![BitmapData {
+                rectangle: InclusiveRectangle {
+                    left,
+                    top,
+                    right: left + SIDE - 1,
+                    bottom: top + SIDE - 1,
+                },
+                width: SIDE,
+                height: SIDE,
+                bits_per_pixel: 32,
+                compression_flags: Compression::empty(),
+                compressed_data_header: None,
+                bitmap_data: &pixels,
+            }],
+        })
+        .expect("encode the bitmap update")
+    }
+
+    fn compress(compressor: &mut BulkCompressor, data: &[u8]) -> (Vec<u8>, CompressionFlags) {
+        let (size, flags) = compressor.compress(data).expect("compress");
+        assert_ne!(flags & flags::PACKET_COMPRESSED, 0, "the test data has to compress");
+        let flags = u8::try_from(flags & !flags::COMPRESSION_TYPE_MASK).expect("flags fit in a byte");
+        (
+            compressor.compressed_data(size).to_vec(),
+            CompressionFlags::from_bits_retain(flags),
+        )
+    }
+
+    fn fast_path_frame(data: &[u8], flags: CompressionFlags) -> Vec<u8> {
+        let update = FastPathUpdatePdu {
+            fragmentation: Fragmentation::Single,
+            update_code: UpdateCode::Bitmap,
+            compression_flags: Some(flags),
+            compression_type: Some(PduCompressionType::K64),
+            data,
+        };
+        let mut frame = encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), update.size()))
+            .expect("encode the Fast-Path header");
+        frame.extend_from_slice(&encode_vec(&update).expect("encode the Fast-Path update"));
+        frame
+    }
+
+    /// A slow-path Update PDU, laid out the way xrdp writes one.
+    fn slow_path_frame(data: &[u8], flags: CompressionFlags) -> Vec<u8> {
+        let length = u16::try_from(18 + data.len()).expect("PDU fits");
+        let mut user_data = Vec::new();
+        user_data.extend_from_slice(&length.to_le_bytes());
+        // pduType: Data PDU, protocol version 1.
+        user_data.extend_from_slice(&0x17u16.to_le_bytes());
+        user_data.extend_from_slice(&1002u16.to_le_bytes());
+        user_data.extend_from_slice(&SHARE_ID.to_le_bytes());
+        // pad1, streamId, uncompressedLength, then pduType2: Update.
+        user_data.extend_from_slice(&[0, 1, 0, 0, 0x02]);
+        user_data.push(flags.bits() | PduCompressionType::K64.as_u8());
+        user_data.extend_from_slice(&length.to_le_bytes());
+        user_data.extend_from_slice(data);
+        encode_vec(&X224(McsMessage::SendDataIndication(SendDataIndication {
+            initiator_id: 1002,
+            channel_id: IO_CHANNEL_ID,
+            user_data: Cow::Owned(user_data),
+        })))
+        .expect("encode the slow-path frame")
+    }
+
+    fn pixel(image: &DecodedImage, x: u16, y: u16) -> &[u8] {
+        let start = usize::from(y) * image.stride() + usize::from(x) * image.bytes_per_pixel();
+        &image.data()[start..start + image.bytes_per_pixel()]
+    }
+
+    /// The second square, drawn from the history the first one left, matches the first.
+    fn assert_squares_match(image: &DecodedImage) {
+        for (x, y) in [(0, 0), (5, 9), (SIDE - 1, SIDE - 1)] {
+            assert_ne!(pixel(image, x, y), [0, 0, 0, 0], "the first square is drawn");
+            assert_eq!(pixel(image, SIDE + x, SIDE + y), pixel(image, x, y));
+        }
+    }
+
+    #[test]
+    fn slow_path_output_shares_the_fast_path_history() {
+        let mut compressor = BulkCompressor::new(BulkCompressionType::Rdp5).expect("compressor");
+        let (first, first_flags) = compress(&mut compressor, &bitmap_update(0, 0));
+        let second_update = bitmap_update(SIDE, SIDE);
+        let (second, second_flags) = compress(&mut compressor, &second_update);
+        let mut fresh = BulkCompressor::new(BulkCompressionType::Rdp5).expect("decompressor");
+        let second_alone = fresh.decompress(
+            &second,
+            u32::from(second_flags.bits() | PduCompressionType::K64.as_u8()),
+        );
+        assert_ne!(
+            second_alone.ok(),
+            Some(second_update.as_slice()),
+            "the second update has to need the first one's history"
+        );
+
+        let mut stage = stage();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 2 * SIDE, 2 * SIDE);
+        stage
+            .process(&mut image, Action::FastPath, &fast_path_frame(&first, first_flags))
+            .expect("Fast-Path update");
+        stage
+            .process(&mut image, Action::X224, &slow_path_frame(&second, second_flags))
+            .expect("slow-path update");
+
+        assert_squares_match(&image);
+    }
+
+    #[test]
+    fn a_new_fast_path_processor_keeps_the_history() {
+        let mut compressor = BulkCompressor::new(BulkCompressionType::Rdp5).expect("compressor");
+        let (first, first_flags) = compress(&mut compressor, &bitmap_update(0, 0));
+        let (second, second_flags) = compress(&mut compressor, &bitmap_update(SIDE, SIDE));
+
+        let mut stage = stage();
+        let mut image = DecodedImage::new(PixelFormat::RgbA32, 2 * SIDE, 2 * SIDE);
+        stage
+            .process(&mut image, Action::FastPath, &fast_path_frame(&first, first_flags))
+            .expect("first update");
+        // What a Deactivation-Reactivation Sequence does.
+        stage.set_fastpath_processor(
+            fast_path::ProcessorBuilder {
+                io_channel_id: IO_CHANNEL_ID,
+                user_channel_id: USER_CHANNEL_ID,
+                share_id: SHARE_ID,
+                enable_server_pointer: false,
+                pointer_software_rendering: false,
+            }
+            .build(),
+        );
+        stage
+            .process(&mut image, Action::FastPath, &fast_path_frame(&second, second_flags))
+            .expect("update after the new processor");
+
+        assert_squares_match(&image);
+    }
 }
