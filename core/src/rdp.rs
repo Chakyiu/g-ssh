@@ -249,6 +249,7 @@ pub struct RdpConnection {
 
 impl RdpConnection {
     pub fn spawn(target: RdpTarget) -> Self {
+        install_tls_provider();
         let (event_tx, event_rx) = async_channel::bounded(8);
         let (frame_tx, frame_rx) = watch::channel(None);
         let (output_tx, output_rx) = mpsc::channel(2);
@@ -402,6 +403,13 @@ impl RdpConnection {
     }
 }
 
+/// rustls is built with both ring and aws-lc-rs here (ureq and gpui's HTTP
+/// client want ring), so it picks no process default, and IronRDP's TLS
+/// upgrade panics without one. Once a default is in place this does nothing.
+fn install_tls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 fn mouse(x: u16, y: u16, flags: PointerFlags, units: i16) -> FastPathInputEvent {
     FastPathInputEvent::MouseEvent(MousePdu {
         flags,
@@ -534,7 +542,70 @@ fn bgra_frame(buffer: &[u32], width: u16, height: u16) -> Option<DesktopFrame> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use ironrdp_pdu::nego::{ConnectionConfirm, ResponseFlags, SecurityProtocol};
+    use ironrdp_pdu::x224::X224;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
     use super::*;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn a_host_that_asks_for_nla_gets_a_tls_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conn = RdpConnection::spawn(RdpTarget::new(
+            "127.0.0.1".to_string(),
+            port,
+            "ada",
+            Zeroizing::new("s3cret".to_string()),
+            RdpSettings::default(),
+        ));
+        let events = conn.subscribe_events();
+        let (mut stream, _) = timeout(WAIT, listener.accept())
+            .await
+            .expect("client never dialed")
+            .unwrap();
+
+        let mut tpkt = [0u8; 4];
+        timeout(WAIT, stream.read_exact(&mut tpkt))
+            .await
+            .expect("client went quiet")
+            .unwrap();
+        let length = usize::from(u16::from_be_bytes([tpkt[2], tpkt[3]]));
+        let mut request = vec![0u8; length - tpkt.len()];
+        stream.read_exact(&mut request).await.unwrap();
+
+        // What a Windows host answers: Network Level Authentication, which
+        // runs inside TLS.
+        let confirm = ironrdp_core::encode_vec(&X224(ConnectionConfirm::Response {
+            flags: ResponseFlags::empty(),
+            protocol: SecurityProtocol::HYBRID,
+        }))
+        .unwrap();
+        stream.write_all(&confirm).await.unwrap();
+
+        let mut record = [0u8; 1];
+        timeout(WAIT, stream.read_exact(&mut record))
+            .await
+            .expect("client went quiet")
+            .expect("client hung up instead of starting TLS");
+        assert_eq!(record[0], 0x16, "a TLS handshake record");
+
+        drop(stream);
+        let event = timeout(WAIT, events.recv())
+            .await
+            .expect("no event")
+            .expect("events closed");
+        match event {
+            RdpEvent::Failed(message) => assert!(message.contains("TLS upgrade"), "{message}"),
+            _ => panic!("expected the TLS upgrade to fail"),
+        }
+    }
 
     #[test]
     fn backslash_account_splits_into_domain_and_user() {
