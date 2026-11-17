@@ -170,3 +170,7 @@ The app writes under `~/.g-ssh`:
 | `logs/g-ssh.log` | The log, plus one rotated copy |
 
 `RUST_LOG` replaces the default filter, which is `warn,g-ssh=info`.
+
+## Support
+
+[Buy me a coffee](https://buymeacoffee.com/chakyiu).
