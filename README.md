@@ -1,5 +1,7 @@
 # g-ssh
 
+<img src="docs/icon.png" alt="g-ssh" width="88">
+
 AI-agent-enabled SSH and SFTP client. Keys stay in an encrypted vault.
 Each host is a file you can copy out, and the password in that file is
 sealed with the vault key.
@@ -13,6 +15,14 @@ account sync are in `core`. That library is imported as `gssh`, because Rust
 already owns the name `core`.
 
 It runs on macOS 12 or newer, Windows, and Linux (X11 and Wayland).
+
+![The host list](docs/screenshot.png)
+
+![A terminal session](docs/terminal.jpg)
+
+![An SFTP session](docs/sftp.jpg)
+
+![A remote desktop session](docs/rdp.jpg)
 
 ## What it does
 
