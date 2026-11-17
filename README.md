@@ -183,4 +183,4 @@ The app writes under `~/.g-ssh`:
 
 ## Support
 
-[Buy me a coffee](https://buymeacoffee.com/chakyiu).
+<a href="https://buymeacoffee.com/chakyiu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" height="40"></a>
