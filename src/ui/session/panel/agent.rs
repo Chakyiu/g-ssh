@@ -56,7 +56,6 @@ const MAX_SELECTION_CHARS: usize = 12_000;
 const MAX_PROMPT_CHARS: usize = 16_000;
 const MAX_OUTPUT_BYTES: usize = 24_000;
 const MAX_COMMAND_BYTES: usize = 8_000;
-const MAX_ROUNDS: u32 = 8;
 const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUESTION_CHARS: usize = 500;
@@ -3607,18 +3606,12 @@ impl ServerPanel {
             if !follow_up {
                 agent.phase = Phase::Idle;
             } else {
+                // Keep going until the model is done or the user presses Stop.
                 agent.rounds += 1;
-                if agent.rounds >= MAX_ROUNDS {
-                    agent.phase = Phase::Idle;
-                    agent.bubbles.push(Bubble::Note(
-                        "Stopped after 8 steps. Ask again to continue.".into(),
-                    ));
-                } else {
-                    agent.phase = Phase::Waiting;
-                    agent.wait_started_ms = Some(now_ms());
-                    agent.wait_chars = 0;
-                    spawn = true;
-                }
+                agent.phase = Phase::Waiting;
+                agent.wait_started_ms = Some(now_ms());
+                agent.wait_chars = 0;
+                spawn = true;
             }
             agent.scroll.scroll_to_bottom();
         }
