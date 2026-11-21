@@ -55,6 +55,9 @@ fn main() {
         cx.activate(true);
     });
     app.run(|cx: &mut App| {
+        #[cfg(windows)]
+        cx.set_app_identity("app.g-ssh", "g-ssh");
+
         // The assets folder is embedded whole, so the fonts come from
         // there and are not compiled in a second time. Source Sans 3 is
         // the interface; Cascadia Code is addresses, paths, and the
