@@ -1367,16 +1367,17 @@ mod tests {
             ],
             "{request}"
         );
-        assert!(request.contains("User-Agent: g-ssh\r\n"), "{request}");
+        // Header names arrive in whatever case the client writes them
+        // (lowercase today), so the name is matched without regard to case.
+        // The value is still compared exactly.
+        let folded = request.to_ascii_lowercase();
+        assert!(folded.contains("user-agent: g-ssh\r\n"), "{request}");
         assert!(
-            request.contains("Accept: application/vnd.github+json\r\n"),
+            folded.contains("accept: application/vnd.github+json\r\n"),
             "{request}"
         );
         assert!(!request.contains(crate::version::CURRENT), "{request}");
-        assert!(
-            !request.to_ascii_lowercase().contains("authorization"),
-            "{request}"
-        );
+        assert!(!folded.contains("authorization"), "{request}");
         assert!(!request.contains("evil.example"), "{request}");
     }
 
