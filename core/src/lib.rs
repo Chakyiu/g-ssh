@@ -21,7 +21,4 @@ mod tele47_gate_block {
     }
 }
 
-pub fn tele47_fmt_violation() -> i32 {
-    let    badly    spaced   =  1;
-    badly*3+spaced
-}
+pub fn tele47_fmt_violation(badly: i32, spaced: i32)->i32{badly*3+spaced}
