@@ -197,6 +197,12 @@ pub enum ServerSessionEvent {
         route: Option<String>,
         outcome: TransferOutcome,
     },
+    /// An auto-start port forward failed after connecting or reconnecting.
+    ForwardFailed {
+        id: String,
+        name: String,
+        reason: String,
+    },
 }
 
 /// The machine an event came from, resolved against the live route. Prompts
@@ -2034,11 +2040,21 @@ impl ServerSession {
             return;
         };
         forward.state = state;
-        // An auto-start that failed has no other way to reach the user: they
-        // may not be looking at the Forwards page.
-        if let Some(reason) = forward.failure() {
-            let message = format!("Port forward '{}' stopped: {reason}", forward.name);
-            cx.emit(ServerSessionEvent::StatusChanged(message));
+        let should_notify = should_notify_forward_failure(forward.auto_start, forward.failure());
+        let failure = forward.failure().map(|reason| {
+            (
+                forward.spec.id.clone(),
+                forward.name.clone(),
+                reason.to_string(),
+            )
+        });
+        if let Some((id, name, reason)) = failure {
+            cx.emit(ServerSessionEvent::StatusChanged(format!(
+                "Port forward '{name}' stopped: {reason}"
+            )));
+            if should_notify {
+                cx.emit(ServerSessionEvent::ForwardFailed { id, name, reason });
+            }
         }
         self.refresh_forwards(cx);
         cx.notify();
@@ -3241,6 +3257,10 @@ impl Render for ServerSession {
     }
 }
 
+fn should_notify_forward_failure(auto_start: bool, failure: Option<&str>) -> bool {
+    auto_start && failure.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3336,6 +3356,19 @@ mod tests {
 
         let timed_out = futures::executor::block_on(finish_within(pending::<u8>(), ready(())));
         assert_eq!(timed_out, None);
+    }
+
+    #[test]
+    fn only_failed_auto_start_forwards_request_a_notification() {
+        assert!(should_notify_forward_failure(
+            true,
+            Some("Address already in use")
+        ));
+        assert!(!should_notify_forward_failure(
+            false,
+            Some("Address already in use")
+        ));
+        assert!(!should_notify_forward_failure(true, None));
     }
 
     #[test]

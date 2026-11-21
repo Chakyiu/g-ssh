@@ -1933,6 +1933,9 @@ impl AppView {
                         cx,
                     );
                 }
+                ServerSessionEvent::ForwardFailed { id, name, reason } => {
+                    this.notify_forward_failed(session_entity, id, name, reason, window, cx);
+                }
                 ServerSessionEvent::CloseRequested => {
                     if let Some(idx) = this.tabs.iter().position(|s| s == session_entity) {
                         this.close_tab(idx, cx);
@@ -2145,6 +2148,32 @@ impl AppView {
             tag: tag.into(),
             title: title.into(),
             body: body.into(),
+            actions: Vec::new(),
+        });
+    }
+
+    /// Report an auto-start forward failure when the app is in the background.
+    /// The per-forward tag keeps separate failed forwards visible while replacing
+    /// repeat failures for the same forward on later reconnects.
+    fn notify_forward_failed(
+        &self,
+        session: &Entity<ServerSession>,
+        id: &str,
+        name: &str,
+        reason: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if window.is_window_active() {
+            return;
+        }
+
+        let session = session.read(cx);
+        window.request_attention();
+        cx.show_system_notification(SystemNotification {
+            tag: format!("g-ssh.forward.{}.{}", session.server_id, id).into(),
+            title: "Port forward failed".into(),
+            body: format!("{name}: {reason} · {}", session.conn_info.display_name()).into(),
             actions: Vec::new(),
         });
     }
