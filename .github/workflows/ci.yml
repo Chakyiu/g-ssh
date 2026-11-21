@@ -1,0 +1,115 @@
+# Checks every pull request and every push to master: formatting, clippy, tests.
+#
+# Three jobs, one machine per OS, for the same reason release.yml uses one
+# machine per OS: gpui links the host's own graphics and window libraries and
+# does not cross-compile. Linux X11 and Wayland are one build — Cargo.toml
+# enables both features and the apt list below links both.
+#
+# No packaging, no signing, no display: the unit tests are plain functions.
+# Application::new lives only in src/main.rs.
+#
+# `--workspace` matters. `cargo test` at the repo root would test the g-ssh
+# package alone and skip core (vault, SSH, SFTP, VNC, RDP, Telnet) and updater.
+# `--locked` keeps this the same dependency set release.yml builds.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Matches the release build so a test sees the same target as the app.
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
+
+jobs:
+  linux:
+    name: linux (fmt, clippy, test)
+    runs-on: ubuntu-24.04
+    steps:
+      # `core` is in this repo. Cargo.toml depends on it by path.
+      - uses: actions/checkout@v7
+
+      # Wayland, X11, Vulkan, and fontconfig. gpui links these on Linux.
+      # ALSA is for RDP audio. gcc/clang/cmake/pkg-config are for native
+      # crates such as aws-lc-rs.
+      - name: Install Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc g++ clang pkg-config cmake \
+            libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev wayland-protocols \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libasound2-dev
+
+      # With no arguments rustup installs the compiler pinned in rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          shared-key: ci-linux
+
+      # rustfmt output does not depend on the OS, so this runs here only.
+      # third_party is outside the workspace and is left alone.
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Fails on clippy errors. Warnings stay warnings, as the README writes it.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      # Compiles the workspace too, so there is no separate build step.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  macos:
+    name: macos (clippy, test)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          shared-key: ci-macos
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  windows:
+    name: windows (clippy, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          shared-key: ci-windows
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
