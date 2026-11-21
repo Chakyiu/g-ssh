@@ -1588,6 +1588,25 @@ mod tests {
         fs::write(path.join("Contents/MacOS/g-ssh"), b"bin").unwrap();
     }
 
+    // What the installed app is on disk: a bundle on macOS, a single exe on
+    // Windows. `dest_is_safe` and `staged_payload_is_safe` check exactly that,
+    // so the installer test's fixture has to follow the platform.
+    #[cfg(windows)]
+    const APP_NAME: &str = "g-ssh.exe";
+    #[cfg(not(windows))]
+    const APP_NAME: &str = "g-ssh.app";
+
+    fn write_installed(path: &Path) {
+        #[cfg(windows)]
+        {
+            fs::write(path, b"bin").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            write_app(path);
+        }
+    }
+
     #[test]
     fn the_running_app_is_the_bundle_around_the_executable() {
         let exe = Path::new("/Applications/g-ssh.app/Contents/MacOS/g-ssh");
@@ -1954,11 +1973,12 @@ mod tests {
     fn the_installer_only_replaces_this_app_with_the_staged_copy() {
         let dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("g-ssh.app");
-        write_app(&dest);
+        let dest = dir.path().join(APP_NAME);
+        write_installed(&dest);
         let stage = dir.path().join(".g-ssh-update-abc123");
-        let staged = stage.join("g-ssh.app");
-        write_app(&staged);
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join(APP_NAME);
+        write_installed(&staged);
         let archive = cache.path().join("g-ssh-0.2.0.dmg");
         fs::write(&archive, b"dmg").unwrap();
 
@@ -1980,7 +2000,7 @@ mod tests {
         let mut outside = SwapRequest {
             pid: 1,
             dest,
-            staged: dir.path().join("g-ssh.app"),
+            staged: dir.path().join(APP_NAME),
             stage_dir: dir.path().join(".g-ssh-update-abc123"),
             archive: cache.path().join("../g-ssh-0.2.0.dmg"),
             token: "abc".into(),
@@ -1988,7 +2008,7 @@ mod tests {
         // The archive path is not the one just built. Rebuild a request whose
         // archive leaves the cache by a parent segment.
         outside.archive = cache.path().join("g-ssh-0.2.0.dmg");
-        outside.staged = outside.stage_dir.join("g-ssh.app");
+        outside.staged = outside.stage_dir.join(APP_NAME);
         assert!(is_absolute_normal(&outside.dest));
         let sneaky = cache.path().join("..").join("g-ssh-0.2.0.dmg");
         outside.archive = sneaky;
