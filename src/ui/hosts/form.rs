@@ -660,7 +660,9 @@ impl ServerFormView {
         }
 
         match self.auth_mode {
-            AuthMode::Password => !self.pass_input.read(cx).value().is_empty(),
+            // A VM with PermitEmptyPasswords signs in with an empty password,
+            // so Password mode is valid even with the field blank.
+            AuthMode::Password => true,
             AuthMode::PrivateKey => self.selected_key_id.is_some(),
             // The agent supplies the keys; nothing to fill in here.
             AuthMode::Agent => true,
@@ -2140,9 +2142,7 @@ impl ServerFormView {
             return self.rdp_settings(cx).is_none().then_some(DESKTOP_SIZE_HINT);
         }
         match self.auth_mode {
-            AuthMode::Password if self.pass_input.read(cx).value().is_empty() => {
-                Some("Enter the password.")
-            }
+            // An empty SSH/SFTP password is allowed: the server may accept it.
             AuthMode::PrivateKey if self.selected_key_id.is_none() => {
                 Some("Choose a key or add one.")
             }
