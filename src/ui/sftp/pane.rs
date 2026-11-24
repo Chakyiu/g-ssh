@@ -226,6 +226,8 @@ pub enum FilePaneEvent {
     /// The button before the pane name: switch between the second pane and
     /// the session's files alone.
     FileModeRequested,
+    /// Show local path(s) in the OS file manager (local pane only).
+    RevealInFileManager(Vec<String>),
 }
 
 /// What a context menu was opened on: one row, the selected rows, or nothing.
@@ -1558,6 +1560,22 @@ fn open_file(path: String, cx: &mut Context<FilePane>) {
     }
 }
 
+fn reveal_in_file_manager_item(
+    paths: Vec<String>,
+    cx: &mut Context<FilePane>,
+) -> ContextMenuItem {
+    ContextMenuItem::new(
+        "ctx-reveal",
+        open::reveal_in_file_manager_label(),
+        cx.listener(move |this, _, _, cx| {
+            this.context_menu = None;
+            cx.emit(FilePaneEvent::RevealInFileManager(paths.clone()));
+            cx.notify();
+        }),
+    )
+    .icon("icons/folder-open.svg")
+}
+
 /// "cd Terminal Here": the session's shell changes into `path`.
 fn cd_terminal_menu_item(path: String, cx: &mut Context<FilePane>) -> ContextMenuItem {
     ContextMenuItem::new(
@@ -1625,6 +1643,14 @@ impl FilePane {
                 )
                 .icon("icons/lock.svg"),
             );
+        }
+
+        if self.kind == PaneKind::Local {
+            let paths: Vec<String> = match entries {
+                [entry] => vec![entry.path.clone()],
+                _ => entries.iter().map(|e| e.path.clone()).collect(),
+            };
+            items.push(reveal_in_file_manager_item(paths, cx));
         }
 
         if let [entry] = entries {
@@ -1813,6 +1839,9 @@ impl FilePane {
             )
             .icon("icons/clipboard-copy.svg"),
         ];
+        if self.kind == PaneKind::Local {
+            items.push(reveal_in_file_manager_item(vec![self.path.clone()], cx));
+        }
         if self.kind == PaneKind::Session {
             items.push(cd_terminal_menu_item(self.path.clone(), cx));
         }

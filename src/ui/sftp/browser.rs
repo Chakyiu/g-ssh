@@ -1198,7 +1198,22 @@ impl SftpBrowser {
             }
             // Local entries are already real paths, so there is nothing to stage.
             FilePaneEvent::DragStarted(_) | FilePaneEvent::ExternalDragUnavailable { .. } => {}
-            FilePaneEvent::ExternalDropped(_) => {}
+            FilePaneEvent::ExternalDropped(paths) => {
+                // Finder/Explorer drops on the local pane still upload to the session.
+                self.upload_paths(Side::Right, paths, cx);
+            }
+            FilePaneEvent::RevealInFileManager(paths) => {
+                for path in paths {
+                    let path = std::path::Path::new(path);
+                    if let Err(e) = crate::files::open::reveal_in_file_manager(path) {
+                        cx.emit(BrowserEvent::Error(format!(
+                            "Couldn't reveal {}: {e}",
+                            path.display()
+                        )));
+                        break;
+                    }
+                }
+            }
             FilePaneEvent::HoverEntry(_) => {}
             FilePaneEvent::OpenFile(_) => {}
             FilePaneEvent::RequestOpenWith(_) => {}
@@ -1475,7 +1490,8 @@ impl SftpBrowser {
             | FilePaneEvent::RequestOpenWith(_)
             | FilePaneEvent::CdTerminalHere(_)
             | FilePaneEvent::EditInTerminal(_)
-            | FilePaneEvent::SourcePickerRequested => {}
+            | FilePaneEvent::SourcePickerRequested
+            | FilePaneEvent::RevealInFileManager(_) => {}
         }
     }
 

@@ -128,6 +128,71 @@ pub fn open_in_specific_app(app: &Path, file: &Path) -> Result<(), OpenError> {
     }
 }
 
+/// Label for “show this path in the OS file manager” in context menus.
+pub fn reveal_in_file_manager_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "Reveal in Finder";
+    #[cfg(target_os = "windows")]
+    return "Reveal in File Explorer";
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    "Show in File Manager"
+}
+
+/// Select `path` in the system file manager. Works for a file or a folder on
+/// this computer.
+pub fn reveal_in_file_manager(path: &Path) -> Result<(), OpenError> {
+    if path.is_dir() {
+        return reveal_folder(path);
+    }
+    std::fs::metadata(path).map_err(OpenError::Io)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status()
+            .map_err(OpenError::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(OpenError::Io(std::io::Error::other(format!(
+                "`open -R` exited with {status}"
+            ))))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path = without_verbatim_prefix(path);
+        let arg = format!("/select,{}", path.display());
+        std::process::Command::new("explorer")
+            .arg(arg)
+            .spawn()
+            .map(drop)
+            .map_err(OpenError::Io)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| p.is_dir())
+            .unwrap_or(path);
+        let status = std::process::Command::new("xdg-open")
+            .arg(parent)
+            .status()
+            .map_err(OpenError::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(OpenError::Io(std::io::Error::other(format!(
+                "`xdg-open` exited with {status}"
+            ))))
+        }
+    }
+}
+
 /// Open `path` in the system file manager. `path` is a folder on this computer.
 pub fn reveal_folder(path: &Path) -> Result<(), OpenError> {
     if !path.is_dir() {
