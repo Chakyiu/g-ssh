@@ -1198,7 +1198,10 @@ impl SftpBrowser {
             }
             // Local entries are already real paths, so there is nothing to stage.
             FilePaneEvent::DragStarted(_) | FilePaneEvent::ExternalDragUnavailable { .. } => {}
-            FilePaneEvent::ExternalDropped(_) => {}
+            FilePaneEvent::ExternalDropped(paths) => {
+                // Finder/Explorer drops on the local pane still upload to the session.
+                self.upload_paths(Side::Right, paths, cx);
+            }
             FilePaneEvent::HoverEntry(_) => {}
             FilePaneEvent::OpenFile(_) => {}
             FilePaneEvent::RequestOpenWith(_) => {}
@@ -1235,6 +1238,15 @@ impl SftpBrowser {
                 cx.emit(BrowserEvent::LeftSourcePickerRequested);
             }
             FilePaneEvent::FileModeRequested => self.toggle_file_mode(cx),
+            FilePaneEvent::RevealInOs { path } => {
+                if let Err(err) =
+                    crate::files::open::reveal_in_file_manager(std::path::Path::new(path))
+                {
+                    cx.emit(BrowserEvent::Error(format!(
+                        "Couldn't reveal in file manager: {err}"
+                    )));
+                }
+            }
             // Remote-only items: the local menu never offers them.
             FilePaneEvent::Chmod { .. }
             | FilePaneEvent::CdTerminalHere(_)
@@ -1475,7 +1487,8 @@ impl SftpBrowser {
             | FilePaneEvent::RequestOpenWith(_)
             | FilePaneEvent::CdTerminalHere(_)
             | FilePaneEvent::EditInTerminal(_)
-            | FilePaneEvent::SourcePickerRequested => {}
+            | FilePaneEvent::SourcePickerRequested
+            | FilePaneEvent::RevealInOs { .. } => {}
         }
     }
 
