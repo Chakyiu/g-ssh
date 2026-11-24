@@ -226,6 +226,10 @@ pub enum FilePaneEvent {
     /// The button before the pane name: switch between the second pane and
     /// the session's files alone.
     FileModeRequested,
+    /// Local pane: open the path in the OS file manager (Reveal in Finder, etc.).
+    RevealInOs {
+        path: String,
+    },
 }
 
 /// What a context menu was opened on: one row, the selected rows, or nothing.
@@ -1559,6 +1563,20 @@ fn open_file(path: String, cx: &mut Context<FilePane>) {
 }
 
 /// "cd Terminal Here": the session's shell changes into `path`.
+fn reveal_in_os_menu_item(entry: &MenuEntry, cx: &mut Context<FilePane>) -> ContextMenuItem {
+    let path = entry.path.clone();
+    ContextMenuItem::new(
+        "ctx-reveal-in-os",
+        open::reveal_in_file_manager_label(),
+        cx.listener(move |this, _, _, cx| {
+            this.context_menu = None;
+            cx.emit(FilePaneEvent::RevealInOs { path: path.clone() });
+            cx.notify();
+        }),
+    )
+    .icon("icons/folder-open.svg")
+}
+
 fn cd_terminal_menu_item(path: String, cx: &mut Context<FilePane>) -> ContextMenuItem {
     ContextMenuItem::new(
         "ctx-cd-terminal",
@@ -1590,6 +1608,9 @@ impl FilePane {
                     items.push(cd_terminal_menu_item(entry.path.clone(), cx));
                 }
                 items.push(self.transfer_menu_item(entries, cx));
+                if self.kind == PaneKind::Local {
+                    items.push(reveal_in_os_menu_item(entry, cx));
+                }
                 items.push(
                     ContextMenuItem::new(
                         "ctx-rename",
@@ -1815,6 +1836,22 @@ impl FilePane {
         ];
         if self.kind == PaneKind::Session {
             items.push(cd_terminal_menu_item(self.path.clone(), cx));
+        }
+        if self.kind == PaneKind::Local {
+            let path = self.path.clone();
+            items.insert(
+                1,
+                ContextMenuItem::new(
+                    "ctx-reveal-in-os",
+                    open::reveal_in_file_manager_label(),
+                    cx.listener(move |this, _, _, cx| {
+                        this.context_menu = None;
+                        cx.emit(FilePaneEvent::RevealInOs { path: path.clone() });
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/folder-open.svg"),
+            );
         }
         items
     }
@@ -2178,6 +2215,7 @@ impl Render for FilePane {
 
         let cols = visible_columns(self.list_width, is_remote);
 
+        let accept_os_drop = self.kind.is_remote();
         v_flex()
             .track_focus(&self.focus_handle)
             .key_context(keys::KEY_CONTEXT)
@@ -2187,6 +2225,12 @@ impl Render for FilePane {
             .flex_1()
             .size_full()
             .overflow_hidden()
+            .when(accept_os_drop, |el| {
+                el.on_drop(cx.listener(|_this, paths: &ExternalPaths, _window, cx| {
+                    cx.emit(FilePaneEvent::ExternalDropped(paths.paths().to_vec()));
+                }))
+                .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+            })
             // Anchor for the in-pane dialog overlay (absolute inset_0).
             .relative()
             .child(width_probe)

@@ -128,6 +128,74 @@ pub fn open_in_specific_app(app: &Path, file: &Path) -> Result<(), OpenError> {
     }
 }
 
+/// Context-menu label for [`reveal_in_file_manager`].
+pub fn reveal_in_file_manager_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Reveal in Finder"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Reveal in File Explorer"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "Show in File Manager"
+    }
+}
+
+/// Open `path` in the system file manager, selecting it when it is a file.
+pub fn reveal_in_file_manager(path: &Path) -> Result<(), OpenError> {
+    if path.is_dir() {
+        return reveal_folder(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status()
+            .map_err(OpenError::Io)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(OpenError::Io(std::io::Error::other(format!(
+                "`open -R` exited with {status}"
+            ))))
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path = without_verbatim_prefix(path);
+        let arg = format!("/select,{}", path.display());
+        match std::process::Command::new("explorer").arg(arg).spawn() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(OpenError::Io(e)),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        for (cmd, flag) in [("nautilus", "--select"), ("dolphin", "--select")] {
+            let Ok(status) = std::process::Command::new(cmd).arg(flag).arg(path).status() else {
+                continue;
+            };
+            if status.success() {
+                return Ok(());
+            }
+        }
+        let Some(parent) = path.parent() else {
+            return Err(OpenError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the path has no parent folder",
+            )));
+        };
+        reveal_folder(parent)
+    }
+}
+
 /// Open `path` in the system file manager. `path` is a folder on this computer.
 pub fn reveal_folder(path: &Path) -> Result<(), OpenError> {
     if !path.is_dir() {
@@ -308,6 +376,10 @@ mod tests {
     }
 
     #[test]
+    fn reveal_in_file_manager_label_is_non_empty() {
+        assert!(!super::reveal_in_file_manager_label().is_empty());
+    }
+
     fn a_missing_file_is_an_io_error_and_not_a_missing_app() {
         let directory = tempfile::tempdir().unwrap();
         let result = super::open_in_default_app(&directory.path().join("gone.txt"));
