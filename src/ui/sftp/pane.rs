@@ -2215,7 +2215,8 @@ impl Render for FilePane {
 
         let cols = visible_columns(self.list_width, is_remote);
 
-        let accept_os_drop = self.kind.is_remote();
+        // OS file-manager drops may land on either pane's chrome.
+        let accept_os_drop = true;
         v_flex()
             .track_focus(&self.focus_handle)
             .key_context(keys::KEY_CONTEXT)

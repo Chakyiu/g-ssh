@@ -407,6 +407,9 @@ fn log_line(path: Option<&Path>, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
     fn stage(dir: &Path) -> (PathBuf, PathBuf) {
         let dest = dir.join("install");
@@ -502,12 +505,14 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
+        let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "g-ssh-update-test-{}-{}",
+            "g-ssh-update-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
-                .map_or(0, |since| since.as_nanos())
+                .map_or(0, |since| since.as_nanos()),
+            seq
         ));
         fs::create_dir(&path).unwrap();
         path
