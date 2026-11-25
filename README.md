@@ -149,6 +149,9 @@ cargo build --release --workspace
 
 The app is `target/release/g-ssh`, or `g-ssh.exe` on Windows. The same
 build writes `update.exe` next to it. That program applies a Windows update.
+`mcp-server` (`mcp-server.exe` on Windows) is a private headless spike on
+the same workspace; see [mcp-server/README.md](mcp-server/README.md).
+Release archives do not include it.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds
 Linux, macOS arm64, and Windows x86_64. Pushing a `v*` tag
