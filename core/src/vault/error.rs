@@ -27,6 +27,9 @@ pub enum VaultError {
     #[error("this host is no longer in the vault")]
     EntryNotFound(Uuid),
 
+    #[error("that folder is no longer in the vault")]
+    GroupNotFound(Uuid),
+
     #[error("this SSH key is no longer in the vault")]
     KeyNotFound(Uuid),
 

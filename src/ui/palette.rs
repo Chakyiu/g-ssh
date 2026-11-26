@@ -62,6 +62,7 @@ pub enum CommandPaletteEvent {
 pub enum PaletteCommand {
     NewHost,
     ImportHosts,
+    ImportConnections,
     OpenSettings,
     LockVault,
     SetTheme(ThemePreference),
@@ -95,7 +96,7 @@ const fn chord(mac: &'static str, other: &'static str) -> &'static str {
 }
 
 /// Shortcuts here must track the bindings in [`crate::ui::app::init`].
-const COMMANDS: [CommandSpec; 15] = [
+const COMMANDS: [CommandSpec; 16] = [
     CommandSpec {
         command: PaletteCommand::NewHost,
         label: "New host",
@@ -109,6 +110,14 @@ const COMMANDS: [CommandSpec; 15] = [
         label: "Import hosts",
         keywords: "config putty termius",
         note: "",
+        shortcut: None,
+        needs_session: false,
+    },
+    CommandSpec {
+        command: PaletteCommand::ImportConnections,
+        label: "Import connections",
+        keywords: "export file g-ssh restore",
+        note: "a sealed export",
         shortcut: None,
         needs_session: false,
     },
@@ -989,7 +998,9 @@ fn command_icon(command: PaletteCommand) -> Icon {
         | PaletteCommand::FocusFiles
         | PaletteCommand::ChooseLeftSource => IconName::FolderOpen,
         PaletteCommand::ReconnectSession => return Icon::empty().path("icons/rotate-cw.svg"),
-        PaletteCommand::ImportHosts => return Icon::empty().path("icons/download.svg"),
+        PaletteCommand::ImportHosts | PaletteCommand::ImportConnections => {
+            return Icon::empty().path("icons/download.svg");
+        }
     };
     Icon::new(name)
 }
@@ -1249,7 +1260,10 @@ mod tests {
         assert_eq!(command_labels("settings", false), ["Settings"]);
         assert_eq!(command_labels("preferences", false), ["Settings"]);
         assert_eq!(command_labels("new host", false), ["New host"]);
-        assert_eq!(command_labels("import", false), ["Import hosts"]);
+        assert_eq!(
+            command_labels("import", false),
+            ["Import hosts", "Import connections"]
+        );
         assert_eq!(command_labels("sidebar", false), ["Show or hide sidebar"]);
         assert_eq!(
             command_labels("theme", false),
@@ -1288,7 +1302,7 @@ mod tests {
             command_labels("sftp", true),
             ["Open SFTP tab", "Focus files"]
         );
-        assert_eq!(command_labels("", false).len(), 8);
+        assert_eq!(command_labels("", false).len(), 9);
         assert_eq!(command_labels("", true).len(), COMMANDS.len());
     }
 

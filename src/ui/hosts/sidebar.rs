@@ -24,7 +24,7 @@ use crate::ui::hosts::sharing;
 use crate::ui::menu::{ContextMenu, ContextMenuItem};
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
-use gssh::vault::{ConnectionKind, ProxyChoice, ServerEntrySummary};
+use gssh::vault::{ConnectionKind, ExportScope, ProxyChoice, ServerEntrySummary};
 
 /// Designed width before the user drags the right edge.
 pub(crate) const SIDEBAR_WIDTH: f32 = 232.;
@@ -82,6 +82,8 @@ pub enum SidebarEvent {
     EditServerRequested(Uuid),
     DuplicateServerRequested(Uuid),
     DeleteServerRequested(Uuid),
+    /// Seal one connection, or every connection in a folder, into a file.
+    ExportRequested(ExportScope),
     SettingsRequested,
     /// Open a terminal on this computer.
     OpenLocal,
@@ -95,6 +97,8 @@ pub struct Sidebar {
     sessions: Vec<(String, HostStatus)>,
     /// Right-click on a host opens its actions at the cursor.
     host_menu: Option<(Uuid, Point<Pixels>)>,
+    /// Right-click on a folder opens its actions at the cursor.
+    group_menu: Option<(Uuid, Point<Pixels>)>,
     /// Folder paths the user folded shut. A path absent here is open, so a
     /// new folder shows its hosts without a saved preference.
     collapsed_groups: HashSet<String>,
@@ -121,6 +125,7 @@ impl Sidebar {
             active_server_id: None,
             sessions: Vec::new(),
             host_menu: None,
+            group_menu: None,
             collapsed_groups: HashSet::new(),
             dragging_host: None,
             drop_slot: None,
@@ -339,6 +344,7 @@ impl Sidebar {
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
+                    this.group_menu = None;
                     this.host_menu = Some((entry_id, event.position));
                     cx.notify();
                 }),
@@ -848,6 +854,7 @@ fn folder_header(
     let is_collapsed = collapsed.contains(key);
     let title = label.to_string();
     let path = key.to_string();
+    let menu_path = path.clone();
     let chevron = if is_collapsed {
         IconName::ChevronRight
     } else {
@@ -892,6 +899,18 @@ fn folder_header(
             }
             cx.notify();
         }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.host_menu = None;
+                let Some(id) = this.group_id(&menu_path, cx) else {
+                    return;
+                };
+                this.group_menu = Some((id, event.position));
+                cx.notify();
+            }),
+        )
         .into_any_element()
 }
 
@@ -1349,6 +1368,7 @@ impl Render for Sidebar {
                     )),
             )
             .children(self.render_host_menu(cx))
+            .children(self.render_group_menu(cx))
     }
 }
 
@@ -1450,6 +1470,20 @@ impl Sidebar {
         );
         items.push(
             ContextMenuItem::new(
+                "host-menu-export",
+                "Export",
+                cx.listener(move |this, _, _, cx| {
+                    this.host_menu = None;
+                    cx.emit(SidebarEvent::ExportRequested(ExportScope::Connection(
+                        entry_id,
+                    )));
+                    cx.notify();
+                }),
+            )
+            .icon("icons/upload.svg"),
+        );
+        items.push(
+            ContextMenuItem::new(
                 "host-menu-duplicate",
                 "Duplicate",
                 cx.listener(move |this, _, _, cx| {
@@ -1513,6 +1547,42 @@ impl Sidebar {
                     cx.notify();
                 }),
                 items,
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn group_id(&self, path: &str, cx: &App) -> Option<Uuid> {
+        self.vault_state.read(cx).manager().and_then(|vault| {
+            vault
+                .list_group_paths()
+                .into_iter()
+                .find(|(_, name)| name == path)
+                .map(|(id, _)| id)
+        })
+    }
+
+    fn render_group_menu(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (group_id, position) = self.group_menu?;
+        Some(
+            ContextMenu::new(
+                "sidebar-group-menu",
+                position,
+                Anchor::TopLeft,
+                cx.listener(|this, _, _, cx| {
+                    this.group_menu = None;
+                    cx.notify();
+                }),
+                vec![ContextMenuItem::new(
+                    "group-menu-export",
+                    "Export group",
+                    cx.listener(move |this, _, _, cx| {
+                        this.group_menu = None;
+                        cx.emit(SidebarEvent::ExportRequested(ExportScope::Group(group_id)));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/upload.svg")],
             )
             .into_any_element(),
         )

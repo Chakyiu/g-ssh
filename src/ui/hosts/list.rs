@@ -24,7 +24,7 @@ use crate::ui::hosts::sharing;
 use crate::ui::hosts::sidebar::host_order_key;
 use crate::ui::sync::SyncService;
 use crate::ui::VaultState;
-use gssh::vault::ServerEntrySummary;
+use gssh::vault::{ExportScope, ServerEntrySummary};
 
 const SERVER_ROW_GROUP: &str = "server-row";
 const CARD_RADIUS: f32 = 12.;
@@ -61,9 +61,12 @@ pub enum ServersViewEvent {
     OpenServer(ServerEntrySummary),
     AddServerRequested,
     ImportRequested,
+    /// Seal a g-ssh export file back into the vault.
+    ImportFileRequested,
     EditServerRequested(Uuid),
     DuplicateServerRequested(Uuid),
     DeleteServerRequested(Uuid),
+    ExportRequested(ExportScope),
 }
 
 pub struct ServersView {
@@ -280,6 +283,20 @@ impl ServersView {
             .items(sharing_items)
             .item(
                 ContextMenuItem::new(
+                    "row-menu-export",
+                    "Export",
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_menu_for = None;
+                        cx.emit(ServersViewEvent::ExportRequested(ExportScope::Connection(
+                            id,
+                        )));
+                        cx.notify();
+                    }),
+                )
+                .icon("icons/upload.svg"),
+            )
+            .item(
+                ContextMenuItem::new(
                     "row-menu-delete",
                     "Delete",
                     cx.listener(move |this, _, _, cx| {
@@ -363,7 +380,15 @@ impl ServersView {
     }
 
     /// Section heading for a host folder: name + count, quiet and small.
-    fn group_header(&self, name: &str, count: usize, cx: &App) -> gpui::AnyElement {
+    /// `group_id` adds Export when the heading is a real folder.
+    fn group_header(
+        &self,
+        name: &str,
+        count: usize,
+        group_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let fg = cx.theme().foreground;
         h_flex()
             .w_full()
             .h(px(32.))
@@ -384,6 +409,22 @@ impl ServersView {
                     .text_color(theme::text_dim())
                     .child(format!("{count}")),
             )
+            .when_some(group_id, |row, id| {
+                row.child(
+                    div()
+                        .id(gpui::SharedString::from(format!("export-group-{name}")))
+                        .ml_auto()
+                        .px(px(6.))
+                        .text_size(px(12.))
+                        .text_color(theme::text_dim())
+                        .cursor_pointer()
+                        .hover(move |style| style.text_color(fg))
+                        .child("Export")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ServersViewEvent::ExportRequested(ExportScope::Group(id)));
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -743,9 +784,6 @@ impl Render for ServersView {
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::element_hover()))
                 .active(|s| s.bg(theme::element_active()))
-                .on_click(cx.listener(|_, _, _, cx| {
-                    cx.emit(ServersViewEvent::ImportRequested);
-                }))
         };
 
         let header = h_flex()
@@ -773,7 +811,18 @@ impl Render for ServersView {
             .child(search_field)
             .children(sync_button)
             .child(
+                import_btn("import-file-header")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(ServersViewEvent::ImportFileRequested);
+                    }))
+                    .child(Icon::empty().path("icons/download.svg").size(px(14.)))
+                    .child("Import file"),
+            )
+            .child(
                 import_btn("import-hosts-header")
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(ServersViewEvent::ImportRequested);
+                    }))
                     .child(Icon::empty().path("icons/download.svg").size(px(14.)))
                     .child("Import"),
             )
@@ -900,7 +949,13 @@ impl Render for ServersView {
                         .child(
                             h_flex()
                                 .gap(px(6.))
-                                .child(import_btn("import-hosts-empty").child("Import them"))
+                                .child(
+                                    import_btn("import-hosts-empty")
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.emit(ServersViewEvent::ImportRequested);
+                                        }))
+                                        .child("Import them"),
+                                )
                                 .child(add_server_btn("add-server-empty")),
                         ),
                     None => el.child(add_server_btn("add-server-empty")),
@@ -942,10 +997,20 @@ impl Render for ServersView {
             ungrouped.sort_by_key(host_order_key);
             let has_groups = !grouped.is_empty();
 
+            let group_paths = self
+                .vault_state
+                .read(cx)
+                .manager()
+                .map(|vault| vault.list_group_paths())
+                .unwrap_or_default();
             let mut content: Vec<gpui::AnyElement> = Vec::new();
             let mut ix = 0usize;
             for (group_name, entries) in grouped {
-                content.push(self.group_header(&group_name, entries.len(), cx));
+                let group_id = group_paths
+                    .iter()
+                    .find(|(_, path)| path == &group_name)
+                    .map(|(id, _)| *id);
+                content.push(self.group_header(&group_name, entries.len(), group_id, cx));
                 let count = entries.len();
                 content.push(self.host_card(entries, ix, cx));
                 ix += count;
@@ -955,7 +1020,7 @@ impl Render for ServersView {
                 // A heading only when folders render above; alone, the card
                 // just needs room under the filters.
                 if has_groups {
-                    content.push(self.group_header("Ungrouped", ungrouped.len(), cx));
+                    content.push(self.group_header("Ungrouped", ungrouped.len(), None, cx));
                 } else {
                     content.push(div().h(px(8.)).into_any_element());
                 }
