@@ -2,6 +2,7 @@ pub mod error;
 pub mod model;
 
 pub(crate) mod crypto;
+mod export;
 mod hosts;
 pub mod memory;
 pub mod recovery;
@@ -11,6 +12,10 @@ pub mod sync;
 pub use crate::ssh::connection::{endpoint_label, ConnectionKind};
 pub use crypto::AgentChatKey;
 pub use error::VaultError;
+pub use export::{
+    is_gssh_export, open_export, read_export, seal_export, write_export, ExportBundle, ExportScope,
+    ImportReport, MAX_EXPORT_BYTES,
+};
 pub use model::{
     rdp_command, resolve_jump_chain, resolve_proxy, ssh_command, telnet_command, vnc_command,
     AgentSettings, AuthMethod, Group, HostSnippet, PortForward, ProxyAuth, ProxyChoice, ProxyDef,

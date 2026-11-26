@@ -23,6 +23,7 @@ use crate::open_tabs::OpenTabs;
 use crate::preferences::Preferences;
 use crate::ui::chrome;
 use crate::ui::hints;
+use crate::ui::hosts::bundle::{export_file_name, BundlePasswordEvent, BundlePasswordView};
 use crate::ui::hosts::form::{FormEvent, FormMode, ServerFormView};
 use crate::ui::hosts::import::{plural, ImportView, ImportViewEvent};
 use crate::ui::hosts::list::{ServersView, ServersViewEvent};
@@ -50,7 +51,7 @@ use gssh::ssh::route::{self, CredentialIssue};
 use gssh::ssh::target::{find_saved_host, find_saved_jump_host, SshTarget};
 use gssh::ssh::{AuthCredential, ForwardState, SshHop, SshRoute, TransferOutcome};
 use gssh::telnet::TelnetTarget;
-use gssh::vault::{AuthMethod, ConnectionKind, ServerEntry};
+use gssh::vault::{AuthMethod, ConnectionKind, ExportScope, ServerEntry};
 
 actions!(
     app_view,
@@ -265,6 +266,27 @@ pub struct AppView {
     showing_local: bool,
 }
 
+fn export_heading(vm: &gssh::vault::VaultManager, scope: ExportScope) -> String {
+    match scope {
+        ExportScope::Connection(id) => vm
+            .get_entry(id)
+            .map(|entry| {
+                if entry.label.is_empty() {
+                    entry.host
+                } else {
+                    entry.label
+                }
+            })
+            .unwrap_or_else(|_| "Connection".into()),
+        ExportScope::Group(id) => vm
+            .list_group_paths()
+            .into_iter()
+            .find(|(group_id, _)| *group_id == id)
+            .map(|(_, path)| path)
+            .unwrap_or_else(|| "Folder".into()),
+    }
+}
+
 impl Focusable for AppView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -316,6 +338,7 @@ impl AppView {
             SidebarEvent::EditServerRequested(id) => this.show_edit_form(*id, window, cx),
             SidebarEvent::DuplicateServerRequested(id) => this.duplicate_server(*id, cx),
             SidebarEvent::DeleteServerRequested(id) => this.show_remove_dialog(*id, window, cx),
+            SidebarEvent::ExportRequested(scope) => this.begin_export(*scope, window, cx),
             SidebarEvent::SettingsRequested => this.toggle_settings(window, cx),
         })
         .detach();
@@ -370,6 +393,8 @@ impl AppView {
                     this.show_server_form(FormMode::Add, window, cx)
                 }
                 ServersViewEvent::ImportRequested => this.show_import_dialog(window, cx),
+                ServersViewEvent::ImportFileRequested => this.begin_import_file(window, cx),
+                ServersViewEvent::ExportRequested(scope) => this.begin_export(*scope, window, cx),
                 ServersViewEvent::EditServerRequested(id) => this.show_edit_form(*id, window, cx),
                 ServersViewEvent::DuplicateServerRequested(id) => this.duplicate_server(*id, cx),
                 ServersViewEvent::DeleteServerRequested(id) => {
@@ -758,6 +783,7 @@ impl AppView {
         match command {
             PaletteCommand::NewHost => self.show_server_form(FormMode::Add, window, cx),
             PaletteCommand::ImportHosts => self.show_import_dialog(window, cx),
+            PaletteCommand::ImportConnections => self.begin_import_file(window, cx),
             PaletteCommand::OpenSettings => self.toggle_settings(window, cx),
             PaletteCommand::LockVault => self.lock_vault(window, cx),
             PaletteCommand::SetTheme(pref) => {
@@ -2575,6 +2601,269 @@ impl AppView {
                 .w(dialog_wide())
                 .child(view_for_dialog.clone())
         });
+    }
+
+    /// Ask for a password, then write a sealed export of `scope`.
+    fn begin_export(&mut self, scope: ExportScope, window: &mut Window, cx: &mut Context<Self>) {
+        let prepared = self.vault_state.read(cx).manager().map(|vm| {
+            let title = export_heading(vm, scope);
+            vm.export_bundle(scope).map(|bundle| (title, bundle))
+        });
+        let Some(prepared) = prepared else {
+            self.set_status("Unlock the vault first.".into(), cx);
+            return;
+        };
+        let (title, bundle) = match prepared {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.set_status(format!("Could not export: {error}"), cx);
+                return;
+            }
+        };
+        let count = bundle.host_count();
+        if count == 0 {
+            self.set_status("That folder has no connections to export.".into(), cx);
+            return;
+        }
+        let file_name = export_file_name(&title);
+        let detail = format!(
+            "Seals {} into a file, including passwords and SSH keys. \
+             Jump hosts those connections use are included.",
+            plural(count, "connection")
+        );
+        let bundle = std::cell::RefCell::new(Some(bundle));
+        let view = cx.new(|cx| {
+            BundlePasswordView::new(
+                format!("Export {title}"),
+                detail,
+                "Export",
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.subscribe_in(
+            &view,
+            window,
+            move |this, _, event, window, cx| match event {
+                BundlePasswordEvent::Cancelled => window.close_dialog(cx),
+                BundlePasswordEvent::Submitted(password) => {
+                    let Some(bundle) = bundle.borrow_mut().take() else {
+                        return;
+                    };
+                    let password = Zeroizing::new(password.as_str().to_owned());
+                    window.close_dialog(cx);
+                    this.write_sealed_export(
+                        bundle,
+                        file_name.clone(),
+                        count,
+                        password,
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
+        let view_for_dialog = view.clone();
+        window.open_dialog(&mut *cx, move |dialog, _, _| {
+            dialog_chrome(dialog)
+                .w(dialog_narrow())
+                .child(view_for_dialog.clone())
+        });
+    }
+
+    fn write_sealed_export(
+        &mut self,
+        bundle: gssh::vault::ExportBundle,
+        file_name: String,
+        count: usize,
+        password: Zeroizing<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .set_file_name(&file_name)
+                .add_filter("g-ssh export", &["json"])
+                .save_file()
+                .await;
+            let Some(handle) = handle else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            this.update_in(cx, |this, _, cx| {
+                this.set_status("Sealing export…".into(), cx);
+            })
+            .ok();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let result = gssh::vault::write_export(&path, &password, &bundle);
+                let _ = tx.try_send(result);
+            });
+            let Ok(result) = rx.recv().await else {
+                return;
+            };
+            this.update_in(cx, |this, _, cx| {
+                let message = match result {
+                    Ok(()) => format!("Exported {}.", plural(count, "connection")),
+                    Err(error) => format!("Could not export: {error}"),
+                };
+                this.set_status(message, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pick a sealed export, then ask for its password and restore it.
+    fn begin_import_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_state.read(cx).manager().is_none() {
+            self.set_status("Unlock the vault first.".into(), cx);
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let handle = rfd::AsyncFileDialog::new()
+                .add_filter("g-ssh export", &["json"])
+                .pick_file()
+                .await;
+            let Some(handle) = handle else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { std::fs::read(&path) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let bytes = match loaded {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        this.set_status(format!("Could not read that file: {error}"), cx);
+                        return;
+                    }
+                };
+                if bytes.len() > gssh::vault::MAX_EXPORT_BYTES {
+                    this.set_status("That file is too large to import.".into(), cx);
+                    return;
+                }
+                if !gssh::vault::is_gssh_export(&bytes) {
+                    this.set_status("That file is not a g-ssh export.".into(), cx);
+                    return;
+                }
+                this.open_import_password(bytes, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_import_password(
+        &mut self,
+        bytes: Vec<u8>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.new(|cx| {
+            BundlePasswordView::new(
+                "Import connections".into(),
+                "Enter the password that sealed this export.".into(),
+                "Import",
+                false,
+                window,
+                cx,
+            )
+        });
+        cx.subscribe_in(
+            &view,
+            window,
+            move |_this, view, event, window, cx| match event {
+                BundlePasswordEvent::Cancelled => window.close_dialog(cx),
+                BundlePasswordEvent::Submitted(password) => {
+                    let bytes = bytes.clone();
+                    let password = Zeroizing::new(password.as_str().to_owned());
+                    let view = view.clone();
+                    let (tx, rx) = async_channel::bounded(1);
+                    std::thread::spawn(move || {
+                        let result = gssh::vault::open_export(&password, &bytes);
+                        let _ = tx.try_send(result);
+                    });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let Ok(result) = rx.recv().await else {
+                            return;
+                        };
+                        this.update_in(cx, |this, window, cx| match result {
+                            Ok(bundle) => {
+                                window.close_dialog(cx);
+                                this.finish_import(bundle, cx);
+                            }
+                            Err(gssh::vault::VaultError::InvalidPassword) => {
+                                view.update(cx, |prompt, cx| {
+                                    prompt.set_error("Wrong password.".into(), cx);
+                                });
+                            }
+                            Err(error) => {
+                                view.update(cx, |prompt, cx| {
+                                    prompt.set_error(
+                                        format!("Could not open that file: {error}"),
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            },
+        )
+        .detach();
+        let view_for_dialog = view.clone();
+        window.open_dialog(&mut *cx, move |dialog, _, _| {
+            dialog_chrome(dialog)
+                .w(dialog_narrow())
+                .child(view_for_dialog.clone())
+        });
+    }
+
+    fn finish_import(&mut self, bundle: gssh::vault::ExportBundle, cx: &mut Context<Self>) {
+        let report = self.vault_state.update(cx, |state, cx| {
+            let Some(vault) = state.manager_mut() else {
+                return None;
+            };
+            let report = vault.import_bundle(bundle);
+            cx.notify();
+            Some(report)
+        });
+        let Some(report) = report else {
+            self.set_status("Unlock the vault first.".into(), cx);
+            return;
+        };
+        let mut message = format!("Imported {}.", plural(report.added, "connection"));
+        if report.skipped > 0 {
+            message.push_str(&format!(
+                " {} already in the vault.",
+                plural(report.skipped, "connection")
+            ));
+        }
+        if report.keys_failed > 0 {
+            message.push_str(&format!(
+                " {} could not be read.",
+                plural(report.keys_failed, "key")
+            ));
+        }
+        if report.jumps_dropped > 0 {
+            message.push_str(&format!(
+                " {} left without a jump host.",
+                plural(report.jumps_dropped, "connection")
+            ));
+        }
+        if let Some(error) = report.save_error {
+            message.push_str(&format!(
+                " The vault could not be saved ({error}). They will be gone on restart."
+            ));
+        }
+        self.set_status(message, cx);
     }
 
     /// Clone a server into a new entry (fresh id, "<label> copy"), so the user
