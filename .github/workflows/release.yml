@@ -7,8 +7,9 @@
 #   gh workflow run release.yml
 # A tag publishes the builds on that GitHub release. The app downloads them
 # from the release page. A hand start only keeps the builds as artifacts.
-# macOS is a .dmg of g-ssh.app. Windows publishes a .zip for the in-app
-# update and a .msi that installs g-ssh.exe and update.exe. Linux is a
+# macOS is a .dmg of g-ssh.app with mcp-server beside it. Windows publishes
+# a .zip for the in-app update and a .msi that installs g-ssh.exe,
+# update.exe, and mcp-server.exe. Linux is a
 # .tar.gz. The macOS app is ad-hoc signed so it can launch, and not notarized.
 name: release
 
@@ -98,8 +99,10 @@ jobs:
             if [ "${{ runner.os }}" = "Windows" ]; then
               cp target/release/g-ssh.exe "$name/"
               cp target/release/update.exe "$name/"
+              cp target/release/mcp-server.exe "$name/"
             else
               cp target/release/g-ssh "$name/"
+              cp target/release/mcp-server "$name/"
             fi
             cp assets/fonts/CascadiaCode-LICENSE.txt \
               assets/fonts/SourceSans3-OFL.txt \
@@ -151,6 +154,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v7
         with:
           path: dist
@@ -183,9 +188,19 @@ jobs:
             done
             gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$repo" --clobber
           else
+            notes=$(mktemp)
+            gh api -X POST "repos/${repo}/releases/generate-notes" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f target_commitish="$GITHUB_REF_NAME" \
+              --jq .body > "$notes" || : > "$notes"
+            fragment=".github/release/mcp-server-notes.md"
+            if [ -f "$fragment" ]; then
+              printf '\n\n' >> "$notes"
+              cat "$fragment" >> "$notes"
+            fi
             gh release create "$GITHUB_REF_NAME" "${files[@]}" \
               --repo "$repo" \
               --title "$GITHUB_REF_NAME" \
-              --generate-notes \
+              --notes-file "$notes" \
               --verify-tag
           fi
