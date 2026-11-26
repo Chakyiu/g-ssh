@@ -33,6 +33,22 @@ Touch ID and the macOS keychain stay in the GUI. This process does not
 read the OS keychain, and it has no tool that returns a recovery phrase,
 a vault key, or a private key.
 
+## Audit log
+
+Every tool call is appended to `mcp-audit.json` in the data directory.
+The row stores the time, the tool, the host argument, the request text,
+and success or the error. It does not store command output or vault
+secrets. If the row cannot be written, the tool still returns and a
+warning is logged on stderr.
+
+How long rows are kept is `mcp_audit_retention_days` in `preferences.json`
+(Settings → Agent → MCP command log). The default is 30 days. Rows older
+than the period are deleted when this server starts, when a call is
+logged, and when the setting is saved. A shorter period deletes the extra
+rows on the next prune. A longer period does not restore rows already
+deleted. A call still running when the period changes is recorded
+afterward, and that prune uses the period on disk then.
+
 Example client config (path and password stay on this machine):
 
 ```json

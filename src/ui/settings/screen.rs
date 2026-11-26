@@ -154,6 +154,7 @@ pub struct SettingsView {
     proxy_pass: Entity<InputState>,
     proxy_error: Option<String>,
     editor_command: Entity<InputState>,
+    mcp_audit_days: Entity<InputState>,
     /// Whether the terminal font menu is open.
     font_menu_open: bool,
     /// Scroll state for that menu, so the current face stays in view.
@@ -240,6 +241,22 @@ impl SettingsView {
                 cx.notify();
             }
         })
+        .detach();
+
+        let mcp_audit_days = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("30")
+                .default_value(Preferences::mcp_audit_retention_days(cx).to_string())
+        });
+        cx.subscribe_in(
+            &mcp_audit_days,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.commit_mcp_audit_retention(window, cx);
+                }
+            },
+        )
         .detach();
 
         let stored = vault_state
@@ -356,6 +373,7 @@ impl SettingsView {
             }),
             proxy_error: None,
             editor_command,
+            mcp_audit_days,
             font_menu_open: false,
             font_menu_scroll: ScrollHandle::new(),
             scheme_menu_open: false,
@@ -2040,6 +2058,49 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Write the retention period, then delete rows the new period no longer
+    /// covers. A failed save leaves the log alone so a shorter period cannot
+    /// delete rows the file does not yet ask to delete.
+    fn commit_mcp_audit_retention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.mcp_audit_days.read(cx).value().trim().to_string();
+        let Some(days) = raw
+            .parse::<u64>()
+            .ok()
+            .map(gssh::mcp_audit::clamp_retention_days)
+        else {
+            let current = Preferences::mcp_audit_retention_days(cx).to_string();
+            if raw != current {
+                self.mcp_audit_days.update(cx, |input, cx| {
+                    input.set_value(current, window, cx);
+                });
+            }
+            return;
+        };
+        let saved = {
+            let prefs = cx.default_global::<Preferences>();
+            let changed = prefs.mcp_audit_retention_days != days;
+            prefs.mcp_audit_retention_days = days;
+            if changed {
+                prefs.save()
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(error) = saved {
+            tracing::warn!(?error, "failed to save MCP audit retention");
+            return;
+        }
+        if let Err(error) = gssh::mcp_audit::prune() {
+            tracing::warn!(%error, "failed to prune MCP audit log");
+        }
+        let shown = self.mcp_audit_days.read(cx).value().trim().to_string();
+        if shown != days.to_string() {
+            self.mcp_audit_days.update(cx, |input, cx| {
+                input.set_value(days.to_string(), window, cx);
+            });
+        }
+    }
+
     fn render_agent_settings(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let error = self.agent_error.clone();
         let saved = self.agent_saved;
@@ -2244,6 +2305,27 @@ impl SettingsView {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.add_agent_allow(window, cx);
                                     })),
+                            ),
+                    )
+                    .child(group_title("MCP command log", cx).mt(px(10.)))
+                    .child(field_label("Keep for (days)", cx))
+                    .child(
+                        div()
+                            .w(px(88.))
+                            .child(Input::new(&self.mcp_audit_days).small()),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(520.))
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(
+                                "How long to keep each MCP tool call: list hosts, run a command, \
+                                 open or close a port forward. Press Enter or leave the field to \
+                                 apply. Rows older than this are removed then, when the MCP server \
+                                 starts, and when the next call is logged. A shorter period removes \
+                                 the extra rows. A longer period does not bring back rows already \
+                                 removed. 30 is the default.",
                             ),
                     )
                     .child(self.agent_sessions(cx)),

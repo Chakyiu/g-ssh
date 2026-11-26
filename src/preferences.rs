@@ -309,6 +309,14 @@ pub struct Preferences {
     /// vault deletion. Set by `load_from`, see `has_account_in`.
     #[serde(default)]
     pub has_account: bool,
+    /// Days to keep MCP command audit rows. Read through
+    /// [`Preferences::mcp_audit_retention_days`], which clamps a hand-edited
+    /// value. The MCP server reads this same field from `preferences.json`.
+    ///
+    /// Saving a shorter period deletes rows that are now too old. A longer
+    /// period does not restore rows already deleted.
+    #[serde(default = "default_mcp_audit_retention_days")]
+    pub mcp_audit_retention_days: u32,
 }
 
 /// The update answer the raw file holds. Read on its own so that a file that
@@ -350,6 +358,10 @@ fn default_ui_scale() -> f32 {
     crate::ui::scale::DEFAULT_UI_SCALE
 }
 
+fn default_mcp_audit_retention_days() -> u32 {
+    gssh::mcp_audit::DEFAULT_RETENTION_DAYS
+}
+
 /// A size the terminal can lay out. The file is hand-editable, so the stored
 /// number can be anything, including one that is not a number.
 fn clamp_terminal_font_size(size: f32) -> f32 {
@@ -381,6 +393,7 @@ impl Default for Preferences {
             editor_command: default_editor_command(),
             is_editor_default_open: false,
             has_account: false,
+            mcp_audit_retention_days: default_mcp_audit_retention_days(),
         }
     }
 }
@@ -565,6 +578,16 @@ impl Preferences {
     pub fn is_editor_default_open(cx: &gpui::App) -> bool {
         cx.try_global::<Self>()
             .is_some_and(|prefs| prefs.is_editor_default_open)
+    }
+
+    /// Days MCP audit rows are kept. 30 when preferences were never loaded.
+    /// A stored value outside 1..=3650 is clamped.
+    pub fn mcp_audit_retention_days(cx: &gpui::App) -> u32 {
+        cx.try_global::<Self>()
+            .map(|prefs| {
+                gssh::mcp_audit::clamp_retention_days(u64::from(prefs.mcp_audit_retention_days))
+            })
+            .unwrap_or(gssh::mcp_audit::DEFAULT_RETENTION_DAYS)
     }
 
     /// False when the preferences were never loaded.
@@ -1099,6 +1122,18 @@ mod tests {
         let path = dir.path().join("preferences.json");
         std::fs::write(&path, "not json at all").unwrap();
         assert_eq!(Preferences::load_from(&path).theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn mcp_audit_retention_defaults_to_thirty_days() {
+        assert_eq!(
+            Preferences::default().mcp_audit_retention_days,
+            gssh::mcp_audit::DEFAULT_RETENTION_DAYS
+        );
+        let old: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.mcp_audit_retention_days, 30);
+        let json = serde_json::to_string(&Preferences::default()).unwrap();
+        assert!(json.contains("\"mcp_audit_retention_days\":30"), "{json}");
     }
 
     #[test]
