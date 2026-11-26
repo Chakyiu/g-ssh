@@ -53,7 +53,7 @@ Example client config (path and password stay on this machine):
 | Tool | What it does |
 | --- | --- |
 | `list_hosts` | Hosts from `connections/`. Id, label, address, kind, group, jump host id, host-key fingerprint, and auth kind. No passwords, key material, or notes. |
-| `ssh_exec` | One command via `open_exec_captured` on the host's saved route (`route_for`, jump hosts included). Returns stdout, stderr, and exit code. A non-zero exit is still a successful tool call. |
+| `ssh_exec` | One command via `open_exec_captured` on the host's saved route (`route_for`, jump hosts included). Returns stdout, stderr, and the remote exit code. A non-zero exit is still a successful tool call (`isError` is false); the code is in the JSON body. `exit_code` is null only when the server sends no `exit-status` (for example a signal). |
 | `start_forward` | One local `-L` forward. Bind address defaults to `127.0.0.1` and must be loopback. |
 | `stop_forward` | Stops a forward by the `forward_id` from `start_forward`. |
 
