@@ -52,6 +52,9 @@ struct LiveSession {
 
 impl App {
     pub fn new(vault: gssh::vault::VaultManager) -> Result<Self, String> {
+        if let Err(error) = gssh::mcp_audit::prune() {
+            tracing::warn!(%error, "mcp audit log was not pruned");
+        }
         Ok(Self {
             vault: Mutex::new(vault),
             sessions: Mutex::new(HashMap::new()),

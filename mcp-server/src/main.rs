@@ -52,7 +52,9 @@ impl Mcp {
         description = "List saved hosts from the vault connections folder. Passwords, keys, and notes are omitted."
     )]
     async fn list_hosts(&self) -> Result<CallToolResult, ErrorData> {
-        Ok(tool_text(self.app.list_hosts()))
+        let result = self.app.list_hosts();
+        audit("list_hosts", None, "", &result);
+        Ok(tool_text(result))
     }
 
     #[tool(
@@ -62,7 +64,9 @@ impl Mcp {
         &self,
         Parameters(args): Parameters<ExecArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(tool_text(self.app.exec(&args.host, &args.command).await))
+        let result = self.app.exec(&args.host, &args.command).await;
+        audit("ssh_exec", Some(&args.host), &args.command, &result);
+        Ok(tool_text(result))
     }
 
     #[tool(
@@ -72,17 +76,19 @@ impl Mcp {
         &self,
         Parameters(args): Parameters<ForwardArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(tool_text(
-            self.app
-                .start_forward(
-                    &args.host,
-                    args.local_port,
-                    &args.remote_host,
-                    args.remote_port,
-                    args.bind_address.as_deref(),
-                )
-                .await,
-        ))
+        let request = forward_request(&args);
+        let result = self
+            .app
+            .start_forward(
+                &args.host,
+                args.local_port,
+                &args.remote_host,
+                args.remote_port,
+                args.bind_address.as_deref(),
+            )
+            .await;
+        audit("start_forward", Some(&args.host), &request, &result);
+        Ok(tool_text(result))
     }
 
     #[tool(description = "Stop a local forward started by start_forward.")]
@@ -90,7 +96,9 @@ impl Mcp {
         &self,
         Parameters(args): Parameters<StopArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        Ok(tool_text(self.app.stop_forward(&args.forward_id).await))
+        let result = self.app.stop_forward(&args.forward_id).await;
+        audit("stop_forward", None, &args.forward_id, &result);
+        Ok(tool_text(result))
     }
 }
 
@@ -100,6 +108,37 @@ impl Mcp {
     instructions = "Headless g-ssh for saved hosts. Tools: list_hosts, ssh_exec, start_forward, stop_forward. No interactive shell. Unknown or changed host keys fail closed. Keyboard-interactive prompts are denied."
 )]
 impl ServerHandler for Mcp {}
+
+fn audit(tool: &str, host: Option<&str>, request: &str, result: &Result<String, String>) {
+    let saved = gssh::mcp_audit::record(gssh::mcp_audit::CommandAudit {
+        tool: tool.to_string(),
+        host: host.map(str::to_string),
+        request: request.to_string(),
+        ok: result.is_ok(),
+        error: result.as_ref().err().cloned(),
+    });
+    if let Err(error) = saved {
+        tracing::warn!(tool, %error, "mcp audit row was not written");
+    }
+}
+
+fn forward_request(args: &ForwardArgs) -> String {
+    match args
+        .bind_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+    {
+        Some(bind) => format!(
+            "bind {bind}:{} -> {}:{}",
+            args.local_port, args.remote_host, args.remote_port
+        ),
+        None => format!(
+            "local {} -> {}:{}",
+            args.local_port, args.remote_host, args.remote_port
+        ),
+    }
+}
 
 fn tool_text(result: Result<String, String>) -> CallToolResult {
     match result {

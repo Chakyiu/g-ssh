@@ -5,6 +5,7 @@
 pub mod account;
 pub mod app;
 pub mod desktop;
+pub mod mcp_audit;
 pub mod rdp;
 pub mod ssh;
 pub mod telnet;

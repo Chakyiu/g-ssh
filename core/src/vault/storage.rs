@@ -187,7 +187,7 @@ pub(super) fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-pub(super) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), VaultError> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), VaultError> {
     #[cfg(unix)]
     atomic_write_unix(path, data)?;
     #[cfg(windows)]
