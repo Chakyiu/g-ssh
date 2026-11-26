@@ -1725,6 +1725,27 @@ async fn open_exec_captured(
     })
 }
 
+/// One captured-exec channel message. `Eof` is [`CapturedAction::Continue`]:
+/// OpenSSH sends it when the process closes stdout, and only then `exit-status`.
+enum CapturedAction {
+    ForwardOut(Vec<u8>),
+    ForwardErr(Vec<u8>),
+    Exit(u32),
+    /// `Close`. Not `Eof`: that arrives before `exit-status`.
+    Finished,
+    Continue,
+}
+
+fn captured_action(msg: ChannelMsg) -> CapturedAction {
+    match msg {
+        ChannelMsg::Data { data } => CapturedAction::ForwardOut(data.to_vec()),
+        ChannelMsg::ExtendedData { data, ext: 1 } => CapturedAction::ForwardErr(data.to_vec()),
+        ChannelMsg::ExitStatus { exit_status } => CapturedAction::Exit(exit_status),
+        ChannelMsg::Close => CapturedAction::Finished,
+        _ => CapturedAction::Continue,
+    }
+}
+
 /// Pump one captured exec. A dropped [`CapturedExec`] completes `cancel`,
 /// and the channel is closed so the remote command is not left running.
 async fn drive_captured_exec(
@@ -1742,24 +1763,24 @@ async fn drive_captured_exec(
             }
             msg = channel.wait() => {
                 let Some(msg) = msg else { break };
-                match msg {
-                    ChannelMsg::Data { data } => {
-                        if stdout_tx.try_send(data.to_vec()).is_err() {
+                match captured_action(msg) {
+                    CapturedAction::ForwardOut(data) => {
+                        if stdout_tx.try_send(data).is_err() {
                             let _ = channel.close().await;
                             break;
                         }
                     }
-                    ChannelMsg::ExtendedData { data, ext: 1 } => {
-                        if stderr_tx.try_send(data.to_vec()).is_err() {
+                    CapturedAction::ForwardErr(data) => {
+                        if stderr_tx.try_send(data).is_err() {
                             let _ = channel.close().await;
                             break;
                         }
                     }
-                    ChannelMsg::ExitStatus { exit_status } => {
+                    CapturedAction::Exit(exit_status) => {
                         let _ = exit_tx.try_send(exit_status);
                     }
-                    ChannelMsg::Eof | ChannelMsg::Close => break,
-                    _ => {}
+                    CapturedAction::Finished => break,
+                    CapturedAction::Continue => {}
                 }
             }
         }
@@ -4634,6 +4655,33 @@ impl client::Handler for ClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenSSH order: stdout closes (`Eof`), then `exit-status`, then `Close`.
+    /// Stopping on `Eof` made every `ssh_exec` report `exit_code: null`.
+    #[test]
+    fn a_non_zero_exit_after_eof_is_kept() {
+        let mut exit_code = None;
+        let mut finished = false;
+        for msg in [
+            ChannelMsg::Eof,
+            ChannelMsg::ExitStatus { exit_status: 3 },
+            ChannelMsg::Close,
+        ] {
+            match captured_action(msg) {
+                CapturedAction::Exit(code) => exit_code = Some(code),
+                CapturedAction::Finished => {
+                    finished = true;
+                    break;
+                }
+                CapturedAction::Continue => {}
+                CapturedAction::ForwardOut(_) | CapturedAction::ForwardErr(_) => {
+                    panic!("no output in this sequence");
+                }
+            }
+        }
+        assert!(finished);
+        assert_eq!(exit_code, Some(3));
+    }
 
     fn new_public_key() -> PublicKey {
         keys::PrivateKey::random(&mut rand::rng(), keys::Algorithm::Ed25519)
