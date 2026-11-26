@@ -1,5 +1,5 @@
 # Builds g-ssh-<version>-windows-x86_64.msi from a folder that already
-# holds g-ssh.exe and update.exe. WiX is installed with:
+# holds g-ssh.exe, update.exe, and mcp-server.exe. WiX is installed with:
 #   dotnet tool install --global wix --version 5.0.2
 #   wix extension add -g WixToolset.UI.wixext/5.0.2
 param(

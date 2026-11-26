@@ -56,6 +56,9 @@
       <Component Id="UpdateExe" Guid="d4b2f8c5-3e69-4071-8b1f-8c7e5d902f31">
         <File Id="UpdateExeFile" Source="$(var.PayloadDir)\update.exe" KeyPath="yes" />
       </Component>
+      <Component Id="McpServerExe" Guid="a7e1b3c4-5f6d-4e89-9012-3bc4d5e6f708">
+        <File Id="McpServerExeFile" Source="$(var.PayloadDir)\mcp-server.exe" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
   </Fragment>
 

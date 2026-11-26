@@ -19,11 +19,16 @@ fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 binary="$root/target/release/g-ssh"
+mcp_server="$root/target/release/mcp-server"
 icon="$root/assets/app-icon/g-ssh.icns"
 out=$1
 
 if [ ! -f "$binary" ]; then
   echo "missing $binary (cargo build --release first)" >&2
+  exit 1
+fi
+if [ ! -f "$mcp_server" ]; then
+  echo "missing $mcp_server (cargo build --release --workspace first)" >&2
   exit 1
 fi
 if [ ! -f "$icon" ]; then
@@ -94,6 +99,9 @@ plutil -lint "$app/Contents/Info.plist" >/dev/null
 xattr -cr "$app"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
+
+cp "$mcp_server" "$stage/mcp-server"
+chmod 755 "$stage/mcp-server"
 
 ln -s /Applications "$stage/Applications"
 
